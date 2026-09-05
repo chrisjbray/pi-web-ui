@@ -1938,6 +1938,153 @@ body.lp-resizing .lp-sash.dragging::after {
 	border-left: 1px solid var(--border, rgba(255, 255, 255, 0.08));
 }
 
+/* tmux 窗口树：会话行下的窗口行（选择/重命名/删除），Adopted 组只读。 */
+.term-tmux-tree {
+	margin: 2px 0 2px 10px;
+	padding-left: 6px;
+	border-left: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+.term-tmux-head {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+}
+.term-tmux-toggle {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	text-align: left;
+	background: transparent;
+	border: none;
+	color: var(--text-dim);
+	cursor: pointer;
+	font-size: 11.5px;
+	padding: 3px 4px;
+	border-radius: 6px;
+}
+.term-tmux-toggle:hover {
+	background: var(--bg-elev2);
+	color: var(--text);
+}
+.term-tmux-badge {
+	font-size: 10px;
+	color: var(--amber);
+	border: 1px solid var(--amber);
+	border-radius: 4px;
+	padding: 0 4px;
+	margin-left: 4px;
+}
+.term-tmux-act {
+	flex-shrink: 0;
+	display: inline-flex;
+	align-items: center;
+	background: transparent;
+	border: none;
+	border-radius: 5px;
+	color: var(--text-faint);
+	cursor: pointer;
+	font-size: 11px;
+	padding: 2px 6px;
+}
+.term-tmux-act:hover {
+	color: var(--amber);
+	background: color-mix(in srgb, var(--amber) 12%, transparent);
+}
+.term-tmux-wins {
+	margin-top: 2px;
+}
+.term-win {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	padding: 2px 4px;
+	border-radius: 6px;
+}
+.term-win:hover {
+	background: var(--bg-elev2);
+}
+.term-win-main {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	background: transparent;
+	border: none;
+	color: var(--text-dim);
+	cursor: pointer;
+	text-align: left;
+	font-size: 12px;
+	padding: 1px 2px;
+}
+.term-win-main:hover {
+	color: var(--text);
+}
+.term-win.active .term-win-main {
+	color: var(--text);
+	font-weight: 600;
+}
+.term-win-idx {
+	flex-shrink: 0;
+	font-size: 10.5px;
+	color: var(--text-faint);
+	min-width: 14px;
+}
+.term-win-name {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.term-win .term-tab-close {
+	opacity: 0;
+}
+.term-win:hover .term-tab-close {
+	opacity: 1;
+}
+.term-win .term-tab-close.confirm {
+	opacity: 1;
+	color: #fff;
+	background: var(--red);
+}
+/* tmux 风格底部状态栏（tmux 窗口名，in-pane 状态栏的镜像遥控）。 */
+.term-statusbar {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 3px 8px;
+	border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+	font-size: 11.5px;
+	color: var(--text-dim);
+	overflow-x: auto;
+	white-space: nowrap;
+}
+.term-statusbar-session {
+	flex-shrink: 0;
+	color: var(--text-faint);
+}
+.term-statusbar-win {
+	flex-shrink: 0;
+	background: transparent;
+	border: none;
+	border-radius: 4px;
+	color: var(--text-dim);
+	cursor: pointer;
+	font: inherit;
+	padding: 1px 5px;
+}
+.term-statusbar-win:hover {
+	background: var(--bg-elev2);
+	color: var(--text);
+}
+.term-statusbar-win.active {
+	color: var(--green);
+	font-weight: 600;
+}
+
 /* ------------------------------------------------------- source control (Git) */
 
 .scm-view {

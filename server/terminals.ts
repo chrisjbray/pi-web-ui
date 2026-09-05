@@ -24,7 +24,8 @@ import "./patch-node-pty.js";
 import { spawn, type IPty } from "node-pty";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { CommandDef, ServerMessage, TerminalInfo } from "./protocol.js";
+import type { CommandDef, ServerMessage, TerminalInfo, TmuxSessionEntry, TmuxWindow } from "./protocol.js";
+import * as tmuxmod from "./tmux.js";
 
 // ---------------------------------------------------------------------------
 // .pi/commands.json
@@ -180,6 +181,17 @@ interface TermEntry {
 	agentBash: boolean;
 	/** UI locale at creation ("en" = English exit banner, else Chinese). */
 	locale?: string;
+	/** tmux 会话名（v1 新建用户终端走 tmux；ai-bash/存量/回退保持 node-pty）。
+	 *  显示用；权威寻址走 tmuxSessionId（改名后不变）。 */
+	tmuxSession?: string;
+	/** tmux 会话 id（`$N`）：改名后不变，所有 tmux 命令寻址用它。 */
+	tmuxSessionId?: string;
+	/** tmux 窗口镜像（tmux 权威，树/状态栏渲染用；变更即重推 terminal_windows）。 */
+	tmuxWindows?: TmuxWindow[];
+	/** 只读接入（tmux attach -r）：防光标争夺；take control 切换读写。 */
+	tmuxReadonly?: boolean;
+	/** 领养的外部会话：只看只接管只 detach，不重命名不杀。 */
+	tmuxAdopted?: boolean;
 }
 
 const isWindows = process.platform === "win32";
@@ -743,7 +755,10 @@ export class TerminalManager {
 		private readonly workspaceRoot: string,
 	) {}
 
-	/** Start a plain interactive shell in the given directory. */
+	/** Start a plain interactive shell in the given directory.
+	 *
+	 *  v1 tmux 用户裸终端走 createTmux（async，会话 `pi-web-ui-<id>`，PTY 只读
+	 *  接入）；本同步 create 保留给 ai-bash/命令/回退路径（直连 node-pty）。 */
 	create(
 		id: string,
 		cwd: string,
@@ -785,6 +800,94 @@ export class TerminalManager {
 		) {
 			this.maybeEmitTccHint(id);
 			this.emitList();
+			return this.info(this.terms.get(id)!);
+		}
+		return null;
+	}
+
+	/** v1 tmux：新建 tmux 会话并把 PTY 只读接入。
+	 *
+	 *  流程：tmux new-session -d → spawnShell 改跑 `tmux attach -r` →
+	 *  推送窗口镜像。tmux 不可用/建会话失败 → 回退普通 create（直连）。 */
+	async createTmux(
+		id: string,
+		cwd: string,
+		cols: number,
+		rows: number,
+		fallbackCwd: string,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<TerminalInfo | null> {
+		const valid = this.validateId(id);
+		if (valid) {
+			this.fail(id, valid.text, valid.textEn);
+			return null;
+		}
+		if (this.terms.has(id)) return this.info(this.terms.get(id)!);
+		if (!this.ensureSpawnAllowed(id, false)) return null;
+		this.history.delete(id);
+		const safeCwd = this.safeCwd(cwd || fallbackCwd);
+		if (!safeCwd) {
+			this.fail(id, "终端工作目录必须位于当前工作区内", "Terminal cwd must be inside the current workspace");
+			return null;
+		}
+		if (!(await tmuxmod.hasTmux())) return this.create(id, cwd, cols, rows, fallbackCwd, title, opts);
+		const session = tmuxmod.tmuxSessionName(id);
+		let sessionId = "";
+		try {
+			if (!(await tmuxmod.hasSession(session))) sessionId = await tmuxmod.newSession(session, safeCwd);
+		} catch {
+			return this.create(id, cwd, cols, rows, fallbackCwd, title, opts);
+		}
+		if (
+			this.spawnShell(id, safeCwd, cols, rows, title || session, undefined, undefined, false, opts?.locale, {
+				tmuxSession: session,
+				tmuxReadonly: true,
+				tmuxSessionId: sessionId || undefined,
+			})
+		) {
+			this.maybeEmitTccHint(id);
+			this.emitList();
+			void this.refreshTmuxWindows(id);
+			return this.info(this.terms.get(id)!);
+		}
+		return null;
+	}
+
+	/** 领养外部 tmux 会话为只读标签（真终端权威；只看只接管只 detach）。 */
+	async adoptTmux(
+		id: string,
+		session: string,
+		cols: number,
+		rows: number,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<TerminalInfo | null> {
+		const valid = this.validateId(id);
+		if (valid) {
+			this.fail(id, valid.text, valid.textEn);
+			return null;
+		}
+		if (this.terms.has(id)) return this.info(this.terms.get(id)!);
+		if (!this.ensureSpawnAllowed(id, false)) return null;
+		this.history.delete(id);
+		if (!(await tmuxmod.hasTmux())) {
+			this.fail(id, "主机未安装 tmux", "tmux is not installed on this host");
+			return null;
+		}
+		if (!(await tmuxmod.hasSession(session))) {
+			this.fail(id, `tmux 会话不存在：${session}`, `tmux session does not exist: ${session}`);
+			return null;
+		}
+		if (
+			this.spawnShell(id, this.workspaceRoot, cols, rows, title || session, undefined, undefined, false, opts?.locale, {
+				tmuxSession: session,
+				tmuxReadonly: true,
+				tmuxAdopted: true,
+			})
+		) {
+			this.emitList();
+			void this.refreshTmuxWindows(id);
 			return this.info(this.terms.get(id)!);
 		}
 		return null;
@@ -858,7 +961,11 @@ export class TerminalManager {
 		if (command) this.input(id, command + "\r");
 	}
 
-	/** Spawn the user's shell as a PTY. Returns false when the spawn failed. */
+	/** Spawn the user's shell as a PTY. Returns false when the spawn failed.
+	 *
+	 *  tmux 模式（opts.tmuxSession）：PTY 不跑登录 shell，改跑
+	 *  `tmux attach-session -t <session> [-r]` ——浏览器是哑终端，tmux 自己画
+	 *  状态栏/分屏/窗口列表，前缀键直通。退出语义随 attach：detach 不杀会话。 */
 	private spawnShell(
 		id: string,
 		cwd: string,
@@ -869,6 +976,12 @@ export class TerminalManager {
 		forceBash?: boolean,
 		agentBash = false,
 		locale?: string,
+		tmux?: {
+			tmuxSession: string;
+			tmuxSessionId?: string;
+			tmuxReadonly?: boolean;
+			tmuxAdopted?: boolean;
+		},
 	): boolean {
 		let abs = cwd;
 		if (!abs) abs = homedir();
@@ -887,7 +1000,16 @@ export class TerminalManager {
 		repairSpawnHelperPermissions();
 		let pty: IPty;
 		try {
-			const { shell, args } = forceBash ? resolveBashShell() : resolveShell();
+			// tmux 模式：PTY 跑 attach 而非 shell。-r 只读默认（防光标争夺），
+			// take control 时重建 PTY 去掉 -r。TERM 保持 xterm-256color 供状态栏用色。
+			const attachTarget = tmux?.tmuxSessionId || tmux?.tmuxSession;
+			const attach = attachTarget
+				? {
+						shell: "tmux",
+						args: ["attach-session", "-t", attachTarget, ...(tmux.tmuxReadonly === false ? [] : ["-r"])],
+					}
+				: null;
+			const { shell, args } = attach ?? (forceBash ? resolveBashShell() : resolveShell());
 			pty = spawn(shell, args, {
 				name: "xterm-256color",
 				cols: Math.max(2, Math.floor(cols) || 80),
@@ -929,6 +1051,11 @@ export class TerminalManager {
 			watches: [],
 			agentBash,
 			locale,
+			tmuxSession: tmux?.tmuxSession,
+			tmuxSessionId: tmux?.tmuxSessionId,
+			tmuxWindows: undefined,
+			tmuxReadonly: tmux?.tmuxSession ? tmux.tmuxReadonly !== false : undefined,
+			tmuxAdopted: tmux?.tmuxAdopted,
 		};
 		this.terms.set(id, entry);
 		// The closures capture `entry`: after a restart the map points at the
@@ -1104,6 +1231,10 @@ export class TerminalManager {
 			exitCode: entry.exitCode,
 			command: entry.command,
 			agentBash: entry.agentBash,
+			tmuxSession: entry.tmuxSession,
+			tmuxWindows: entry.tmuxWindows,
+			tmuxReadonly: entry.tmuxReadonly,
+			tmuxAdopted: entry.tmuxAdopted,
 		};
 	}
 
@@ -1346,9 +1477,15 @@ export class TerminalManager {
 		}
 	}
 
-	/** Kill one terminal (tab closed), including an exited terminal's retained history. */
+	/** Kill one terminal (tab closed), including an exited terminal's retained history.
+	 *
+	 *  tmux 标签：只杀接入 PTY（detach），原生会话一并杀掉（关标签=关会话）；
+	 *  领养会话不动（真终端不受影响）。 */
 	kill(id: string): void {
 		const entry = this.terms.get(id);
+		if (entry?.tmuxSession && !entry.tmuxAdopted) {
+			void tmuxmod.killSession(entry.tmuxSessionId || entry.tmuxSession).catch(() => {});
+		}
 		if (entry) {
 			this.disarmIdleWatch(entry);
 			const killedWatches = entry.watches;
@@ -1369,14 +1506,239 @@ export class TerminalManager {
 		if (this.history.delete(id)) this.emitList();
 	}
 
-	/** Rename a terminal tab (live or retained history). Empty names ignored. */
+	/** Rename a terminal tab (live or retained history). Empty names ignored.
+	 *
+	 *  tmux 标签：改的是会话名（rename-session），tab 名即会话名；id 寻址所以
+	 *  改名不断连。领养会话拒绝（真终端权威）。 */
 	rename(id: string, title: string): void {
 		const trimmed = (title ?? "").trim();
 		if (!trimmed) return;
 		const entry = this.find(id);
 		if (!entry) return;
+		if (entry.tmuxSession) {
+			if (entry.tmuxAdopted) {
+				this.fail(id, "领养会话不能重命名（真终端权威）", "Adopted sessions cannot be renamed");
+				return;
+			}
+			entry.title = trimmed;
+			entry.tmuxSession = trimmed;
+			this.emitList();
+			void (async () => {
+				try {
+					await tmuxmod.renameSession(entry.tmuxSessionId || trimmed, trimmed);
+				} catch (err) {
+					this.fail(
+						id,
+						`tmux 重命名会话失败：${(err as Error).message}`,
+						`tmux rename-session failed: ${(err as Error).message}`,
+					);
+					return;
+				}
+				await this.refreshTmuxWindows(id);
+			})();
+			return;
+		}
 		entry.title = trimmed;
 		this.emitList();
+	}
+
+	// ------------------------------------------------------------------
+	// tmux 窗口操作（树遥控；tmux 是权威状态，操作后刷新镜像即收敛）
+	// ------------------------------------------------------------------
+
+	/** 刷新某 tmux 标签的窗口镜像并推送 terminal_windows。 */
+	async refreshTmuxWindows(id: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		const target = entry.tmuxSessionId || entry.tmuxSession;
+		const [windows, liveName] = await Promise.all([
+			tmuxmod.listWindows(target),
+			entry.tmuxAdopted ? Promise.resolve("") : tmuxmod.sessionName(target),
+		]);
+		const cur = this.find(id);
+		if (!cur || cur.tmuxSession !== entry.tmuxSession) return;
+		cur.tmuxWindows = windows;
+		// 外部改名（真终端 rename-session）同步回 tab 名；用户在面板改的名
+		// 本来就和会话名一致，无变化则无操作。
+		if (liveName && liveName !== cur.tmuxSession) {
+			cur.tmuxSession = liveName;
+			cur.title = liveName;
+		}
+		this.emit({
+			type: "terminal_windows",
+			terminalId: id,
+			windows: windows.map((w) => ({ id: w.id, name: w.name, active: w.active, index: w.index })),
+		});
+		this.emitList();
+	}
+
+	/** tmux 新窗口（tmux 自动编号命名；镜像刷新后树出现新行）。 */
+	async tmuxNewWindow(id: string, title?: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		try {
+			await tmuxmod.newWindow(entry.tmuxSessionId || entry.tmuxSession, title);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 新建窗口失败：${(err as Error).message}`,
+				`tmux new-window failed: ${(err as Error).message}`,
+			);
+			return;
+		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 选中窗口（树点击/切换；tmux 重绘收敛，in-pane 状态栏同步）。 */
+	async tmuxSelectWindow(id: string, windowId: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		try {
+			await tmuxmod.selectWindow(windowId);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 切换窗口失败：${(err as Error).message}`,
+				`tmux select-window failed: ${(err as Error).message}`,
+			);
+			return;
+		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 重命名窗口（仅原生会话；领养会话拒绝——真终端权威）。 */
+	async tmuxRenameWindow(id: string, windowId: string, name: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		if (entry.tmuxAdopted) {
+			this.fail(id, "领养会话的窗口不能重命名（真终端权威）", "Adopted session windows cannot be renamed");
+			return;
+		}
+		try {
+			await tmuxmod.renameWindow(windowId, name);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 重命名窗口失败：${(err as Error).message}`,
+				`tmux rename-window failed: ${(err as Error).message}`,
+			);
+			return;
+		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 杀窗口（仅原生会话；UI 两步确认）。 */
+	async tmuxKillWindow(id: string, windowId: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		if (entry.tmuxAdopted) {
+			this.fail(id, "领养会话的窗口不能删除（真终端权威）", "Adopted session windows cannot be killed");
+			return;
+		}
+		try {
+			await tmuxmod.killWindow(windowId);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 删除窗口失败：${(err as Error).message}`,
+				`tmux kill-window failed: ${(err as Error).message}`,
+			);
+			return;
+		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 只读/读写切换：重建 PTY 去掉/加上 -r（输出历史保留在 entry）。 */
+	async tmuxTakeControl(id: string, readonly: boolean): Promise<void> {
+		const entry = this.terms.get(id);
+		if (!entry?.tmuxSession) return;
+		entry.tmuxReadonly = readonly;
+		// 重建接入 PTY：杀旧 attach 进程（detach 不杀会话），起新 attach。
+		try {
+			entry.pty.kill();
+		} catch {
+			// already dead
+		}
+		this.terms.delete(id);
+		const ok = this.spawnShell(
+			id,
+			entry.cwd,
+			entry.cols,
+			entry.rows,
+			entry.title,
+			entry.command,
+			undefined,
+			entry.agentBash,
+			entry.locale,
+			{
+				tmuxSession: entry.tmuxSession,
+				tmuxSessionId: entry.tmuxSessionId,
+				tmuxReadonly: readonly,
+				tmuxAdopted: entry.tmuxAdopted,
+			},
+		);
+		if (!ok) return;
+		const fresh = this.terms.get(id);
+		if (fresh) {
+			fresh.tmuxWindows = entry.tmuxWindows;
+			// 保留历史输出：重建 PTY 是新 attach，旧输出接回避免黑屏感。
+			fresh.output = entry.output;
+			fresh.outputOffset = entry.outputOffset;
+		}
+		this.emitList();
+	}
+
+	/** 前端打开 Terminal 面板时调一次：立即推一份领养列表并启动 30s 轮询。 */
+	async listAdoptablePush(): Promise<void> {
+		this.startAdoptPoll();
+		try {
+			if (!(await tmuxmod.hasTmux())) return;
+			const sessions = await this.listAdoptable();
+			this.lastAdopted = JSON.stringify(sessions);
+			this.emit({ type: "tmux_sessions", sessions });
+		} catch {
+			// best-effort
+		}
+	}
+
+	/** 领养会话 detach：杀接入 PTY，tmux 会话本身不动（真终端不受影响）。 */
+	async tmuxDetach(id: string): Promise<void> {
+		const entry = this.terms.get(id) ?? this.history.get(id);
+		if (!entry?.tmuxSession) return;
+		this.kill(id);
+	}
+
+	/** 领养轮询源数据：非本应用前缀会话（真终端开工待领养）。 */
+	async listAdoptable(): Promise<TmuxSessionEntry[]> {
+		const all = await tmuxmod.listSessions();
+		return all
+			.filter((s) => s.adopted)
+			.map((s) => ({ name: s.name, attached: s.attached, windows: s.windows, adopted: true }));
+	}
+
+	private adoptTimer: ReturnType<typeof setInterval> | null = null;
+	private lastAdopted: string = "";
+
+	/** 领养轮询（30s）：发现真终端新建/detach 的外部会话即推送 tmux_sessions。
+	 *  懒启动（首次 listAdoptable 调用），killAll 停止。变更才推送。 */
+	startAdoptPoll(): void {
+		if (this.adoptTimer) return;
+		const tick = async () => {
+			try {
+				if (!(await tmuxmod.hasTmux())) return;
+				const sessions = await this.listAdoptable();
+				const key = JSON.stringify(sessions);
+				if (key !== this.lastAdopted) {
+					this.lastAdopted = key;
+					this.emit({ type: "tmux_sessions", sessions });
+				}
+			} catch {
+				// best-effort：轮询永不抛进 dispatcher
+			}
+		};
+		void tick();
+		this.adoptTimer = setInterval(tick, tmuxmod.TMUX_ADOPT_POLL_MS);
+		this.adoptTimer.unref?.();
 	}
 
 	/** Kill every terminal owned by this conversation. */
@@ -1399,6 +1761,10 @@ export class TerminalManager {
 		}
 		this.terms.clear();
 		this.history.clear();
+		if (this.adoptTimer) {
+			clearInterval(this.adoptTimer);
+			this.adoptTimer = null;
+		}
 		this.emitList();
 	}
 }

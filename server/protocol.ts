@@ -168,6 +168,30 @@ export interface TerminalInfo {
 	/** true = 终端接管 bash 的持久终端（'ai-bash'）：不计入终端数量上限，
 	 *  前端把它单独归到「AI bash」折叠分组里。缺省 false = 用户终端。 */
 	agentBash?: boolean;
+	/** tmux 会话名（v1 新建用户终端；缺省 = node-pty 直连）。 */
+	tmuxSession?: string;
+	/** tmux 窗口镜像（tmux 权威；树/状态栏渲染用）。 */
+	tmuxWindows?: TmuxWindow[];
+	/** 只读接入中（tmux attach -r）。 */
+	tmuxReadonly?: boolean;
+	/** 领养的外部会话（只看只接管只 detach）。 */
+	tmuxAdopted?: boolean;
+}
+
+/** tmux 窗口条目（list-windows 镜像）。 */
+export interface TmuxWindow {
+	id: string;
+	name: string;
+	active: boolean;
+	index: number;
+}
+
+/** tmux 会话条目（领养列表用；adopted=true = 非本应用前缀）。 */
+export interface TmuxSessionEntry {
+	name: string;
+	attached: boolean;
+	windows: number;
+	adopted: boolean;
 }
 
 /** A slash command available in the chat input (the web counterpart of the
@@ -270,6 +294,22 @@ export type ClientMessage =
 	| { type: "terminal_resize"; terminalId: string; cols: number; rows: number; conversationId?: string }
 	| { type: "terminal_kill"; terminalId: string; conversationId?: string }
 	| { type: "rename_terminal"; terminalId: string; title: string; conversationId?: string }
+	/** tmux 新窗口（仅 tmux 会话；tmux 自己编号命名）。 */
+	| { type: "tmux_new_window"; terminalId: string; title?: string; conversationId?: string }
+	/** tmux 选中窗口（树点击/切换；tmux 重绘收敛）。 */
+	| { type: "tmux_select_window"; terminalId: string; windowId: string; conversationId?: string }
+	/** tmux 重命名窗口（仅原生会话；领养会话拒绝）。 */
+	| { type: "tmux_rename_window"; terminalId: string; windowId: string; name: string; conversationId?: string }
+	/** tmux 杀窗口（仅原生会话；UI 两步确认）。 */
+	| { type: "tmux_kill_window"; terminalId: string; windowId: string; conversationId?: string }
+	/** tmux 只读/读写切换（只读 -r 防光标争夺；接管是显式动作）。 */
+	| { type: "tmux_take_control"; terminalId: string; readonly: boolean; conversationId?: string }
+	/** 领养外部 tmux 会话为只读标签（真终端权威；只看只接管只 detach）。 */
+	| { type: "tmux_adopt"; session: string; conversationId?: string }
+	/** 取领养候选列表并启动轮询（Terminal 面板打开时调一次）。 */
+	| { type: "list_tmux_sessions"; conversationId?: string }
+	/** 领养会话 detach（从树移除；真终端不受影响）。 */
+	| { type: "tmux_detach"; terminalId: string; conversationId?: string }
 	// Runs a command in a new shell; if the terminal already exists it is
 	// RESTARTED in place (current process killed, fresh shell runs it again).
 	| {
@@ -1058,6 +1098,10 @@ export type ServerMessage =
 	| { type: "terminal_output"; conversationId?: string; terminalId: string; data: string }
 	| { type: "terminal_exit"; conversationId?: string; terminalId: string; exitCode: number | null }
 	| { type: "terminal_list"; conversationId?: string; terminals: TerminalInfo[] }
+	/** tmux 窗口镜像推送（tmux 权威；输出活动/操作后刷新）。 */
+	| { type: "terminal_windows"; conversationId?: string; terminalId: string; windows: TmuxWindow[] }
+	/** tmux 会话列表推送（领养组用；30s 轮询）。 */
+	| { type: "tmux_sessions"; conversationId?: string; sessions: TmuxSessionEntry[] }
 	// -- command list (.pi/commands.json) ------------------------------------
 	| { type: "commands"; commands: CommandDef[]; path: string }
 	/** The slash-command catalog for the chat input (builtin + extension +

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { randomUuid } from "../uuid";
-import { FiEdit2, FiMenu, FiPlay, FiPlus, FiRefreshCw, FiTerminal, FiTrash2, FiX } from "react-icons/fi";
+import { FiCheck, FiEdit2, FiMenu, FiPlay, FiPlus, FiRefreshCw, FiTerminal, FiTrash2, FiX } from "react-icons/fi";
 import type { ChatState, TerminalMeta } from "../use-chat";
 import type { ClientMessage, CommandDef } from "../types";
 import { TermXterm } from "./TermXterm";
@@ -52,6 +52,11 @@ export function TerminalPanel({ chat, send, terminal }: TerminalPanelProps) {
 	const [aiBashOpen, setAiBashOpen] = useState(true);
 	const [renamingTab, setRenamingTab] = useState<string | null>(null);
 	const [renameDraft, setRenameDraft] = useState("");
+	// tmux：会话展开（窗口树）、窗口重命名草稿、窗口删除两步确认。
+	const [tmuxOpen, setTmuxOpen] = useState<Record<string, boolean>>({});
+	const [renamingWin, setRenamingWin] = useState<string | null>(null);
+	const [winDraft, setWinDraft] = useState("");
+	const [confirmWinKill, setConfirmWinKill] = useState<string | null>(null);
 
 	// When the connection drops the server kills all PTYs and the reducer clears
 	// the tab list — make sure the active selection doesn't dangle.
@@ -61,6 +66,12 @@ export function TerminalPanel({ chat, send, terminal }: TerminalPanelProps) {
 			setActiveId(chat.terminals[chat.terminals.length - 1].id);
 		}
 	}, [chat.terminals, activeId]);
+
+	// tmux 领养列表：面板挂载/就绪即取一次，服务端 30s 轮询后续推送。
+	useEffect(() => {
+		if (chat.ready) send({ type: "list_tmux_sessions" });
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [chat.ready]);
 
 	// The SCM / settings panel asked to focus a specific terminal tab (git write
 	// ops, uninstall runs) — follow the request so the user sees the command run.
@@ -141,73 +152,252 @@ export function TerminalPanel({ chat, send, terminal }: TerminalPanelProps) {
 		}
 	};
 
-	// 单个终端标签（用户终端 + ai-bash 分组共用）。
-	const renderTab = (tab: TerminalMeta) => (
-		<div key={tab.id} className={`term-tab ${tab.id === activeId ? "active" : ""}`}>
-			<button
-				type="button"
-				className="term-tab-main"
-				title={`${tab.cwd}${tab.command ? `\n> ${tab.command.command}` : ""}`}
-				onClick={() => {
-					if (renamingTab) return;
-					setActiveId(tab.id);
-					setSideOpen(false);
-				}}
-			>
-				<span className={`term-tab-dot ${tab.running ? "run" : "exit"}`} />
-				<span className="term-tab-title">
-					{renamingTab === tab.id ? (
+	// tmux 窗口行：选择 / 内联重命名 / 两步确认删除（仅原生会话；领养只读）。
+	const renderTmuxWindow = (tab: TerminalMeta, w: { id: string; name: string; active: boolean; index: number }) => {
+		const key = `${tab.id}:${w.id}`;
+		const killing = confirmWinKill === key;
+		return (
+			<div key={w.id} className={`term-win ${w.active ? "active" : ""}`}>
+				<button
+					type="button"
+					className="term-win-main"
+					title={w.name}
+					onClick={() => {
+						if (renamingWin) return;
+						setActiveId(tab.id);
+						send({
+							type: "tmux_select_window",
+							terminalId: tab.id,
+							conversationId: tab.conversationId,
+							windowId: w.id,
+						});
+					}}
+				>
+					<span className="term-win-idx">{w.index}</span>
+					{renamingWin === key ? (
 						<input
 							autoFocus
 							className="term-tab-rename-input"
-							value={renameDraft}
-							placeholder={tab.title}
+							value={winDraft}
+							placeholder={w.name}
 							onClick={(e) => e.stopPropagation()}
-							onChange={(e) => setRenameDraft(e.target.value)}
+							onChange={(e) => setWinDraft(e.target.value)}
 							onKeyDown={(e) => {
 								e.stopPropagation();
 								if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-									const title = renameDraft.trim();
-									if (title)
-										send({ type: "rename_terminal", terminalId: tab.id, conversationId: tab.conversationId, title });
-									setRenamingTab(null);
+									const name = winDraft.trim();
+									if (name)
+										send({
+											type: "tmux_rename_window",
+											terminalId: tab.id,
+											conversationId: tab.conversationId,
+											windowId: w.id,
+											name,
+										});
+									setRenamingWin(null);
 								} else if (e.key === "Escape") {
-									setRenamingTab(null);
+									setRenamingWin(null);
 								}
 							}}
-							onBlur={() => setRenamingTab(null)}
+							onBlur={() => setRenamingWin(null)}
 						/>
 					) : (
-						tab.title
+						<span className="term-win-name">{w.name}</span>
 					)}
-					{!tab.running && (
-						<span className="term-tab-exit">
-							{t("exited", {
-								code: tab.exitCode === null ? "" : ` ${tab.exitCode}`,
-							})}
-						</span>
-					)}
-				</span>
-			</button>
-			<button
-				type="button"
-				className="term-tab-close term-tab-rename"
-				title={t("renameTerminal")}
-				onClick={(e) => {
-					e.stopPropagation();
-					setRenameDraft(tab.title);
-					setRenamingTab(tab.id);
-				}}
-			>
-				<FiEdit2 />
-			</button>
-			<button type="button" className="term-tab-close" title={t("closeTerminal")} onClick={() => closeTab(tab.id)}>
-				<FiX />
-			</button>
-		</div>
-	);
+				</button>
+				{!tab.tmuxAdopted && (
+					<>
+						<button
+							type="button"
+							className="term-tab-close term-tab-rename"
+							title={t("renameTerminal")}
+							onClick={(e) => {
+								e.stopPropagation();
+								setWinDraft(w.name);
+								setRenamingWin(key);
+							}}
+						>
+							<FiEdit2 />
+						</button>
+						<button
+							type="button"
+							className={`term-tab-close ${killing ? "confirm" : ""}`}
+							title={killing ? t("confirmQ") : t("delete")}
+							onClick={(e) => {
+								e.stopPropagation();
+								if (killing) {
+									setConfirmWinKill(null);
+									send({
+										type: "tmux_kill_window",
+										terminalId: tab.id,
+										conversationId: tab.conversationId,
+										windowId: w.id,
+									});
+								} else {
+									setConfirmWinKill(key);
+								}
+							}}
+						>
+							{killing ? <FiCheck /> : <FiX />}
+						</button>
+					</>
+				)}
+			</div>
+		);
+	};
 
-	// -- command list editing --------------------------------------------------
+	// tmux 会话操作行：新窗口 + 只读徽标/take control + detach（原生会话无 detach）。
+	const renderTmuxActions = (tab: TerminalMeta) => {
+		if (!tab.tmuxSession) return null;
+		return (
+			<div className="term-tmux-tree">
+				<div className="term-tmux-head">
+					<button
+						type="button"
+						className="term-tmux-act"
+						title={t("tmuxNewWindow")}
+						onClick={() => send({ type: "tmux_new_window", terminalId: tab.id, conversationId: tab.conversationId })}
+					>
+						<FiPlus />
+					</button>
+					<button
+						type="button"
+						className="term-tmux-act"
+						title={tab.tmuxReadonly ? t("tmuxTakeControl") : t("tmuxRelease")}
+						onClick={() =>
+							send({
+								type: "tmux_take_control",
+								terminalId: tab.id,
+								conversationId: tab.conversationId,
+								readonly: !tab.tmuxReadonly,
+							})
+						}
+					>
+						{tab.tmuxReadonly ? t("tmuxTakeControlShort") : t("tmuxReleaseShort")}
+					</button>
+					{tab.tmuxAdopted && (
+						<button
+							type="button"
+							className="term-tmux-act"
+							title={t("tmuxDetach")}
+							onClick={() => {
+								terminal.close(tab.id);
+								send({ type: "tmux_detach", terminalId: tab.id, conversationId: tab.conversationId });
+							}}
+						>
+							{t("tmuxDetachShort")}
+						</button>
+					)}
+				</div>
+			</div>
+		);
+	};
+
+	// 单个终端标签（用户终端 + ai-bash 分组共用）。
+	// tmux 标签直接显示会话名：重命名/删除即作用于会话本身；窗口树挂在标签下方。
+	const renderTab = (tab: TerminalMeta) => {
+		const sessionName = tab.tmuxSession;
+		const open = tmuxOpen[tab.id] ?? true;
+		const wins = tab.tmuxWindows ?? [];
+		return (
+			<div key={tab.id}>
+				<div className={`term-tab ${tab.id === activeId ? "active" : ""}`}>
+					{sessionName && wins.length > 0 && (
+						<button
+							type="button"
+							className="term-tmux-act"
+							onClick={(e) => {
+								e.stopPropagation();
+								setTmuxOpen((m) => ({ ...m, [tab.id]: !open }));
+							}}
+						>
+							{open ? "▾" : "▸"}
+						</button>
+					)}
+					<button
+						type="button"
+						className="term-tab-main"
+						title={`${tab.cwd}${tab.command ? `\n> ${tab.command.command}` : ""}`}
+						onClick={() => {
+							if (renamingTab) return;
+							setActiveId(tab.id);
+							setSideOpen(false);
+						}}
+					>
+						<span className={`term-tab-dot ${tab.running ? "run" : "exit"}`} />
+						<span className="term-tab-title">
+							{renamingTab === tab.id ? (
+								<input
+									autoFocus
+									className="term-tab-rename-input"
+									value={renameDraft}
+									placeholder={sessionName ?? tab.title}
+									onClick={(e) => e.stopPropagation()}
+									onChange={(e) => setRenameDraft(e.target.value)}
+									onKeyDown={(e) => {
+										e.stopPropagation();
+										if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+											const title = renameDraft.trim();
+											if (title)
+												send({
+													type: "rename_terminal",
+													terminalId: tab.id,
+													conversationId: tab.conversationId,
+													title,
+												});
+											setRenamingTab(null);
+										} else if (e.key === "Escape") {
+											setRenamingTab(null);
+										}
+									}}
+									onBlur={() => setRenamingTab(null)}
+								/>
+							) : (
+								(sessionName ?? tab.title)
+							)}
+							{sessionName && tab.tmuxAdopted && <span className="term-tmux-badge">{t("tmuxAdopted")}</span>}
+							{sessionName && tab.tmuxReadonly && !tab.tmuxAdopted && (
+								<span className="term-tmux-badge">{t("tmuxReadonly")}</span>
+							)}
+							{!tab.running && (
+								<span className="term-tab-exit">
+									{t("exited", {
+										code: tab.exitCode === null ? "" : ` ${tab.exitCode}`,
+									})}
+								</span>
+							)}
+						</span>
+					</button>
+					{(!sessionName || !tab.tmuxAdopted) && (
+						<button
+							type="button"
+							className="term-tab-close term-tab-rename"
+							title={t("renameTerminal")}
+							onClick={(e) => {
+								e.stopPropagation();
+								setRenameDraft(sessionName ?? tab.title);
+								setRenamingTab(tab.id);
+							}}
+						>
+							<FiEdit2 />
+						</button>
+					)}
+					{(!sessionName || !tab.tmuxAdopted) && (
+						<button
+							type="button"
+							className="term-tab-close"
+							title={t("closeTerminal")}
+							onClick={() => closeTab(tab.id)}
+						>
+							<FiX />
+						</button>
+					)}
+				</div>
+				{sessionName && renderTmuxActions(tab)}
+				{sessionName && open && <div className="term-tmux-wins">{wins.map((w) => renderTmuxWindow(tab, w))}</div>}
+			</div>
+		);
+	};
 
 	const startNew = () => {
 		setIsNew(true);
@@ -389,6 +579,49 @@ export function TerminalPanel({ chat, send, terminal }: TerminalPanelProps) {
 								{aiBashOpen && <div className="term-folder-body">{agentTabs.map(renderTab)}</div>}
 							</div>
 						)}
+						{chat.tmuxSessions.length > 0 && (
+							<div className="term-folder">
+								<div className="term-folder-header">
+									<span className="term-folder-title">{t("tmuxAdoptGroup")}</span>
+									<span className="term-folder-count">{chat.tmuxSessions.length}</span>
+								</div>
+								<div className="term-folder-body">
+									{chat.tmuxSessions.map((s) => (
+										<div key={s.name} className="term-tab">
+											<button
+												type="button"
+												className="term-tab-main"
+												title={`${s.name} (${s.windows})`}
+												onClick={() =>
+													send({
+														type: "tmux_adopt",
+														session: s.name,
+														conversationId: chat.activeConversationId || chat.state?.conversationId || "",
+													})
+												}
+											>
+												<span className="term-tab-title">{s.name}</span>
+												<span className="term-folder-count">{s.windows}</span>
+											</button>
+											<button
+												type="button"
+												className="term-tab-close term-tab-rename"
+												title={t("tmuxAdopt")}
+												onClick={() =>
+													send({
+														type: "tmux_adopt",
+														session: s.name,
+														conversationId: chat.activeConversationId || chat.state?.conversationId || "",
+													})
+												}
+											>
+												<FiPlus />
+											</button>
+										</div>
+									))}
+								</div>
+							</div>
+						)}
 					</div>
 				</div>
 			</aside>
@@ -406,21 +639,53 @@ export function TerminalPanel({ chat, send, terminal }: TerminalPanelProps) {
 						<div className="term-empty-sub">{t("termEmptySub")}</div>
 					</div>
 				) : (
-					chat.terminals.map((t) => (
-						<TermXterm
-							key={`${t.conversationId}:${t.id}`}
-							conversationId={t.conversationId}
-							terminalId={t.id}
-							command={t.command}
-							cwd={t.cwd}
-							title={t.title}
-							active={t.id === activeId}
-							running={t.running}
-							exitCode={t.exitCode}
-							send={send}
-							register={terminal.register}
-						/>
-					))
+					<>
+						{chat.terminals.map((t) => (
+							<TermXterm
+								key={`${t.conversationId}:${t.id}`}
+								conversationId={t.conversationId}
+								terminalId={t.id}
+								command={t.command}
+								cwd={t.cwd}
+								title={t.title}
+								active={t.id === activeId}
+								running={t.running}
+								exitCode={t.exitCode}
+								send={send}
+								register={terminal.register}
+							/>
+						))}
+						{(() => {
+							const cur = chat.terminals.find((x) => x.id === activeId);
+							const wins = cur?.tmuxWindows;
+							if (!cur?.tmuxSession || !wins || wins.length === 0) return null;
+							return (
+								<div className="term-statusbar">
+									<span className="term-statusbar-session">{cur.tmuxSession}</span>
+									{wins.map((w) => (
+										<button
+											key={w.id}
+											type="button"
+											className={`term-statusbar-win ${w.active ? "active" : ""}`}
+											title={w.name}
+											onClick={() => {
+												setActiveId(cur.id);
+												send({
+													type: "tmux_select_window",
+													terminalId: cur.id,
+													conversationId: cur.conversationId,
+													windowId: w.id,
+												});
+											}}
+										>
+											[{w.index}:{w.name}
+											{w.active ? "*" : ""}]
+										</button>
+									))}
+								</div>
+							);
+						})()}
+					</>
 				)}
 			</div>
 		</div>

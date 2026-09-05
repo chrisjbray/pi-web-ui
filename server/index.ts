@@ -462,6 +462,27 @@ export interface TerminalManagerLike {
 		title?: string,
 		opts?: { forceBash?: boolean; locale?: string },
 	): unknown;
+	/** v1 tmux：新建会话并只读接入（裸终端用；不可用回退 create）。 */
+	createTmux?(
+		id: string,
+		cwd: string,
+		cols: number,
+		rows: number,
+		fallbackCwd: string,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<unknown>;
+	/** 领养外部 tmux 会话（只读）。 */
+	adoptTmux?(id: string, session: string, cols: number, rows: number, title?: string): Promise<unknown>;
+	/** 推送领养候选列表并启动 30s 轮询（Terminal 面板打开时调一次）。 */
+	listAdoptablePush?(): Promise<void>;
+	/** tmux 窗口操作（树遥控）。 */
+	tmuxNewWindow?(id: string, title?: string): Promise<void>;
+	tmuxSelectWindow?(id: string, windowId: string): Promise<void>;
+	tmuxRenameWindow?(id: string, windowId: string, name: string): Promise<void>;
+	tmuxKillWindow?(id: string, windowId: string): Promise<void>;
+	tmuxTakeControl?(id: string, readonly: boolean): Promise<void>;
+	tmuxDetach?(id: string): Promise<void>;
 	input(id: string, data: string): void;
 	resize(id: string, cols: number, rows: number): void;
 	kill(id: string): void;
@@ -956,16 +977,31 @@ wss.on("connection", (ws) => {
 				break;
 			case "terminal_create": {
 				const tm = cs.getTerminalManager(msg.conversationId);
-				if (tm)
-					tm.create(
-						msg.terminalId,
-						msg.cwd,
-						msg.cols,
-						msg.rows,
-						cs.getTerminalCwd(msg.conversationId),
-						msg.title,
-						msg.locale ? { locale: msg.locale } : undefined,
-					);
+				if (tm) {
+					// v1 tmux：裸终端走 tmux 会话（不可用回退直连）；TermXterm 只发
+					// terminal_create 给裸 shell，run_command 保持直连。
+					if (typeof tm.createTmux === "function") {
+						void tm.createTmux(
+							msg.terminalId,
+							msg.cwd,
+							msg.cols,
+							msg.rows,
+							cs.getTerminalCwd(msg.conversationId),
+							msg.title,
+							msg.locale ? { locale: msg.locale } : undefined,
+						);
+					} else {
+						tm.create(
+							msg.terminalId,
+							msg.cwd,
+							msg.cols,
+							msg.rows,
+							cs.getTerminalCwd(msg.conversationId),
+							msg.title,
+							msg.locale ? { locale: msg.locale } : undefined,
+						);
+					}
+				}
 				break;
 			}
 			case "terminal_input":
@@ -979,6 +1015,32 @@ wss.on("connection", (ws) => {
 				break;
 			case "rename_terminal":
 				cs.getTerminalManager(msg.conversationId)?.rename(msg.terminalId, msg.title);
+				break;
+			case "tmux_new_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxNewWindow?.(msg.terminalId, msg.title);
+				break;
+			case "tmux_select_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxSelectWindow?.(msg.terminalId, msg.windowId);
+				break;
+			case "tmux_rename_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxRenameWindow?.(msg.terminalId, msg.windowId, msg.name);
+				break;
+			case "tmux_kill_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxKillWindow?.(msg.terminalId, msg.windowId);
+				break;
+			case "tmux_take_control":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxTakeControl?.(msg.terminalId, msg.readonly);
+				break;
+			case "tmux_adopt":
+				void cs
+					.getTerminalManager(msg.conversationId)
+					?.adoptTmux?.(`adopt-${Date.now().toString(36)}`, msg.session, 120, 40, msg.session);
+				break;
+			case "tmux_detach":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxDetach?.(msg.terminalId);
+				break;
+			case "list_tmux_sessions":
+				void cs.getTerminalManager(msg.conversationId)?.listAdoptablePush?.();
 				break;
 			case "run_command":
 				cs.getTerminalManager(msg.conversationId)?.runCommand(
