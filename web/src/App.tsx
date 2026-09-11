@@ -821,7 +821,7 @@ export function App() {
 					</div>
 					<div className={`view-pane ${view === "terminal" ? "" : "hidden"}`}>
 						<Suspense fallback={null}>
-							<TerminalPanel chat={chat} terminal={terminal} />
+							<TerminalPanel chat={chat} send={send} terminal={terminal} />
 						</Suspense>
 					</div>
 					<div className={`view-pane ${view === "git" ? "" : "hidden"}`}>
