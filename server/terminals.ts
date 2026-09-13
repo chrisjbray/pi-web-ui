@@ -24,9 +24,9 @@ import "./patch-node-pty.js";
 import { spawn, type IPty } from "node-pty";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { CommandDef, ServerMessage, TerminalInfo } from "./protocol.js";
-import { BASH_DESCRIPTION, BASH_PARAMETERS, BASH_PROMPT_GUIDELINES, BASH_PROMPT_SNIPPET } from "./tool-prompts.js";
-import { pick, type ServerLang } from "./i18n.js";
+import type { CommandDef, ServerMessage, TerminalInfo, TmuxSessionEntry, TmuxWindow } from "./protocol.js";
+import { bilingual, pick, type ServerLang } from "./i18n.js";
+import * as tmuxmod from "./tmux.js";
 
 // ---------------------------------------------------------------------------
 // .pi/commands.json
@@ -187,6 +187,17 @@ interface TermEntry {
 	used: boolean;
 	/** UI locale at creation ("en" = English exit banner, else Chinese). */
 	locale?: string;
+	/** tmux 会话名（v1 新建用户终端走 tmux；ai-bash/存量/回退保持 node-pty）。
+	 *  显示用；权威寻址走 tmuxSessionId（改名后不变）。 */
+	tmuxSession?: string;
+	/** tmux 会话 id（`$N`）：改名后不变，所有 tmux 命令寻址用它。 */
+	tmuxSessionId?: string;
+	/** tmux 窗口镜像（tmux 权威，树/状态栏渲染用；变更即重推 terminal_windows）。 */
+	tmuxWindows?: TmuxWindow[];
+	/** 只读接入（tmux attach -r）：防光标争夺；take control 切换读写。 */
+	tmuxReadonly?: boolean;
+	/** 领养的外部会话：只看只接管只 detach，不重命名不杀。 */
+	tmuxAdopted?: boolean;
 }
 
 const isWindows = process.platform === "win32";
@@ -820,13 +831,10 @@ export class TerminalManager {
 		private readonly lang?: () => ServerLang,
 	) {}
 
-	/** 过户：对话整体搬到另一个 ClientSession 时，把输出/退出事件改发给新宿主。
-	 *  PTY 本体不动（进程不重启，输出缓冲保留），只换投递地址. */
-	rebindEmit(emit: (msg: ServerMessage) => void): void {
-		this.emit = emit;
-	}
-
-	/** Start a plain interactive shell in the given directory. */
+	/** Start a plain interactive shell in the given directory.
+	 *
+	 *  v1 tmux 用户裸终端走 createTmux（async，会话 `pi-web-ui-<id>`，PTY 只读
+	 *  接入）；本同步 create 保留给 ai-bash/命令/回退路径（直连 node-pty）。 */
 	create(
 		id: string,
 		cwd: string,
@@ -887,6 +895,103 @@ export class TerminalManager {
 		return null;
 	}
 
+	/** v1 tmux：新建 tmux 会话并把 PTY 只读接入。
+	 *
+	 *  流程：tmux new-session -d → spawnShell 改跑 `tmux attach -r` →
+	 *  推送窗口镜像。tmux 不可用/建会话失败 → 回退普通 create（直连）。 */
+	async createTmux(
+		id: string,
+		cwd: string,
+		cols: number,
+		rows: number,
+		fallbackCwd: string,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<TerminalInfo | null> {
+		const valid = this.validateId(id);
+		if (valid) {
+			this.fail(id, valid.text, valid.textEn);
+			return null;
+		}
+		if (this.terms.has(id)) return this.info(this.terms.get(id)!);
+		if (!this.ensureSpawnAllowed(id, false)) return null;
+		this.history.delete(id);
+		const safeCwd = this.safeCwd(cwd || fallbackCwd);
+		if (!safeCwd) {
+			this.fail(
+				id,
+				pick(
+					this.lang?.() ?? "en",
+					"终端工作目录必须位于当前工作区内",
+					"Terminal cwd must be inside the current workspace",
+					"terminals.cwd.outside.workspace",
+				),
+				"Terminal cwd must be inside the current workspace",
+			);
+			return null;
+		}
+		if (!(await tmuxmod.hasTmux())) return this.create(id, cwd, cols, rows, fallbackCwd, title, opts);
+		const session = tmuxmod.tmuxSessionName(id);
+		let sessionId = "";
+		try {
+			if (!(await tmuxmod.hasSession(session))) sessionId = await tmuxmod.newSession(session, safeCwd);
+		} catch {
+			return this.create(id, cwd, cols, rows, fallbackCwd, title, opts);
+		}
+		if (
+			this.spawnShell(id, safeCwd, cols, rows, title || session, undefined, undefined, false, opts?.locale, {
+				tmuxSession: session,
+				tmuxReadonly: true,
+				tmuxSessionId: sessionId || undefined,
+			})
+		) {
+			this.maybeEmitTccHint(id);
+			this.emitList();
+			void this.refreshTmuxWindows(id);
+			return this.info(this.terms.get(id)!);
+		}
+		return null;
+	}
+
+	/** 领养外部 tmux 会话为只读标签（真终端权威；只看只接管只 detach）。 */
+	async adoptTmux(
+		id: string,
+		session: string,
+		cols: number,
+		rows: number,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<TerminalInfo | null> {
+		const valid = this.validateId(id);
+		if (valid) {
+			this.fail(id, valid.text, valid.textEn);
+			return null;
+		}
+		if (this.terms.has(id)) return this.info(this.terms.get(id)!);
+		if (!this.ensureSpawnAllowed(id, false)) return null;
+		this.history.delete(id);
+		if (!(await tmuxmod.hasTmux())) {
+			this.fail(id, "主机未安装 tmux", "tmux is not installed on this host");
+			return null;
+		}
+		if (!(await tmuxmod.hasSession(session))) {
+			this.fail(id, `tmux 会话不存在：${session}`, `tmux session does not exist: ${session}`);
+			return null;
+		}
+		if (
+			this.spawnShell(id, this.workspaceRoot, cols, rows, title || session, undefined, undefined, false, opts?.locale, {
+				tmuxSession: session,
+				tmuxReadonly: true,
+				tmuxAdopted: true,
+			})
+		) {
+			this.emitList();
+			void this.refreshTmuxWindows(id);
+			return this.info(this.terms.get(id)!);
+		}
+		return null;
+	}
+
 	/** Warn about unavailable camera/mic TCC grants in a fresh terminal, once per client. */
 	private maybeEmitTccHint(id: string): void {
 		if (this.tccHintShown || !launchdSpawnedOnMac()) return;
@@ -938,7 +1043,11 @@ export class TerminalManager {
 			if (!existing.exited) {
 				this.flushPending(existing);
 				existing.exited = true;
-				this.killNative(existing);
+				try {
+					existing.pty.kill();
+				} catch {
+					// already dead
+				}
 			}
 			cols = existing.cols || cols;
 			rows = existing.rows || rows;
@@ -996,7 +1105,11 @@ export class TerminalManager {
 		}
 	}
 
-	/** Spawn the user's shell as a PTY. Returns false when the spawn failed. */
+	/** Spawn the user's shell as a PTY. Returns false when the spawn failed.
+	 *
+	 *  tmux 模式（opts.tmuxSession）：PTY 不跑登录 shell，改跑
+	 *  `tmux attach-session -t <session> [-r]` ——浏览器是哑终端，tmux 自己画
+	 *  状态栏/分屏/窗口列表，前缀键直通。退出语义随 attach：detach 不杀会话。 */
 	private spawnShell(
 		id: string,
 		cwd: string,
@@ -1007,6 +1120,12 @@ export class TerminalManager {
 		forceBash?: boolean,
 		agentBash = false,
 		locale?: string,
+		tmux?: {
+			tmuxSession: string;
+			tmuxSessionId?: string;
+			tmuxReadonly?: boolean;
+			tmuxAdopted?: boolean;
+		},
 	): boolean {
 		let abs = cwd;
 		if (!abs) abs = homedir();
@@ -1025,7 +1144,16 @@ export class TerminalManager {
 		repairSpawnHelperPermissions();
 		let pty: IPty;
 		try {
-			const { shell, args } = forceBash ? resolveBashShell() : resolveShell();
+			// tmux 模式：PTY 跑 attach 而非 shell。-r 只读默认（防光标争夺），
+			// take control 时重建 PTY 去掉 -r。TERM 保持 xterm-256color 供状态栏用色。
+			const attachTarget = tmux?.tmuxSessionId || tmux?.tmuxSession;
+			const attach = attachTarget
+				? {
+						shell: "tmux",
+						args: ["attach-session", "-t", attachTarget, ...(tmux.tmuxReadonly === false ? [] : ["-r"])],
+					}
+				: null;
+			const { shell, args } = attach ?? (forceBash ? resolveBashShell() : resolveShell());
 			pty = spawn(shell, args, {
 				name: "xterm-256color",
 				cols: Math.max(2, Math.floor(cols) || 80),
@@ -1071,6 +1199,11 @@ export class TerminalManager {
 			// noteAgentActivity）。
 			used: agentBash || command !== undefined,
 			locale,
+			tmuxSession: tmux?.tmuxSession,
+			tmuxSessionId: tmux?.tmuxSessionId,
+			tmuxWindows: undefined,
+			tmuxReadonly: tmux?.tmuxSession ? tmux.tmuxReadonly !== false : undefined,
+			tmuxAdopted: tmux?.tmuxAdopted,
 		};
 		this.terms.set(id, entry);
 		// The closures capture `entry`: after a restart the map points at the
@@ -1247,6 +1380,10 @@ export class TerminalManager {
 			exitCode: entry.exitCode,
 			command: entry.command,
 			agentBash: entry.agentBash,
+			tmuxSession: entry.tmuxSession,
+			tmuxWindows: entry.tmuxWindows,
+			tmuxReadonly: entry.tmuxReadonly,
+			tmuxAdopted: entry.tmuxAdopted,
 		};
 	}
 
@@ -1507,14 +1644,9 @@ export class TerminalManager {
 		for (const w of pendingWatches) w.cb(null);
 		entry.exitCode = exitCode;
 		this.terms.delete(id);
-		// 进程已退出，立即释放底层的 PTY 句柄（Windows ConPTY / HPCON / sockets 等），
-		// 避免已退出的终端长期占用 ConPTY 与 MSYS2 控制台资源（issue #269）。
-		this.killNative(entry);
 		while (this.history.size >= MAX_TERMINAL_HISTORY) {
 			const oldest = this.history.keys().next().value;
 			if (typeof oldest !== "string") break;
-			const oldEntry = this.history.get(oldest);
-			if (oldEntry) this.killNative(oldEntry);
 			this.history.delete(oldest);
 		}
 		this.history.set(id, entry);
@@ -1539,9 +1671,15 @@ export class TerminalManager {
 		}
 	}
 
-	/** Kill one terminal (tab closed), including an exited terminal's retained history. */
+	/** Kill one terminal (tab closed), including an exited terminal's retained history.
+	 *
+	 *  tmux 标签：只杀接入 PTY（detach），原生会话一并杀掉（关标签=关会话）；
+	 *  领养会话不动（真终端不受影响）。 */
 	kill(id: string): void {
 		const entry = this.terms.get(id);
+		if (entry?.tmuxSession && !entry.tmuxAdopted) {
+			void tmuxmod.killSession(entry.tmuxSessionId || entry.tmuxSession).catch(() => {});
+		}
 		if (entry) {
 			this.disarmIdleWatch(entry);
 			const killedWatches = entry.watches;
@@ -1549,95 +1687,266 @@ export class TerminalManager {
 			for (const w of killedWatches) w.cb(null);
 			this.flushPending(entry);
 			entry.exited = true;
-			this.killNative(entry);
+			try {
+				entry.pty.kill();
+			} catch {
+				// already dead
+			}
 			this.terms.delete(id);
 			this.emit({ type: "terminal_exit", terminalId: id, exitCode: null });
 			this.emitList();
 			return;
 		}
-		const histEntry = this.history.get(id);
-		if (histEntry) {
-			this.killNative(histEntry);
-			this.history.delete(id);
-			this.emitList();
-			return;
-		}
+		if (this.history.delete(id)) this.emitList();
 	}
 
-	/** Rename a terminal tab (live or retained history). Empty names ignored. */
+	/** Rename a terminal tab (live or retained history). Empty names ignored.
+	 *
+	 *  tmux 标签：改的是会话名（rename-session），tab 名即会话名；id 寻址所以
+	 *  改名不断连。领养会话拒绝（真终端权威）。 */
 	rename(id: string, title: string): void {
 		const trimmed = (title ?? "").trim();
 		if (!trimmed) return;
 		const entry = this.find(id);
 		if (!entry) return;
+		if (entry.tmuxSession) {
+			if (entry.tmuxAdopted) {
+				this.fail(id, "领养会话不能重命名（真终端权威）", "Adopted sessions cannot be renamed");
+				return;
+			}
+			entry.title = trimmed;
+			entry.tmuxSession = trimmed;
+			this.emitList();
+			void (async () => {
+				try {
+					await tmuxmod.renameSession(entry.tmuxSessionId || trimmed, trimmed);
+				} catch (err) {
+					this.fail(
+						id,
+						`tmux 重命名会话失败：${(err as Error).message}`,
+						`tmux rename-session failed: ${(err as Error).message}`,
+					);
+					return;
+				}
+				await this.refreshTmuxWindows(id);
+			})();
+			return;
+		}
 		entry.title = trimmed;
 		this.emitList();
 	}
 
-	/**
-	 * Kill the native PTY (issue #215：Windows ConPTY 关机死锁；issue #269：MSYS2 控制台耗尽死锁）。
-	 *
-	 * Windows 下：
-	 * 1. 若进程已经退出（entry.exited）：直接调 pty.kill() 释放 HPCON 句柄
-	 *    （子进程已死、管道见 EOF，绝不会死锁）；关机路径跳过，由 OS 回收。
-	 * 2. 若进程尚未退出（!entry.exited）：先向 PTY 写入 \x03exit\r 优雅关闭（让
-	 *    bash 正常触发清理钩子），300ms 后仍活着再调 pty.kill() 兜底——node-pty 在
-	 *    Windows 上走 console-process-list 做**全树**清理。不再使用裸
-	 *    process.kill(pid)（TerminateProcess）：它只杀 ConPTY 附着的单一进程，
-	 *    且从拿到 pid 到调用之间隔着一个 PID 复用误杀窗口。
-	 * 3. 关机（shutdown=true）：只做优雅写，跳过 pty.kill() 与 300ms 兜底，由 OS
-	 *    回收（保持 50ms 内退出的关机预算）。
-	 * 非 Windows 原样直调 pty.kill()（POSIX 下 shell 是直接子进程，pty.kill 足够，
-	 * 保持既有行为不做额外延迟）。
-	 */
-	private killNative(entry: TermEntry, shutdown = false): void {
-		if (process.platform === "win32") {
-			if (entry.exited) {
-				if (!shutdown) {
-					try {
-						entry.pty.kill();
-					} catch {
-						// already dead
-					}
-				}
-				return;
-			}
-			// 优雅关闭：先发 Ctrl+C，再发 exit\r
-			try {
-				entry.pty.write("\x03exit\r");
-			} catch {}
-			if (shutdown) return;
-			const t = setTimeout(() => {
-				if (entry.exited) return;
-				try {
-					entry.pty.kill();
-				} catch {
-					// already dead
-				}
-			}, 300);
-			t.unref?.();
+<<<<<=======
+	// ------------------------------------------------------------------
+	// tmux 窗口操作（树遥控；tmux 是权威状态，操作后刷新镜像即收敛）
+	// ------------------------------------------------------------------
+
+	/** 刷新某 tmux 标签的窗口镜像并推送 terminal_windows。 */
+	async refreshTmuxWindows(id: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		const target = entry.tmuxSessionId || entry.tmuxSession;
+		const [windows, liveName] = await Promise.all([
+			tmuxmod.listWindows(target),
+			entry.tmuxAdopted ? Promise.resolve("") : tmuxmod.sessionName(target),
+		]);
+		const cur = this.find(id);
+		if (!cur || cur.tmuxSession !== entry.tmuxSession) return;
+		cur.tmuxWindows = windows;
+		// 外部改名（真终端 rename-session）同步回 tab 名；用户在面板改的名
+		// 本来就和会话名一致，无变化则无操作。
+		if (liveName && liveName !== cur.tmuxSession) {
+			cur.tmuxSession = liveName;
+			cur.title = liveName;
+		}
+		this.emit({
+			type: "terminal_windows",
+			terminalId: id,
+			windows: windows.map((w) => ({ id: w.id, name: w.name, active: w.active, index: w.index })),
+		});
+		this.emitList();
+	}
+
+	/** tmux 新窗口（tmux 自动编号命名；镜像刷新后树出现新行）。 */
+	async tmuxNewWindow(id: string, title?: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		try {
+			await tmuxmod.newWindow(entry.tmuxSessionId || entry.tmuxSession, title);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 新建窗口失败：${(err as Error).message}`,
+				`tmux new-window failed: ${(err as Error).message}`,
+			);
 			return;
 		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 选中窗口（树点击/切换；tmux 重绘收敛，in-pane 状态栏同步）。 */
+	async tmuxSelectWindow(id: string, windowId: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		try {
+			await tmuxmod.selectWindow(windowId);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 切换窗口失败：${(err as Error).message}`,
+				`tmux select-window failed: ${(err as Error).message}`,
+			);
+			return;
+		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 重命名窗口（仅原生会话；领养会话拒绝——真终端权威）。 */
+	async tmuxRenameWindow(id: string, windowId: string, name: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		if (entry.tmuxAdopted) {
+			this.fail(id, "领养会话的窗口不能重命名（真终端权威）", "Adopted session windows cannot be renamed");
+			return;
+		}
+		try {
+			await tmuxmod.renameWindow(windowId, name);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 重命名窗口失败：${(err as Error).message}`,
+				`tmux rename-window failed: ${(err as Error).message}`,
+			);
+			return;
+		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 杀窗口（仅原生会话；UI 两步确认）。 */
+	async tmuxKillWindow(id: string, windowId: string): Promise<void> {
+		const entry = this.find(id);
+		if (!entry?.tmuxSession) return;
+		if (entry.tmuxAdopted) {
+			this.fail(id, "领养会话的窗口不能删除（真终端权威）", "Adopted session windows cannot be killed");
+			return;
+		}
+		try {
+			await tmuxmod.killWindow(windowId);
+		} catch (err) {
+			this.fail(
+				id,
+				`tmux 删除窗口失败：${(err as Error).message}`,
+				`tmux kill-window failed: ${(err as Error).message}`,
+			);
+			return;
+		}
+		await this.refreshTmuxWindows(id);
+	}
+
+	/** tmux 只读/读写切换：重建 PTY 去掉/加上 -r（输出历史保留在 entry）。 */
+	async tmuxTakeControl(id: string, readonly: boolean): Promise<void> {
+		const entry = this.terms.get(id);
+		if (!entry?.tmuxSession) return;
+		entry.tmuxReadonly = readonly;
+		// 重建接入 PTY：杀旧 attach 进程（detach 不杀会话），起新 attach。
 		try {
 			entry.pty.kill();
 		} catch {
 			// already dead
 		}
+		this.terms.delete(id);
+		const ok = this.spawnShell(
+			id,
+			entry.cwd,
+			entry.cols,
+			entry.rows,
+			entry.title,
+			entry.command,
+			undefined,
+			entry.agentBash,
+			entry.locale,
+			{
+				tmuxSession: entry.tmuxSession,
+				tmuxSessionId: entry.tmuxSessionId,
+				tmuxReadonly: readonly,
+				tmuxAdopted: entry.tmuxAdopted,
+			},
+		);
+		if (!ok) return;
+		const fresh = this.terms.get(id);
+		if (fresh) {
+			fresh.tmuxWindows = entry.tmuxWindows;
+			// 保留历史输出：重建 PTY 是新 attach，旧输出接回避免黑屏感。
+			fresh.output = entry.output;
+			fresh.outputOffset = entry.outputOffset;
+		}
+		this.emitList();
 	}
 
-	/**
-	 * Kill every terminal owned by this conversation.
-	 * @param opts.shutdown=true = 进程关机路径（disposeAll）：Windows 下跳过
-	 * `pty.kill()`（见 killNative），只做 TerminateProcess + 状态清理，50ms 内退出。
-	 * 日常移出对话走默认 false，必须释放 HPC 句柄。
-	 */
-	killAll(opts?: { shutdown?: boolean }): void {
-		const shutdown = opts?.shutdown === true;
+	/** 前端打开 Terminal 面板时调一次：立即推一份领养列表并启动 30s 轮询。 */
+	async listAdoptablePush(): Promise<void> {
+		this.startAdoptPoll();
+		try {
+			if (!(await tmuxmod.hasTmux())) return;
+			const sessions = await this.listAdoptable();
+			this.lastAdopted = JSON.stringify(sessions);
+			this.emit({ type: "tmux_sessions", sessions });
+		} catch {
+			// best-effort
+		}
+	}
+
+	/** 领养会话 detach：杀接入 PTY，tmux 会话本身不动（真终端不受影响）。 */
+	async tmuxDetach(id: string): Promise<void> {
+		const entry = this.terms.get(id) ?? this.history.get(id);
+		if (!entry?.tmuxSession) return;
+		this.kill(id);
+	}
+
+	/** 领养轮询源数据：非本应用前缀会话（真终端开工待领养）。 */
+	async listAdoptable(): Promise<TmuxSessionEntry[]> {
+		const all = await tmuxmod.listSessions();
+		return all
+			.filter((s) => s.adopted)
+			.map((s) => ({ name: s.name, attached: s.attached, windows: s.windows, adopted: true }));
+	}
+
+	private adoptTimer: ReturnType<typeof setInterval> | null = null;
+	private lastAdopted: string = "";
+
+	/** 领养轮询（30s）：发现真终端新建/detach 的外部会话即推送 tmux_sessions。
+	 *  懒启动（首次 listAdoptable 调用），killAll 停止。变更才推送。 */
+	startAdoptPoll(): void {
+		if (this.adoptTimer) return;
+		const tick = async () => {
+			try {
+				if (!(await tmuxmod.hasTmux())) return;
+				const sessions = await this.listAdoptable();
+				const key = JSON.stringify(sessions);
+				if (key !== this.lastAdopted) {
+					this.lastAdopted = key;
+					this.emit({ type: "tmux_sessions", sessions });
+				}
+			} catch {
+				// best-effort：轮询永不抛进 dispatcher
+			}
+		};
+		void tick();
+		this.adoptTimer = setInterval(tick, tmuxmod.TMUX_ADOPT_POLL_MS);
+		this.adoptTimer.unref?.();
+	}
+
+	/** Kill every terminal owned by this conversation. */
+	killAll(): void {
 		for (const entry of this.terms.values()) {
 			this.disarmIdleWatch(entry);
 			if (entry.exited) continue;
 			entry.exited = true;
-			this.killNative(entry, shutdown);
+			try {
+				entry.pty.kill();
+			} catch {
+				// already dead
+			}
 		}
 		for (const entry of this.terms.values()) {
 			for (const wake of entry.waiters) wake();
@@ -1645,11 +1954,12 @@ export class TerminalManager {
 			for (const w of entry.watches) w.cb(null);
 			entry.watches = [];
 		}
-		for (const entry of this.history.values()) {
-			this.killNative(entry, shutdown);
-		}
 		this.terms.clear();
 		this.history.clear();
+		if (this.adoptTimer) {
+			clearInterval(this.adoptTimer);
+			this.adoptTimer = null;
+		}
 		this.emitList();
 	}
 }
@@ -1715,36 +2025,28 @@ function cleanBashOutput(raw: string): string {
  *  保留在 history 供查阅——故每调用独立 id，避免复用覆盖旧输出。 */
 let oneShotBashSeq = 0;
 
-/** head / tail 的运行时上限，与 bash 工具参数 schema 的 maximum 5000 一致
- *  （agent-service.ts）——schema 只影响提示不拦运行时（issue #462）。 */
-const MAX_HEAD_TAIL_LINES = 5000;
-
 /** 应用 head / tail 参数到输出顶层行（替代 `| head` / `| tail` 管道——管道会
  *  缓冲输出、让可见终端全程哑火，还容易白白触发静默解阻）。两者同时给时先
  *  截头再截尾。 */
 export function applyHeadTail(text: string, head?: number, tail?: number, lang: ServerLang = "en"): string {
-	// 入口钳到 schema 上限：此前只判 >0，传 1e9 会把整段缓冲灌进单条工具结果
-	// 并持久化进转录。
-	const headN = head && head > 0 ? Math.min(Math.floor(head), MAX_HEAD_TAIL_LINES) : 0;
-	const tailN = tail && tail > 0 ? Math.min(Math.floor(tail), MAX_HEAD_TAIL_LINES) : 0;
 	// 只对真实数据行切片；省略提示行单独存，最后再包回输出，避免提示行在
 	// head+tail 组合时被当成数据行参与第二次截取（导致尾部少截一行）。
 	let data = text.split("\n");
 	let headNote: string | null = null;
 	let tailNote: string | null = null;
-	if (headN && data.length > headN) {
-		const n = data.length - headN;
+	if (head && head > 0 && data.length > head) {
+		const n = data.length - head;
 		headNote = pick(lang, `…（后 ${n} 行已省略）`, `…[${n} lines omitted below]…`, "terminals.headtail.omitted.below", {
 			n,
 		});
-		data = data.slice(0, headN);
+		data = data.slice(0, head);
 	}
-	if (tailN && data.length > tailN) {
-		const n = data.length - tailN;
+	if (tail && tail > 0 && data.length > tail) {
+		const n = data.length - tail;
 		tailNote = pick(lang, `…（前 ${n} 行已省略）`, `…[${n} lines omitted above]…`, "terminals.headtail.omitted.above", {
 			n,
 		});
-		data = data.slice(-tailN);
+		data = data.slice(-tail);
 	}
 	const parts: string[] = [];
 	if (tailNote) parts.push(tailNote);
@@ -1776,12 +2078,41 @@ export function makeTerminalBashTool(
 	return defineTool({
 		name: "bash",
 		label: "Run bash command",
-		// 提示词单源：模型看到的 bash 定义由 makeAdaptiveBashTool 从 tool-prompts.ts 取，
-		// 本定义只提供终端这条执行路径（description/schema 必须与另两条一致，不另写一套）。
-		description: BASH_DESCRIPTION,
-		promptSnippet: BASH_PROMPT_SNIPPET,
-		promptGuidelines: BASH_PROMPT_GUIDELINES,
-		parameters: BASH_PARAMETERS,
+		description:
+			"Run a shell command in a visible terminal; returns full output and exit code. " +
+			"persist=false (default): a fresh one-shot terminal per call; the shell exits after the command but its output stays viewable. " +
+			"persist=true: runs in the persistent 'ai-bash' terminal — shell state (cd/venv/ssh) is retained across calls; " +
+			"terminal_read/terminal_input/terminal_key observe or interact; terminal_wait blocks on backgrounded commands. " +
+			"Run the bare command — never pipe through head/tail/more/less (output is returned complete; pipes hide live progress); use the head/tail params instead. " +
+			"For interactive commands (REPLs, y/n prompts) set persist=true and drive them with terminal_input / terminal_key.",
+		promptSnippet: "run shell commands (persist=true keeps the terminal alive across calls)",
+		parameters: Type.Object({
+			command: Type.String({ description: "The shell command to run" }),
+			timeout: Type.Optional(Type.Number({ description: "Optional timeout in seconds" })),
+			persist: Type.Optional(
+				Type.Boolean({
+					description:
+						"true → run in the persistent 'ai-bash' terminal: shell state (cd/venv/ssh) is retained across calls. " +
+						"false (default) → one-shot terminal that exits when the command finishes; output stays viewable.",
+				}),
+			),
+			head: Type.Optional(
+				Type.Integer({
+					minimum: 1,
+					maximum: 5000,
+					description:
+						"Only return the FIRST N lines of output (like `| head -N`); prefer this over piping through head.",
+				}),
+			),
+			tail: Type.Optional(
+				Type.Integer({
+					minimum: 1,
+					maximum: 5000,
+					description:
+						"Only return the LAST N lines of output (like `| tail -N`); prefer this over piping through tail.",
+				}),
+			),
+		}),
 		execute: async (_id, p, signal) => {
 			const lang: ServerLang = opts.lang?.() ?? "en";
 			const persist = p.persist ?? opts.defaultPersist();
@@ -2095,11 +2426,11 @@ export function makePersistentTerminalTools(
 			name: "terminal_create",
 			label: "Create terminal",
 			description:
-				"Create a named persistent interactive PTY. Interact via terminal_input / terminal_key; inspect output via terminal_read.",
-			promptSnippet: "drive interactive programs or long-running servers in a PTY",
-			promptGuidelines: [
-				"Use this for full-screen TUIs (vim/htop) and servers you need to observe or interrupt; prefer bash for one-shot commands",
-			],
+				"Create a named persistent interactive PTY. Interact via terminal_input / terminal_key, inspect output via terminal_read. " +
+				"Prefer bash for one-shot commands; use this (or bash persist=true) for interactive/TUI programs (REPLs, vim/htop, y/n prompts) or long-running servers to observe or interrupt.",
+			promptSnippet:
+				"run interactive programs or long-running servers in a persistent visible PTY (multi-step: " +
+				"create → input/key → read)",
 			parameters: Type.Object({
 				terminalId: Type.String({ description: "Stable terminal name" }),
 				cwd: Type.Optional(Type.String({ description: "Workspace-relative directory" })),
@@ -2268,10 +2599,10 @@ export function makePersistentTerminalTools(
 			name: "terminal_wait",
 			label: "Wait for terminal command",
 			description:
-				"Block until a bash-tool command finishes (exit marker) or timeout — no polling. " +
-				"Returns {finished, exitCode} plus output produced meanwhile; finished=false = still running (call again). " +
-				"terminal_input commands have no completion marker — use terminal_read(waitMs=…) for those.",
-			promptSnippet: "avoid polling: wait for a long bash command to finish",
+				"Block until a command started through the BASH TOOL finishes (exit marker appears) or timeout — no polling. " +
+				"Only applies to bash-tool commands; commands sent via terminal_input have no completion marker — use terminal_read(waitMs=…) for those. " +
+				"Returns {finished, exitCode} plus output produced while waiting; finished=false means still running (call again).",
+			promptSnippet: "block until a terminal's current command finishes (no polling)",
 			parameters: Type.Object({
 				terminalId: Type.String(),
 				cursor: Type.Optional(
