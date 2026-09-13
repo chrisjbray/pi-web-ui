@@ -137,6 +137,12 @@
 		"vitest": "^5.0.1"
 	},
 	"allowScripts": {
-		"node-pty@1.1.0": true
+		"node-pty@1.1.0": true,
+		"electron-winstaller@5.4.0": true,
+		"esbuild@0.25.12": true,
+		"esbuild@0.28.2": true,
+		"esbuild@0.28.1": true,
+		"protobufjs@7.6.5": true,
+		"@google/genai@1.52.0": true
 	}
 }
