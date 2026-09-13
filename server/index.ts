@@ -605,7 +605,7 @@ app.use((req, res, next) => {
 	proxyHttp(hit, req, res);
 });
 app.get("/plugins/:id/client/*", (req, res) => {
-	// SAFETY: express 4 的通配参数在运行时落在 params[0],但类型声明里没有 -- 显式取
+	// express 4 的通配参数在运行时落在 params[0]，但类型声明里没有 —— 显式取
 	const rest = String((req.params as unknown as Record<string, string | undefined>)[0] ?? "");
 	// 特权 DOM 门禁：声明了 dom 能力的插件，其 bundle 需用户逐个授权后才下发
 	// （同源 bundle 技术上拦不住 DOM 访问，门只能放在这里；见 server/plugin-dom.ts）。
@@ -882,12 +882,33 @@ export interface TerminalManagerLike {
 		fallbackCwd: string,
 		title?: string,
 		opts?: { forceBash?: boolean; locale?: string },
-	): void;
+	): unknown;
+	/** v1 tmux：新建会话并只读接入（裸终端用；不可用回退 create）。 */
+	createTmux?(
+		id: string,
+		cwd: string,
+		cols: number,
+		rows: number,
+		fallbackCwd: string,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<unknown>;
+	/** 领养外部 tmux 会话（只读）。 */
+	adoptTmux?(id: string, session: string, cols: number, rows: number, title?: string): Promise<unknown>;
+	/** 推送领养候选列表并启动 30s 轮询（Terminal 面板打开时调一次）。 */
+	listAdoptablePush?(): Promise<void>;
+	/** tmux 窗口操作（树遥控）。 */
+	tmuxNewWindow?(id: string, title?: string): Promise<void>;
+	tmuxSelectWindow?(id: string, windowId: string): Promise<void>;
+	tmuxRenameWindow?(id: string, windowId: string, name: string): Promise<void>;
+	tmuxKillWindow?(id: string, windowId: string): Promise<void>;
+	tmuxTakeControl?(id: string, readonly: boolean): Promise<void>;
+	tmuxDetach?(id: string): Promise<void>;
 	input(id: string, data: string): void;
 	resize(id: string, cols: number, rows: number): void;
 	kill(id: string): void;
 	rename(id: string, title: string): void;
-	runCommand(id: string, command: CommandDef, cols: number, rows: number, fallbackCwd: string): void;
+	runCommand(id: string, command: CommandDef, cols: number, rows: number, fallbackCwd: string): unknown;
 }
 
 export interface DispatchSession {
@@ -1406,7 +1427,6 @@ if ("schedulerStore" in service) {
 // {ok:false}，绝不抛错炸进程。
 // ---------------------------------------------------------------------------
 {
-	// SAFETY: This compatibility bridge only assigns optional plugin hooks; consumers test their presence.
 	const pm = pluginMgr as unknown as Record<string, unknown>;
 	/** 注入函数间复用的对话条目形状（与 agent-service 的 *ForPlugins 方法对齐）。 */
 	type PluginConvListItem = { id: string; title: string; cwd: string; kind: string; isStreaming: boolean };
@@ -1430,9 +1450,10 @@ if ("schedulerStore" in service) {
 		steerForPlugins?: (cid: string, t: string) => Promise<{ ok: boolean; error?: string }>;
 	};
 	/** 挑一个客户端会话：标准 pi 引擎走 service.pluginClient()，DSH/未知引擎无此方法即 undefined。 */
-	const pickClient = (): ReturnType<AgentService["pluginClient"]> => {
+	const pickClient = (): unknown => {
 		try {
-			return service instanceof AgentService ? service.pluginClient() : undefined;
+			const svc = service as unknown as { pluginClient?: () => unknown };
+			return typeof svc.pluginClient === "function" ? svc.pluginClient() : undefined;
 		} catch {
 			return undefined;
 		}
@@ -1506,7 +1527,6 @@ if ("schedulerStore" in service) {
 	// 标准 pi 引擎走 service.completeForPlugins；DSH/未知引擎回 {ok:false}，绝不抛错。
 	(pm as any).llmProvider = async (pluginId: string, req: unknown) => {
 		try {
-			// SAFETY: Only invoked after the optional method is checked; request fields are narrowed below.
 			const svc = service as unknown as {
 				completeForPlugins?: (
 					pluginId: string,
@@ -1968,6 +1988,32 @@ wss.on("connection", (ws) => {
 			case "rename_terminal":
 				cs.getTerminalManager(msg.conversationId)?.rename(msg.terminalId, msg.title);
 				break;
+			case "tmux_new_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxNewWindow?.(msg.terminalId, msg.title);
+				break;
+			case "tmux_select_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxSelectWindow?.(msg.terminalId, msg.windowId);
+				break;
+			case "tmux_rename_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxRenameWindow?.(msg.terminalId, msg.windowId, msg.name);
+				break;
+			case "tmux_kill_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxKillWindow?.(msg.terminalId, msg.windowId);
+				break;
+			case "tmux_take_control":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxTakeControl?.(msg.terminalId, msg.readonly);
+				break;
+			case "tmux_adopt":
+				void cs
+					.getTerminalManager(msg.conversationId)
+					?.adoptTmux?.(`adopt-${Date.now().toString(36)}`, msg.session, 120, 40, msg.session);
+				break;
+			case "tmux_detach":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxDetach?.(msg.terminalId);
+				break;
+			case "list_tmux_sessions":
+				void cs.getTerminalManager(msg.conversationId)?.listAdoptablePush?.();
+				break;
 			case "run_command":
 				cs.getTerminalManager(msg.conversationId)?.runCommand(
 					msg.terminalId,
@@ -2011,7 +2057,6 @@ wss.on("connection", (ws) => {
 				cs.pushSettings();
 				break;
 			case "set_settings":
-				// SAFETY: Both dispatch engines validate the explicitly enumerated settings fields below.
 				void (cs as unknown as { setSettings: (p: Record<string, unknown>) => Promise<void> }).setSettings({
 					promptMode: msg.promptMode,
 					customSystemPrompt: msg.customSystemPrompt,
