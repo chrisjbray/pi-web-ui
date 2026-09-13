@@ -16,29 +16,23 @@
  *   all share one conversation list per project.
  *   PI_CODING_AGENT_DIR  pi config dir (auth/models/skills) — passed to the SDK
  */
-// MUST be imported before the SDK is loaded so on-disk patches apply cleanly.
-import "./patch-remote-catalog.js";
-import "./patch-turn-end-boundary.js";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer, request as proxyRequest, type IncomingMessage } from "node:http";
 import { createConnection } from "node:net";
 import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import express from "express";
 import compression from "compression";
 import { WebSocket, WebSocketServer } from "ws";
 import { VERSION, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { sdkCopies, sdkOriginNote } from "./sdk-origin.js";
 import { PROTOCOL_VERSION } from "./protocol-version.js";
 import { AgentService, workspacePath, QuiesceRejectedError } from "./agent-service.js";
 import { WS_MAX_PAYLOAD_BYTES, isAbsoluteWirePath, wireToAbs } from "./files-service.js";
-import { httpHostAllowed } from "./host-guard.js";
 import { registerFileTransferRoutes } from "./file-transfer-routes.js";
-import { initAttachmentStore, readAttachment } from "./attachment-store.js";
-import { isAudioFile, previewKind } from "./text-sniff.js";
+import { previewKind } from "./text-sniff.js";
 import { startControlServer } from "./control-socket.js";
 import { scheduleUploadCleanup } from "./uploads.js";
 import { ensureWindowsBash, windowsBashDir } from "./ensure-bash.js";
@@ -47,8 +41,6 @@ import { isManaged, managedRefusal } from "./managed.js";
 import { launchOrigin, toServiceInfo } from "./launch-origin.js";
 import { parseTabs, tabsRefusal } from "./tabs.js";
 import { recordUnknownWsType } from "./ws-unknown-types.js";
-import { validateClientId } from "./ws-client-id.js";
-import { PendingCommandQueue } from "./ws-pending-queue.js";
 import {
 	installPack,
 	isKnownPack,
@@ -61,25 +53,20 @@ import {
 import {
 	PluginManager,
 	resolvePluginClientFile,
-	type PluginChatRequest,
 	type PluginConversationSnapshot,
 	type PluginRunEvent,
 } from "./plugins.js";
-import type { GuardedToolName, ToolPostRequest, ToolPreRequest } from "./plugin-tool-guard.js";
-import { buildPluginJobArgs, confirmPluginInstall, inspectInstallSpec, PluginInstaller } from "./plugin-installer.js";
+import { PluginInstaller } from "./plugin-installer.js";
 import { syncPluginCatalog } from "./plugin-catalog-sync.js";
 import type { ServerLang } from "./i18n.js";
 import { McpBridge } from "./mcp-bridge.js";
 import { createMcpHotReload } from "./mcp-hot-reload.js";
 import { createHostMetricsSampler } from "./host-metrics.js";
-import { SchedulerStore, SchedulerValidationError } from "./scheduler-tasks.js";
-import { initHttpProxy } from "./http-proxy.js";
-import { globalLspPool } from "./lsp-tool.js";
-import { buildPiWebTokenCookie, decodeCookieToken, isTlsRequest } from "./auth-cookie.js";
+import { SchedulerStore } from "./scheduler-tasks.js";
+import { buildPiWebTokenCookie, isTlsRequest } from "./auth-cookie.js";
 import type {
 	BgServer,
 	ClientMessage,
-	UiApprovalRule,
 	UiLayoutPrefs,
 	CommandDef,
 	PromptAttachment,
@@ -119,40 +106,8 @@ function cliFlag(name: string): string | undefined {
 }
 
 const PORT = Number(cliFlag("--port") ?? process.env.PI_WEB_PORT ?? 8787);
-// #506：直启路径与 bin 层对齐做端口校验——`--port abc` / `PI_WEB_PORT=abc` 之前会
-// listen(NaN) 被 Node 当 0 绑到随机端口，且日志打印 http://localhost:NaN。
-if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
-	console.error(`无效端口: ${cliFlag("--port") ?? process.env.PI_WEB_PORT} (--port / PI_WEB_PORT)`);
-	console.error(`Invalid port: ${cliFlag("--port") ?? process.env.PI_WEB_PORT} (--port / PI_WEB_PORT)`);
-	process.exit(1);
-}
 const CWD = resolve(cliFlag("--cwd") ?? process.env.PI_WEB_CWD ?? process.cwd());
 const DATA_DIR = resolve(cliFlag("--data-dir") ?? process.env.PI_WEB_DATA_DIR ?? join(homedir(), ".pi-web"));
-// The data dir is where the control socket, client state, plugins, themes and
-// uploads live, but nothing guarantees it exists on a first run (a fresh
-// `server install` never creates it). The control socket binds at startup —
-// before any store gets a chance to mkdir its own subdirectory — and bind()
-// into a missing directory fails with EACCES, silently disabling the whole
-// control channel (status/quiesce) for that process. Create it up front.
-try {
-	mkdirSync(DATA_DIR, { recursive: true });
-} catch (err) {
-	console.warn(`[data] 无法创建数据目录 ${DATA_DIR}: ${(err as Error).message}`);
-}
-// issue #295：工作区直接就是家目录时，SDK 初始化期的同步目录扫描会落在 $HOME 上
-// （iCloud 占位符/外部卷坏挂载 → scandir/open 内核挂起 → 事件循环假死，hello 后无
-// ready）。新装服务默认已是 ~/pi-web-ui（见 bin/pi-web-ui.mjs serviceOptions）；
-// 老服务若仍指着家目录，在此提示一次，`server install` 重装即迁移。
-try {
-	if (resolve(CWD) === resolve(homedir())) {
-		console.warn(
-			`[ws] 工作区为用户主目录 ${CWD}：目录扫描可能因外部卷/同步盘挂载而长时间阻塞，` +
-				`建议用 \`pi-web-ui server install --cwd <项目目录>\` 重装迁移。`,
-		);
-	}
-} catch {
-	/* 路径比较失败不影响启动 */
-}
 // Dev-no-cache setting read without a ClientStateStore instance (the index.html
 // route runs before any client attaches). Reads the same global settings blob.
 function readDevNoCacheSetting(): boolean | undefined {
@@ -233,12 +188,6 @@ function buildId(): string {
 // honors PI_CODING_AGENT_DIR).
 const SESSION_DIR_ROOT = join(getAgentDir(), "sessions");
 
-// Propagate pi agent's httpProxy setting and environment proxies to undici/fetch
-const proxyInfo = initHttpProxy(getAgentDir());
-if (proxyInfo.active) {
-	console.log(`[proxy] Outbound HTTP proxy enabled: ${proxyInfo.proxyUrl}`);
-}
-
 // Windows 轻量 bash 兜底：把 <home>/.pi-web/bin 前置到 PATH（SDK 的 bash 工具经
 // findBashOnPath 会找到其中的 bash.exe），并在无 Git Bash 时后台下载 busybox-w32。
 // 终端面板的 shell 探测链也已包含该目录（见 terminals.ts resolveShell）。
@@ -248,21 +197,6 @@ if (process.platform === "win32") {
 }
 
 const app = express();
-// Host 白名单（防 DNS rebinding，审查 #352）：无 token 部署下 HTTP 路由此前
-// 不校验 Host，恶意网页让自己的域名解析到 127.0.0.1 即可打满全部 API。
-// 显式白名单走 PI_WEB_ALLOW_HOSTS（与 WS 侧同 env）；设置了 PI_WEB_TOKEN 则
-// 由 token 鉴权兜底，不再限制 Host。WS 升级侧同规则见 originAllowed()。
-app.use((req, res, next) => {
-	const hostHeader = req.headers.host;
-	if (
-		typeof hostHeader === "string" &&
-		!httpHostAllowed(hostHeader, { allowHosts: ALLOW_HOSTS, hasAuthToken: Boolean(AUTH_TOKEN) })
-	) {
-		res.status(403).end("host not allowed");
-		return;
-	}
-	next();
-});
 app.use(express.json({ limit: "10mb" }));
 
 /** 从请求中提取候选 token：头 / 查询参数 / cookie（浏览器导航场景靠 cookie 续命）。 */
@@ -282,52 +216,25 @@ function requestTokens(req: { headers: IncomingMessage["headers"]; url?: string 
 	if (typeof cookie === "string") {
 		for (const part of cookie.split(";")) {
 			const [k, ...rest] = part.trim().split("=");
-			if (k !== "pi_web_token") continue;
-			// 我们下发的是 encodeURIComponent 后的值（issue #261），而手写 / 旧客户端的
-			// 明文 cookie 也可能出现（`=` 在值里合法，按首个 = 切分）；两种候选都进池子。
-			const raw = rest.join("=").trim();
-			if (!raw) continue;
-			out.push(raw);
-			const decoded = decodeCookieToken(raw);
-			if (decoded !== raw) out.push(decoded);
+			if (k === "pi_web_token") out.push(rest.join("=").trim());
 		}
 	}
 	return out.filter(Boolean);
 }
 
-/** 口令比较用常时时间：先哈希到定长再 timingSafeEqual（长度差异被摘要抹平），
- *  消除逐字节短路比较的时序侧信道（审查 #352：纵深防御，远程可利用性低）。 */
-function sameSecret(candidate: string): boolean {
-	const a = createHash("sha256").update(candidate).digest();
-	const b = createHash("sha256").update(AUTH_TOKEN).digest();
-	return timingSafeEqual(a, b);
-}
-
 function tokenOk(req: Parameters<typeof requestTokens>[0]): boolean {
-	return requestTokens(req).some(sameSecret);
+	return requestTokens(req).includes(AUTH_TOKEN);
 }
 
-/** 请求携带的 pi_web_token cookie 的**口令值**（未带/损坏时为空串）。
- *  已解码：下发时是 `encodeURIComponent` 过的（issue #261），所以这里拿到的是
- *  可直接与 `AUTH_TOKEN` 比较的原文。 */
+/** 请求携带的 pi_web_token cookie 值（未带/损坏时为空串）。 */
 function cookieToken(req: { headers: IncomingMessage["headers"] }): string {
 	const cookie = req.headers.cookie;
 	if (typeof cookie !== "string") return "";
 	for (const part of cookie.split(";")) {
 		const [k, ...rest] = part.trim().split("=");
-		if (k === "pi_web_token") return decodeCookieToken(rest.join("=").trim());
+		if (k === "pi_web_token") return rest.join("=").trim();
 	}
 	return "";
-}
-
-/** Express 5 命名通配 `*splat` 的取值：单段是字符串，多段是字符串数组
- *  （issue #225：直接 String() 会把多段用逗号拼成 "a,b.mjs"，插件 vendor 子
- *  目录、嵌套文件预览、插件子路径 API 全 404）。统一拼回 "/" 即得 Express 4
- *  语义；下游既有的越界/包含校验（workspacePath / resolvePluginClientFile）不变。 */
-function splatParam(req: { params: unknown }): string {
-	const v = (req.params as unknown as Record<string, string | string[] | undefined>).splat;
-	if (Array.isArray(v)) return v.join("/");
-	return String(v ?? "");
 }
 
 if (AUTH_TOKEN) {
@@ -343,10 +250,7 @@ if (AUTH_TOKEN) {
 		// Secure 只在 TLS 连接上加：常加会让明文 HTTP（默认 loopback）收不到 cookie。
 		const secure = isTlsRequest(req);
 		if (ok) {
-			// cookieToken 已解码成原文（issue #261），所以直接和原始口令比 ——
-			// 以前拿 `encodeURIComponent(AUTH_TOKEN)` 比，含 `=` / 非 ASCII 的口令
-			// 永远不相等（于是每个请求都重发 cookie，且带 cookie 的请求反而 401）。
-			if (!sameSecret(cookie)) {
+			if (cookie !== encodeURIComponent(AUTH_TOKEN)) {
 				res.setHeader("Set-Cookie", buildPiWebTokenCookie(encodeURIComponent(AUTH_TOKEN), 31536000, secure));
 			}
 		} else if (cookie) {
@@ -388,46 +292,7 @@ const TABS = parseTabs();
 registerFileTransferRoutes(app, (clientId) => service.get(clientId)?.cwd);
 
 app.get("/api/health", (_req, res) => {
-	// 审查 #352：该端点对未鉴权开放（监控探针需要），故只保留版本/引擎与 SDK
-	// 副本诊断信息，不再暴露 cwd（工作区路径披露）与 pid（指纹/信息收集面）。
-	res.json({
-		ok: true,
-		piVersion: VERSION,
-		// issue #260：服务实际加载的是自带副本，不是全局 pi CLI 那份。这里把两份都报出来，
-		// 用户就不用猜「为什么升了全局 SDK 不生效」。（纯新增字段，piVersion 语义不变。）
-		piSdkCopies: sdkCopies(),
-		engine: ENGINE,
-	});
-});
-
-/**
- * 基于 SHA-256 内容寻址的附件静态服务：
- * 永久强缓存（immutable），支持图片和文件读取。
- */
-app.get("/api/attachment/:hash", async (req, res) => {
-	try {
-		const hash = String(req.params.hash ?? "").trim();
-		const hit = await readAttachment(hash);
-		if (!hit) {
-			res.status(404).end("attachment not found");
-			return;
-		}
-		res.setHeader("Content-Type", hit.mimeType);
-		res.setHeader("Content-Length", hit.buffer.length);
-		res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-		if (hit.mimeType === "image/svg+xml") {
-			// SVG 以文档形态打开（顶层导航/iframe）时内嵌 <script> 会在本应用
-			// origin 执行——附件内容可来自剪贴板/工作区文件，等同存储型 XSS
-			// （审查 #352 P0-1）。sandbox CSP 让文档形态降级到不透明 origin；
-			// <img> 引用不受影响（子资源响应的 CSP 不作用于引用页，且
-			// SVG-as-image 本就不执行脚本）。
-			res.setHeader("Content-Security-Policy", "sandbox");
-			res.setHeader("X-Content-Type-Options", "nosniff");
-		}
-		res.end(hit.buffer);
-	} catch (err) {
-		res.status(500).end((err as Error).message);
-	}
+	res.json({ ok: true, piVersion: VERSION, cwd: CWD, pid: process.pid, engine: ENGINE });
 });
 
 /**
@@ -435,9 +300,7 @@ app.get("/api/attachment/:hash", async (req, res) => {
  *
  * Media preview (no download param): only image/video kinds are served —
  * text goes over the WebSocket, and exe/jar/etc. are never exposed here.
- * Audio files (isAudioFile: browser-playable containers only) are allowed too
- * so present_files cards and the preview dialog can inline-play them.
- * express's sendFile handles Range requests, so video/audio seeking works.
+ * express's sendFile handles Range requests, so video seeking works.
  *
  * Download (?download=1): any file kind is served with
  * Content-Disposition: attachment so the browser saves it instead of
@@ -473,8 +336,7 @@ app.get("/api/file", async (req, res) => {
 		// allowlist them explicitly here.
 		const lower = name.toLowerCase();
 		const isHtmlPreview = lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml");
-		const isAudioPreview = isAudioFile(name);
-		if (!isDownload && kind !== "image" && kind !== "video" && !isHtmlPreview && !isAudioPreview) {
+		if (!isDownload && kind !== "image" && kind !== "video" && !isHtmlPreview) {
 			res.status(400).end("not a previewable media file");
 			return;
 		}
@@ -486,12 +348,7 @@ app.get("/api/file", async (req, res) => {
 		if (isDownload) {
 			// res.download sets Content-Disposition: attachment and RFC 5987
 			// filename* encoding for non-ASCII names.
-			// dotfiles: allow — issue #223：Express 5 的 send 默认 dotfiles=ignore，
-			// 工作区/数据目录常位于隐藏目录下（如 ~/.pi-web），绝对路径含点号段会被判 404。
-			// 路径已由上方的 workspacePath/isAbsoluteWirePath 做工作区 containment 校验，放行安全。
-			// 注：绝对 wire 路径分支是机器浏览设计（whole-machine browsing），
-			// 不受工作区约束——别被注释误导（审查 #352）。
-			res.download(abs, name, { dotfiles: "allow" });
+			res.download(abs, name);
 		} else {
 			if (isHtmlPreview) {
 				// Sandbox even a top-level navigation to this URL: a workspace
@@ -506,13 +363,8 @@ app.get("/api/file", async (req, res) => {
 				const allowJs = req.query.allowJs === "1";
 				res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
 				res.setHeader("X-Content-Type-Options", "nosniff");
-			} else if (lower.endsWith(".svg")) {
-				// 与 /api/attachment 同理：SVG 文档形态的 <script> 沙箱化
-				// （审查 #352 P0-1），<img> 内嵌用法不受影响。
-				res.setHeader("Content-Security-Policy", "sandbox");
-				res.setHeader("X-Content-Type-Options", "nosniff");
 			}
-			res.sendFile(abs, { dotfiles: "allow" });
+			res.sendFile(abs);
 		}
 	} catch {
 		res.status(404).end("not found");
@@ -535,10 +387,10 @@ app.get("/api/file", async (req, res) => {
  * get a sandboxed CSP (?allowJs=1 relaxes scripts only — never same-origin),
  * everything else streams with its real content type.
  */
-app.get("/api/preview/*splat", async (req, res) => {
+app.get("/api/preview/*", async (req, res) => {
 	try {
-		// 多段路径的 splat 是数组（见 splatParam），拼回 "/" 后才是线形路径。
-		const captured = splatParam(req);
+		// SAFETY: Express wildcard captures are indexed string route parameters.
+		const captured = String((req.params as unknown as Record<string, string>)[0] ?? "");
 		const ABS_MARKER = "__abs__/";
 		const cid = typeof req.query.clientId === "string" ? req.query.clientId : "";
 		const cs = cid ? service.get(cid) : undefined;
@@ -574,11 +426,8 @@ app.get("/api/preview/*splat", async (req, res) => {
 		if (lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml")) {
 			const allowJs = req.query.allowJs === "1";
 			res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
-		} else if (lower.endsWith(".svg")) {
-			// 与 /api/attachment 同理：SVG 文档形态的 <script> 沙箱化（审查 #352 P0-1）。
-			res.setHeader("Content-Security-Policy", "sandbox");
 		}
-		res.sendFile(abs, { dotfiles: "allow" });
+		res.sendFile(abs);
 	} catch {
 		res.status(404).end("not found");
 	}
@@ -676,10 +525,7 @@ app.get("/themes/:id.css", (req, res) => {
 	}
 	res.setHeader("Content-Type", "text/css; charset=utf-8");
 	res.setHeader("Cache-Control", "no-cache");
-	// dotfiles: allow — issue #223：Express 5 的 send 默认 dotfiles=ignore，主题文件位于
-	// 隐藏目录下（如 ~/.pi-web/themes、npm 全局目录 ~/.local/…）时会被判 404。路径已由
-	// resolveThemeFile 校验（id 白名单 + 仅已知目录 + isFile），放行安全。
-	res.sendFile(file, { dotfiles: "allow" });
+	res.sendFile(file);
 });
 
 // Plugin client bundles: <dataDir>/plugins/<id>/client/* served at
@@ -691,9 +537,9 @@ const PLUGINS_DIR = join(DATA_DIR, "plugins");
 // 插件 HTTP 路由挂载点：host.route("GET", "/inbox") 实际暴露为
 // /plugins-api/<id>/inbox。PI_WEB_TOKEN 鉴权（上方 app.use）自动覆盖；
 // 响应已在前面过了 express.json。注意不要在此 catch-all 里消费 body。
-app.all(["/plugins-api/:id/*splat", "/plugins-api/:id"], (req, res) => {
-	// 多段子路径的 splat 是数组（见 splatParam），拼回 "/" 后再交插件路由。
-	const rest = splatParam(req);
+app.all(["/plugins-api/:id/*", "/plugins-api/:id"], (req, res) => {
+	// SAFETY: Express wildcard captures are strings indexed by 0.
+	const rest = String((req.params as unknown as Record<string, string | undefined>)[0] ?? "");
 	pluginMgr.handleHttp(String(req.params.id ?? ""), req.method, rest, req, res);
 });
 /** 通用插件代理（host.registerProxy 注册的前缀落到这里）：去前缀后原样透传到
@@ -758,9 +604,9 @@ app.use((req, res, next) => {
 	}
 	proxyHttp(hit, req, res);
 });
-app.get("/plugins/:id/client/*splat", (req, res) => {
-	// 多段子路径（插件 vendor/分包）的 splat 是数组（见 splatParam），拼回 "/"。
-	const rest = splatParam(req);
+app.get("/plugins/:id/client/*", (req, res) => {
+	// express 4 的通配参数在运行时落在 params[0]，但类型声明里没有 —— 显式取
+	const rest = String((req.params as unknown as Record<string, string | undefined>)[0] ?? "");
 	// 特权 DOM 门禁：声明了 dom 能力的插件，其 bundle 需用户逐个授权后才下发
 	// （同源 bundle 技术上拦不住 DOM 访问，门只能放在这里；见 server/plugin-dom.ts）。
 	if (pluginMgr.isDomBundleBlocked(String(req.params.id ?? ""))) {
@@ -777,8 +623,7 @@ app.get("/plugins/:id/client/*splat", (req, res) => {
 		res.setHeader("Content-Type", "text/javascript; charset=utf-8");
 	}
 	res.setHeader("Cache-Control", "no-cache"); // 开发期改文件即生效
-	// dotfiles: allow — issue #223：插件目录默认在 ~/.pi-web/plugins（隐藏目录段），同上需放行。
-	res.sendFile(abs, { dotfiles: "allow" }, (err) => {
+	res.sendFile(abs, (err) => {
 		if (err && !res.headersSent)
 			res
 				.status((err as NodeJS.ErrnoException & { statusCode?: number }).statusCode === 404 ? 404 : 500)
@@ -839,8 +684,7 @@ if (existsSync(webDist)) {
 		const stored = readDevNoCacheSetting();
 		const noStore = stored ?? envDefault;
 		res.setHeader("Cache-Control", noStore ? "no-store" : "public, max-age=0");
-		// dotfiles: allow — issue #223：nvm 等安装路径本身在隐藏目录下（如 ~/.nvm/…），同上需放行。
-		res.sendFile(join(webDist, "index.html"), { dotfiles: "allow" }, (err) => {
+		res.sendFile(join(webDist, "index.html"), (err) => {
 			if (err && !res.headersSent) {
 				res.status(503).send("正在更新 pi-web-ui，请稍后刷新…");
 			}
@@ -896,13 +740,8 @@ function parseAuthority(a: string): { hostname: string; port: string } {
 }
 
 function originAllowed(req: IncomingMessage): boolean {
-	const hostHeader = req.headers.host ?? "";
-	// Host 白名单与 HTTP 侧同规则（审查 #352）：rebinding 下 Origin 会与
-	// 攻击者 Host 自比相等，必须先把非本机/私网的 Host 挡掉。
-	if (!httpHostAllowed(hostHeader, { allowHosts: ALLOW_HOSTS, hasAuthToken: Boolean(AUTH_TOKEN) })) {
-		return false;
-	}
-	const host = parseAuthority(hostHeader.toLowerCase());
+	const hostHeader = (req.headers.host ?? "").toLowerCase();
+	const host = parseAuthority(hostHeader);
 	if (ALLOW_HOSTS.length > 0 && !ALLOW_HOSTS.includes(host.hostname)) {
 		return false;
 	}
@@ -1004,14 +843,6 @@ httpServer.on("upgrade", (req, socket, head) => {
 // closing sockets, sleep/wake, network partitions). Also broadcasts lightweight
 // server host metrics (CPU and memory usage) sampled every ~2s.
 const HEARTBEAT_INTERVAL_MS = 2_000;
-/** 全局广播与心跳推送背压阈值（256KB）：socket 积压时丢弃广播消息，防用户态无界堆积（issue #460）。 */
-const BROADCAST_BACKPRESSURE_MAX_BYTES = 262_144;
-
-interface TrackedWebSocket extends WebSocket {
-	isAlive?: boolean;
-	missedPings?: number;
-}
-
 const sampleHostMetrics = createHostMetricsSampler();
 
 const heartbeatTimer = setInterval(() => {
@@ -1025,36 +856,8 @@ const heartbeatTimer = setInterval(() => {
 	if (wss.clients.size > 0) {
 		const payload = JSON.stringify(message);
 		for (const ws of wss.clients) {
-			if (ws.readyState !== WebSocket.OPEN) continue;
-			const tracked = ws as TrackedWebSocket;
-
-			// 半开连接死连接回收（issue #460）：连续无活动/无 pong 则 terminate
-			if (tracked.isAlive === false) {
-				tracked.missedPings = (tracked.missedPings || 0) + 1;
-				if (tracked.missedPings >= 3) {
-					try {
-						ws.terminate?.();
-					} catch {}
-					continue;
-				}
-			} else {
-				tracked.missedPings = 0;
-			}
-			tracked.isAlive = false;
-			try {
-				ws.ping();
-			} catch {
-				try {
-					ws.terminate?.();
-				} catch {}
-				continue;
-			}
-
-			// 广播背压：缓冲积压严重时跳过心跳推送
-			if (ws.bufferedAmount <= BROADCAST_BACKPRESSURE_MAX_BYTES) {
-				try {
-					ws.send(payload);
-				} catch {}
+			if (ws.readyState === WebSocket.OPEN) {
+				ws.send(payload);
 			}
 		}
 	}
@@ -1079,12 +882,33 @@ export interface TerminalManagerLike {
 		fallbackCwd: string,
 		title?: string,
 		opts?: { forceBash?: boolean; locale?: string },
-	): void;
+	): unknown;
+	/** v1 tmux：新建会话并只读接入（裸终端用；不可用回退 create）。 */
+	createTmux?(
+		id: string,
+		cwd: string,
+		cols: number,
+		rows: number,
+		fallbackCwd: string,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<unknown>;
+	/** 领养外部 tmux 会话（只读）。 */
+	adoptTmux?(id: string, session: string, cols: number, rows: number, title?: string): Promise<unknown>;
+	/** 推送领养候选列表并启动 30s 轮询（Terminal 面板打开时调一次）。 */
+	listAdoptablePush?(): Promise<void>;
+	/** tmux 窗口操作（树遥控）。 */
+	tmuxNewWindow?(id: string, title?: string): Promise<void>;
+	tmuxSelectWindow?(id: string, windowId: string): Promise<void>;
+	tmuxRenameWindow?(id: string, windowId: string, name: string): Promise<void>;
+	tmuxKillWindow?(id: string, windowId: string): Promise<void>;
+	tmuxTakeControl?(id: string, readonly: boolean): Promise<void>;
+	tmuxDetach?(id: string): Promise<void>;
 	input(id: string, data: string): void;
 	resize(id: string, cols: number, rows: number): void;
 	kill(id: string): void;
 	rename(id: string, title: string): void;
-	runCommand(id: string, command: CommandDef, cols: number, rows: number, fallbackCwd: string): void;
+	runCommand(id: string, command: CommandDef, cols: number, rows: number, fallbackCwd: string): unknown;
 }
 
 export interface DispatchSession {
@@ -1106,19 +930,12 @@ export interface DispatchSession {
 	/** 返回值语义见 SlashHost.newChat：布尔值 = 是否落在一个可接收首条的空白
 	 *  新对话（/new <prompt> 用）。此处只管转发，返回值被丢弃，故允许 void。
 	 *  preset = DSH Agent 预设（pi 引擎忽略）。 */
-	newChat(preset?: string, ephemeral?: boolean): Promise<boolean | void>;
+	newChat(preset?: string): Promise<boolean | void>;
 	editMessage(messageId: string, text: string, attachments?: PromptAttachment[]): Promise<void>;
-	forkSession?(messageId: string, position?: "before" | "at", targetConvId?: string): Promise<void>;
 	cycleModel(): Promise<void>;
 	cycleThinking(): void;
 	flushSnapshot(forceFull?: boolean): void;
 	pushSlashCommands(): Promise<void>;
-	/** 取一条工具的**定义说明** → `tool_info`（工具卡右键 → 「显示工具详细信息」）。
-	 *  pi 与 dsh 都实现了；缺失时 dispatch 回 `unsupported`（不静默 —— 否则点开弹窗
-	 *  会永远停在「读取中」）。 */
-	getToolInfo?(name: string): void | Promise<void>;
-	/** 查询被某个压缩卡片折叠的历史消息（按需惰性加载，issue #398）。 */
-	getCompactedMessages?(compactionMessageId: string, targetConvId?: string): void | Promise<void>;
 	refreshSessions(): Promise<void>;
 	pushProjects(): Promise<void>;
 	removeProject(path: string): Promise<void>;
@@ -1127,14 +944,6 @@ export interface DispatchSession {
 	renameConversation(id: string, name: string): Promise<void>;
 	dismissConversation(id: string, withFinishedSubagents?: boolean, force?: boolean): Promise<void>;
 	dismissFinishedSubagents(parentId?: string): Promise<void>;
-	handoffSubagent?(fromRunId: string, toRunId: string, payload: string): Promise<void>;
-	persistConversation?(id: string): Promise<void>;
-	setConversationPinned?(id: string, pinned: boolean): Promise<void>;
-	pinSession?(path: string, pinned: boolean): Promise<void>;
-	updatePlanStep?(stepId: string, patch: Partial<import("./protocol.js").PlanStep>, conversationId?: string): void;
-	deletePlanStep?(stepId: string, conversationId?: string): void;
-	addPlanStep?(step: import("./protocol.js").PlanStep, afterStepId?: string, conversationId?: string): void;
-	planCleanHandoff?(steps: import("./protocol.js").PlanStep[], promptText: string): Promise<void>;
 	switchSession(path: string): Promise<void>;
 	switchConversation(id: string): Promise<void>;
 	listFiles(path?: string): Promise<void>;
@@ -1145,9 +954,6 @@ export interface DispatchSession {
 		reqId: number,
 		opts?: { path?: string; hash?: string },
 	): Promise<void>;
-	/** SCM「AI 生成提交信息」（scm_commitmsg）：当前模型一次性补全，应答 kind
-	 *  "commitmsg" 的 scm_data；pi 引擎之外的会话实现缺失时分发处兜底报错。 */
-	scmGenCommitMessage?(reqId: number): Promise<void>;
 	readFile(path: string): Promise<void>;
 	writeFile(path: string, text: string): Promise<void>;
 	uploadFile(dirPath: string, name: string, data: string): Promise<void>;
@@ -1160,9 +966,6 @@ export interface DispatchSession {
 	openDefaultEntry(path: string): Promise<void>;
 	listModels(): Promise<void>;
 	setModel(modelId: string): Promise<void>;
-	/** 全局默认模型（pi 引擎专有；DSH 无此概念，实现缺失时 dispatch 侧 `?.` 忽略）。 */
-	setDefaultModel?(modelId: string): Promise<void>;
-	clearDefaultModel?(): void;
 	setThinking(level: string): void;
 	setCwd(path: string): Promise<void>;
 	/** 设置当前项目的额外工作区根（宿主侧多根，见 protocol 的 set_workspace_roots）。 */
@@ -1171,7 +974,6 @@ export interface DispatchSession {
 	makeDir(path: string, setAsCwd?: boolean): Promise<void>;
 	checkUpdate(): Promise<void>;
 	checkUpdatesAll(force?: boolean): Promise<void>;
-	checkPluginUpdates?(manual?: boolean): Promise<void>;
 	resolveDialog(id: number, value: string | boolean | null): void;
 	installPiAgent(): Promise<void>;
 	setProviderApiKey(provider: string, apiKey: string): Promise<void>;
@@ -1190,50 +992,19 @@ export interface DispatchSession {
 	addProviderKey(provider: string, apiKey: string, name?: string): Promise<void>;
 	activateProviderKey(provider: string, keyName: string): Promise<void>;
 	removeProviderKey(provider: string, keyName: string): Promise<void>;
-	fetchModelsList(
-		reqId: number,
-		baseUrl: string,
-		apiKey?: string,
-		authHeader?: boolean,
-		api?: string,
-		providerId?: string,
-	): Promise<void>;
-	testModelConnection?(
-		reqId: number,
-		baseUrl: string,
-		apiKey?: string,
-		authHeader?: boolean,
-		api?: string,
-		providerId?: string,
-	): Promise<void>;
+	fetchModelsList(reqId: number, baseUrl: string, apiKey?: string, authHeader?: boolean, api?: string): Promise<void>;
 	refreshProviderModels(providerId: string, reqId: number): Promise<void>;
 	refreshBuiltinModels(reqId: number): Promise<void>;
 	appendBuiltinModel(providerId: string, model: unknown, reqId: number): Promise<void>;
 	cloneProvider(provider: string, reqId: number): Promise<void>;
-	enrichModels(reqId: number, ids: string[], hints?: Record<string, string>): Promise<void>;
-	abortEnrichModels(reqId?: number): void;
 	getTerminalManager(conversationId?: string): TerminalManagerLike | undefined;
 	getTerminalCwd(conversationId?: string): string;
 	listCommands(): Promise<void>;
 	saveCommands(commands: CommandDef[]): Promise<void>;
-	setGoal(
-		goal: string,
-		opts?: {
-			reviewModel?: string;
-			maxRounds?: number;
-			locked?: boolean;
-			/** 目标模式 2.0：执行者模型（DSH 引擎不接委托执行，忽略）。 */
-			execModel?: string;
-		},
-	): Promise<void>;
+	setGoal(goal: string, opts?: { reviewModel?: string; maxRounds?: number; locked?: boolean }): Promise<void>;
 	clearGoal(): Promise<void>;
 	startGoalWizard(text: string, opts?: { wizardModel?: string; maxRounds?: number; locked?: boolean }): Promise<void>;
-	setGoalPrefs(opts?: {
-		reviewModel?: string;
-		maxRounds?: number;
-		locked?: boolean;
-		execModel?: string;
-	}): Promise<void>;
+	setGoalPrefs(opts?: { reviewModel?: string; maxRounds?: number; locked?: boolean }): Promise<void>;
 	pushSettings(): void;
 	setSettings(partial: {
 		promptMode?: "append" | "replace";
@@ -1248,17 +1019,13 @@ export interface DispatchSession {
 		terminalToolsEnabled?: boolean;
 		terminalBash?: boolean;
 		terminalBashIdleMs?: number;
-		terminalBashMaxForegroundMs?: number;
 		editSoftEnabled?: boolean;
 		thinkingWrap?: boolean;
 		toolsWrap?: boolean;
-		toolImagesEnabled?: boolean;
 		visionBridgeEnabled?: boolean;
 		visionBridgeModel?: string | null;
 		visionBridgePromptMode?: "append" | "replace";
 		visionBridgePrompt?: string;
-		scmCommitMsgPromptMode?: "append" | "replace";
-		scmCommitMsgPrompt?: string;
 		reviewPrompt?: string;
 		reviewDisabledSkills?: string[];
 	}): Promise<void>;
@@ -1282,32 +1049,11 @@ export interface DispatchSession {
 	/** 浏览器页面调用回包（browser_page 工具，pi 引擎专有；DSH 无页面桥，
 	 *  方法缺失时 dispatch 侧的 `?.` 直接忽略这条消息）。 */
 	resolvePageCall?(id: string, ok: boolean, result?: unknown, error?: string): void;
-	forkSession?(messageId: string, position?: "before" | "at", conversationId?: string): Promise<void>;
-	rollbackSession?(messageId: string, conversationId?: string, restoreWorkspace?: boolean): Promise<void>;
-	resolveToolApproval?(
-		id: string,
-		decision: "approve" | "deny" | "edit",
-		editedParams?: unknown,
-		reason?: string,
-		/** "category" = 顺带记住本对话的该同类档位；"all" = 本对话后续全部允许。 */
-		scope?: "once" | "category" | "all",
-	): boolean;
-	/** 设置当前对话的审批放行策略（设置面板撤销区；纯内存态）。 */
-	setApprovalPolicy?(partial: { conversationId?: string; allowAll?: boolean; categories?: string[] }): void;
-	updatePlan?(steps: import("./protocol.js").PlanStep[], activeStepId?: string | null, conversationId?: string): void;
-	/** 切换计划模式（只规划不实施）：会话级，热生效。 */
-	setPlanMode?(enabled: boolean, conversationId?: string): Promise<void>;
-	/** 切换审查者模式（自动委派）：会话级，默认关。DSH 实现里直接拒（无工具闸门）。 */
-	setDelegateMode?(enabled: boolean, conversationId?: string): Promise<void>;
 	savePreset(name: string): Promise<void>;
 	applyPreset(name: string): Promise<void>;
 	deletePreset(name: string): Promise<void>;
 	/** Upsert 一个子代理模板（全局共享）。 */
 	saveSubagentTemplate(template: UiSubagentTemplate): Promise<void>;
-	saveApprovalRule?(rule: UiApprovalRule): Promise<void>;
-	saveApprovalRules?(rules: UiApprovalRule[]): Promise<void>;
-	deleteApprovalRule?(id: string): Promise<void>;
-	resetBuiltinApprovalRule?(id: string): Promise<void>;
 	/** 当前客户端的服务端语言（issue #91 v2：归一化 UI 代码，zh/EN/ja/…）。 */
 	getLang(): string;
 	/** Browser UI locale report (hello.locale / set_locale) — persist per
@@ -1355,17 +1101,6 @@ export interface EngineService {
 	/** Browser UI locale report (hello.locale / set_locale) — persist per
 	 *  client and refresh lang-aware prompts (streaming-safe). */
 	setLocale(clientId: string, locale: string): Promise<void>;
-	/** 手动过户（pi 引擎实现；DSH 未实现 → dispatch 回落提示）。 */
-	takeOverConversation?(targetId: string, ownerId: string, convId: string): Promise<void>;
-	/** 跨页作答预告 + 答案转交（pi 引擎实现；DSH 未实现 → dispatch 回落提示）。 */
-	peekElsewhereQuestion?(targetId: string, ownerId: string, convId: string): Promise<void>;
-	answerElsewhereQuestion?(
-		targetId: string,
-		ownerId: string,
-		id: string,
-		answers: { id: string; selected: string[]; custom?: string }[],
-		cancelled?: boolean,
-	): Promise<void>;
 	onQuit?: (() => boolean) | undefined;
 	onToolEvent?:
 		| ((ev: {
@@ -1376,25 +1111,6 @@ export interface EngineService {
 				isError?: boolean;
 		  }) => void)
 		| undefined;
-	/** bash/read 插件拦截（P1-5，pi 引擎；dsh 引擎无 customTool 注册面，不接）。 */
-	toolGuard?:
-		| {
-				pre: (
-					req: ToolPreRequest,
-					lang: string,
-				) => Promise<{
-					verdict:
-						| { decision: "allow" }
-						| { decision: "deny"; reason?: string; reasonEn?: string }
-						| { decision: "ask"; reason?: string; reasonEn?: string };
-					pluginId?: string;
-				}>;
-				post: (
-					req: ToolPostRequest,
-					lang: string,
-				) => Promise<{ content?: Array<{ type: string; text?: string }>; pluginIds: string[] } | undefined>;
-		  }
-		| undefined;
 	/** 运行轨迹事件转发（pi 引擎发射；dsh 引擎暂不发射，插件收不到即无轨迹）。 */
 	onRunEvent?: ((ev: PluginRunEvent) => void) | undefined;
 	/** 对话切换通知（切历史会话/切 running 对话/新对话/切项目，pi 引擎）。 */
@@ -1403,7 +1119,11 @@ export interface EngineService {
 	readConversationForPlugins?: (() => PluginConversationSnapshot | null) | undefined;
 	/** 插件无头调用 agent（pi 引擎；dsh 引擎暂无，host.chat 明确拒绝）。 */
 	chatFromPlugin?:
-		((pluginId: string, req: PluginChatRequest) => Promise<{ conversationId: string; clientId: string }>) | undefined;
+		| ((
+				pluginId: string,
+				req: { text: string; accountId?: string },
+		  ) => Promise<{ conversationId: string; clientId: string }>)
+		| undefined;
 	pluginToolsProvider?: (() => unknown[]) | undefined;
 	pluginCommandsProvider?: (() => unknown[]) | undefined;
 	pluginBgTasksProvider?: (() => BgServer[]) | undefined;
@@ -1422,7 +1142,6 @@ const service: EngineService =
 
 // Server-string tables (issue #91 v2): packs' `serverStrings` sections feed
 // pick() lookup for non-zh/en UI languages (missing key → English fallback).
-initAttachmentStore(DATA_DIR);
 loadServerStrings(DATA_DIR);
 // Optional UI plugins (<dataDir>/plugins/<id>/): scanned on every client
 // attach so freshly dropped plugins appear without a server restart.
@@ -1445,9 +1164,6 @@ async function reloadPluginsAndPush(lang?: () => ServerLang): Promise<void> {
 interface PendingPathRequest {
 	resolve: (ok: boolean) => void;
 	timer: ReturnType<typeof setTimeout>;
-	/** 弹窗广播时在线的 clientId 集合：应答必须来自其中之一——广播后才连上的端
-	 *  没见过弹窗，不许代答（plugin_path_response 处理处校验）。 */
-	recipients: Set<string>;
 }
 const pendingPathRequests = new Map<string, PendingPathRequest>();
 /** 把授权表推给所有在线客户端（设置面板展示 + 撤销后刷新）。 */
@@ -1471,9 +1187,7 @@ pluginMgr.pathAccessRequester = (pluginId, dir, reason) =>
 			pendingPathRequests.delete(id);
 			resolve(false);
 		}, 120_000);
-		// 广播前先记下在线端集合：应答来源绑定用（防没见过弹窗的连接代答）。
-		const recipients = new Set(pluginMgr.onlineClientIds());
-		pendingPathRequests.set(id, { resolve, timer, recipients });
+		pendingPathRequests.set(id, { resolve, timer });
 		const payload = JSON.stringify({
 			type: "plugin_path_request",
 			id,
@@ -1502,8 +1216,6 @@ pluginMgr.onGrantsChanged = () => pushPluginGrants();
 interface PendingPermissionRequest {
 	resolve: (ans: { ok: boolean; remember: boolean }) => void;
 	timer: ReturnType<typeof setTimeout>;
-	/** 弹窗广播时在线的 clientId 集合：应答必须来自其中之一（同目录授权）。 */
-	recipients: Set<string>;
 }
 const pendingPermissionRequests = new Map<string, PendingPermissionRequest>();
 /** 把能力授权表推给所有在线客户端（设置面板展示 + 撤销后刷新）。 */
@@ -1536,9 +1248,7 @@ pluginMgr.permissionRequester = (pluginId, req) =>
 			}
 			resolve({ ok: false, remember: false });
 		}, 120_000);
-		// 广播前先记下在线端集合：应答来源绑定用（防没见过弹窗的连接代答）。
-		const recipients = new Set(pluginMgr.onlineClientIds());
-		pendingPermissionRequests.set(id, { resolve, timer, recipients });
+		pendingPermissionRequests.set(id, { resolve, timer });
 		const ask = JSON.stringify({
 			type: "plugin_permission_request",
 			id,
@@ -1560,46 +1270,9 @@ pluginMgr.permissionRequester = (pluginId, req) =>
 	});
 pluginMgr.onPermGrantsChanged = () => pushPluginPermissions();
 
-// ---------------------------------------------------------------------------
-// 特权 DOM 授权两步握手：grant 是提权方向，不接受「一帧消息直接落盘」——设置面板
-// 点击先发 plugin_dom_consent，服务端给该 pluginId 生成在途 consent 请求并广播
-// plugin_dom_consent_request，收到绑定来源的 plugin_dom_consent_response 才调
-// setDomConsent 持久写盘。发起端（settings 面板）按 from === 自己的 clientId 自动
-// 应答，用户点一下的体验不变；陌生连接既不在 recipients 里，也没有发起记录，
-// 只能等 120s 超时拒绝。revoke 是降权方向，保持单步直达（不走本表）。
-// ---------------------------------------------------------------------------
-interface PendingDomConsent {
-	/** 随广播下发的请求 id，应答按它回查（本表按 pluginId 键：同插件同时只允许一个在途）。 */
-	id: string;
-	pluginId: string;
-	/** 广播时在线的 clientId 集合：应答来源绑定（与目录/能力授权同一口径）。 */
-	recipients: Set<string>;
-	timer: ReturnType<typeof setTimeout>;
-}
-/** key = pluginId：wantsDom 插件集合有限 + 120s 自动过期，规模天然有界。 */
-const pendingDomConsents = new Map<string, PendingDomConsent>();
-/** 按 id 反查在途 consent 请求（应答只有 id；表很小，线性扫即可）。 */
-function findDomConsentById(id: string): PendingDomConsent | undefined {
-	for (const p of pendingDomConsents.values()) if (p.id === id) return p;
-	return undefined;
-}
-
-// ---------------------------------------------------------------------------
-// 插件安装的用户确认门（P0）：plugin_catalog_sync 的 install:true 与 plugin_job
-// 的 install/update 在真正动安装器之前必须拿到用户确认。
-// ---------------------------------------------------------------------------
-async function confirmPluginInstallHelper(items: Array<{ id: string; source: string }>): Promise<boolean> {
-	return confirmPluginInstall(items, {
-		permGrants: pluginMgr.permGrants,
-		permissionRequester: pluginMgr.permissionRequester,
-		onGrantsChanged: pushPluginPermissions,
-	});
-}
-
 // 内置定时任务（issue #184）：全局 <dataDir>/scheduler-tasks.json，TTL 与
 // client-state 同级；Agent 工具建的任务优先唤醒发起对话（issue #193：
-// wakeConversation steer 投递，不切用户当前对话），原对话不在先回落同项目
-// 活跃对话（issue #231：视口兜底＋自动重绑定＋明确降级提示），都没有才无头伪
+// wakeConversation steer 投递，不切用户当前对话），对话不在了再回落无头伪
 // 客户端（chatFromScheduler）；单次任务触发后自动删除。DSH 引擎无这俩方法时
 // executor 回 not-supported（历史里记失败，不炸进程）。
 const scheduler = new SchedulerStore(DATA_DIR, {
@@ -1617,119 +1290,34 @@ const scheduler = new SchedulerStore(DATA_DIR, {
 				wakeConversation?: (
 					id: string,
 					text: string,
-					opts?: { sessionFile?: string; cwd?: string },
-				) => Promise<{
-					ok: boolean;
-					conversationId?: string;
-					sessionFile?: string;
-					clientId?: string;
-					busy?: boolean;
-					error?: string;
-				}>;
-				wakeViewportInCwd?: (
-					cwd: string,
-					text: string,
-				) => Promise<{
-					ok: boolean;
-					conversationId?: string;
-					sessionFile?: string;
-					clientId?: string;
-					busy?: boolean;
-					error?: string;
-				}>;
+				) => Promise<{ ok: boolean; conversationId?: string; error?: string }>;
 			};
 			if (typeof svc.chatFromScheduler !== "function" && typeof svc.wakeConversation !== "function") {
 				result = { ok: false, error: "当前引擎不支持定时任务（仅标准 pi 引擎）" };
 			} else {
-				const runHeadless = (): Promise<{ ok: boolean; conversationId?: string; error?: string }> =>
-					svc.chatFromScheduler!({
+				// 发起对话还在 → steer 唤醒它（报告直接落原对话）；不在了 → 无头执行。
+				const target = String(task.conversationId ?? "").trim();
+				if (target && typeof svc.wakeConversation === "function") {
+					const w = await svc.wakeConversation(target, `[定时任务 ${task.name}] ${task.prompt}`);
+					if (w.ok) {
+						result = { ok: true, conversationId: w.conversationId };
+					} else {
+						result = await svc.chatFromScheduler!({
+							id: task.id,
+							cwd: task.cwd,
+							prompt: task.prompt,
+							model: task.model,
+							thinkingLevel: task.thinkingLevel,
+						});
+					}
+				} else {
+					result = await svc.chatFromScheduler!({
 						id: task.id,
 						cwd: task.cwd,
 						prompt: task.prompt,
 						model: task.model,
 						thinkingLevel: task.thinkingLevel,
 					});
-				const target = String(task.conversationId ?? "").trim();
-				const taskFile = String((task as { sessionFile?: unknown }).sessionFile ?? "").trim();
-				const text = `[定时任务 ${task.name}] ${task.prompt}`;
-				if (!target && !taskFile) {
-					// 面板建的任务：创建时就没绑对话，保持无头语义（不抢占用户视口）。
-					result = await runHeadless();
-				} else if (typeof svc.wakeConversation === "function") {
-					// 原绑定对话还在（含压缩/重启后按会话文件重认）→ steer 唤醒，报告落原对话。
-					let w: {
-						ok: boolean;
-						conversationId?: string;
-						sessionFile?: string;
-						busy?: boolean;
-						error?: string;
-					};
-					try {
-						w = await svc.wakeConversation(target, text, { sessionFile: taskFile, cwd: task.cwd });
-					} catch (err) {
-						w = { ok: false, error: (err as Error).message };
-					}
-					if (w.ok) {
-						// 会话继承（issue #231）：压缩/重启后同文件对话换了新 id → 任务跟过去，
-						// 下次触发直达，不再误判 closed/gone。单次任务随后自删，免一次写盘。
-						if (!task.oneShot) {
-							try {
-								if (w.conversationId && w.conversationId !== target)
-									scheduler.rebind(task.id, { conversationId: w.conversationId });
-								if (w.sessionFile && w.sessionFile !== taskFile)
-									scheduler.rebind(task.id, { sessionFile: w.sessionFile });
-							} catch {
-								// 重绑失败不影响本次已投递的唤醒
-							}
-						}
-						result = { ok: true, conversationId: w.conversationId };
-					} else if (typeof svc.wakeViewportInCwd === "function") {
-						// 活跃视口兜底（issue #231）：原句柄断开（切走释放/过户改名/重启），
-						// 只要同项目还有用户正看着的对话，报告落那里 —— 不静默吞结果。
-						const fallbackText = `[定时任务 ${task.name}｜原对话不在，已转到本窗口继续] ${task.prompt}`;
-						let f: {
-							ok: boolean;
-							conversationId?: string;
-							sessionFile?: string;
-							busy?: boolean;
-							error?: string;
-						};
-						try {
-							f = await svc.wakeViewportInCwd(task.cwd, fallbackText);
-						} catch (err) {
-							f = { ok: false, error: (err as Error).message };
-						}
-						if (f.ok) {
-							if (!task.oneShot) {
-								try {
-									scheduler.rebind(task.id, {
-										conversationId: f.conversationId ?? "",
-										sessionFile: f.sessionFile ?? "",
-									});
-								} catch {
-									// 重绑失败不影响本次已投递的唤醒
-								}
-							}
-							pushNoticeToAll(
-								"info",
-								`定时任务「${task.name}」原对话不在，已转到同项目的活跃对话继续（原绑定 ${target || "（未知）"}）。报告直接落在当前对话。`,
-								`Scheduled task "${task.name}" moved to the project's active conversation (was ${target || "unknown"}). The report lands in the current chat.`,
-							);
-							result = { ok: true, conversationId: f.conversationId };
-						} else {
-							// 降级可见性（issue #231）：必须无头时明确广播去向，不静默。
-							pushNoticeToAll(
-								"warning",
-								`定时任务「${task.name}」原对话不在、同项目也无存活对话，已转后台执行（无头）。报告在后台任务面板的调度历史中查看。`,
-								`Scheduled task "${task.name}" found no live conversation and runs headless; see its report in the background-tasks panel history.`,
-							);
-							result = await runHeadless();
-						}
-					} else {
-						result = await runHeadless();
-					}
-				} else {
-					result = await runHeadless();
 				}
 			}
 		} catch (err) {
@@ -1747,16 +1335,6 @@ const scheduler = new SchedulerStore(DATA_DIR, {
 	},
 	onChange: () => pushSchedulerTasks(),
 	notify: (level, text, textEn) => pushNoticeToAll(level, text, textEn ?? text),
-	// issue #291：任务删除（含单次任务跑完自删）后回收其伪客户端，
-	// 否则 scheduler:<taskId> 会话会永久占据其他客户端的 elsewhere 列表。
-	onTaskRemoved: (taskId) => {
-		const svc = service as unknown as { releaseSchedulerClient?: (id: string) => void };
-		try {
-			svc.releaseSchedulerClient?.(taskId);
-		} catch {
-			// 回收失败不影响任务删除
-		}
-	},
 });
 scheduler.start();
 /** 把调度器任务列表推给所有在线客户端（设置面板展示 + 变更后刷新）。 */
@@ -1765,7 +1343,6 @@ function pushSchedulerTasks(): void {
 		const payload = JSON.stringify({ type: "scheduler_tasks", tasks: scheduler.list() });
 		for (const client of wss.clients) {
 			if (client.readyState !== WebSocket.OPEN) continue;
-			if (client.bufferedAmount > BROADCAST_BACKPRESSURE_MAX_BYTES) continue;
 			try {
 				client.send(payload);
 			} catch {
@@ -1782,7 +1359,6 @@ function pushNoticeToAll(level: "info" | "warning" | "error", text: string, text
 	const payload = JSON.stringify({ type: "notice", level, text, textEn });
 	for (const client of wss.clients) {
 		if (client.readyState !== WebSocket.OPEN) continue;
-		if (client.bufferedAmount > BROADCAST_BACKPRESSURE_MAX_BYTES) continue;
 		try {
 			client.send(payload);
 		} catch {
@@ -1810,12 +1386,6 @@ void mcpBridge.load().then(() => {
 });
 // 插件扩展点：SDK 工具执行事件（bash/读文件等 start+end）转发给已注册的插件。
 service.onToolEvent = (ev) => pluginMgr.emitToolEvent(ev);
-// 插件扩展点（P1-5）：bash/read 执行前后的拦截（pre 拒/问即拦、post 脱敏补上下文；
-// 只覆盖已接管的这两处，DSH 引擎无 customTool 注册面不接）。
-service.toolGuard = {
-	pre: (req, lang) => pluginMgr.evaluateToolPre(req, lang),
-	post: (req, lang) => pluginMgr.evaluateToolPost(req, lang),
-};
 service.onRunEvent = (ev) => pluginMgr.emitRunEvent(ev);
 // 插件扩展点：对话切换通知（轨迹视图切会话后即重拉；dsh 引擎暂无）。
 service.onConversationChanged = () => pluginMgr.emitConversationChanged();
@@ -1857,7 +1427,6 @@ if ("schedulerStore" in service) {
 // {ok:false}，绝不抛错炸进程。
 // ---------------------------------------------------------------------------
 {
-	// SAFETY: This compatibility bridge only assigns optional plugin hooks; consumers test their presence.
 	const pm = pluginMgr as unknown as Record<string, unknown>;
 	/** 注入函数间复用的对话条目形状（与 agent-service 的 *ForPlugins 方法对齐）。 */
 	type PluginConvListItem = { id: string; title: string; cwd: string; kind: string; isStreaming: boolean };
@@ -1881,9 +1450,10 @@ if ("schedulerStore" in service) {
 		steerForPlugins?: (cid: string, t: string) => Promise<{ ok: boolean; error?: string }>;
 	};
 	/** 挑一个客户端会话：标准 pi 引擎走 service.pluginClient()，DSH/未知引擎无此方法即 undefined。 */
-	const pickClient = (): ReturnType<AgentService["pluginClient"]> => {
+	const pickClient = (): unknown => {
 		try {
-			return service instanceof AgentService ? service.pluginClient() : undefined;
+			const svc = service as unknown as { pluginClient?: () => unknown };
+			return typeof svc.pluginClient === "function" ? svc.pluginClient() : undefined;
 		} catch {
 			return undefined;
 		}
@@ -1957,7 +1527,6 @@ if ("schedulerStore" in service) {
 	// 标准 pi 引擎走 service.completeForPlugins；DSH/未知引擎回 {ok:false}，绝不抛错。
 	(pm as any).llmProvider = async (pluginId: string, req: unknown) => {
 		try {
-			// SAFETY: Only invoked after the optional method is checked; request fields are narrowed below.
 			const svc = service as unknown as {
 				completeForPlugins?: (
 					pluginId: string,
@@ -2022,10 +1591,6 @@ const SNAPSHOT_BACKPRESSURE_FACTOR = 3;
 const SNAPSHOT_BACKPRESSURE_MIN_BYTES = 262_144;
 /** 背压丢弃后的延迟重发间隔。 */
 const SNAPSHOT_RETRY_MS = 250;
-/** issue #295：attach（会话初始化）超过此时长未完成，先给浏览器一句可见提示，
- *  避免界面永久停在「正在连接」而用户不知发生了什么。attach 本体继续等（不取消），
- *  完成后照常走快照流程。 */
-const ATTACH_SLOW_NOTICE_MS = 8_000;
 
 /**
  * Multi-tab serialization sharing: emit() hands the SAME message object to
@@ -2045,14 +1610,6 @@ function serializeShared(msg: ServerMessage): string {
 }
 
 wss.on("connection", (ws) => {
-	const tracked = ws as TrackedWebSocket;
-	tracked.isAlive = true;
-	tracked.missedPings = 0;
-	ws.on("pong", () => {
-		tracked.isAlive = true;
-		tracked.missedPings = 0;
-	});
-
 	// Count attached sockets (the control socket reports REAL sockets, not
 	// cached client-session objects).
 	service.noteSocketOpen();
@@ -2060,13 +1617,8 @@ wss.on("connection", (ws) => {
 	let closed = false;
 	/** 最近一份全量 snapshot 的估算字节数（UTF-16 ×2），供背压相对阈值用（issue #11）。 */
 	let lastSnapshotBytes = 0;
-	/** Commands received while the session is still being created — replayed after attach.
-	 *  带上限（256 条）：attach 挂死/失败保活期间队列不再无界增长，超限丢最旧并告警。 */
-	const pending = new PendingCommandQueue();
-	/** attach 完成（含插件链 + 首快照）前一律排队（见 hello 分支的 replayQueued）：
-	 *  ready 先行后，ready 只代表传输通，插件命令目录/首快照都还没好，直接分发
-	 *  会撞「未知命令」/ rev 链断裂。 */
-	let attachDone = false;
+	/** Commands received while the session is still being created — replayed after attach. */
+	let pending: ClientMessage[] = [];
 	/** 背压丢快照后的延迟重发定时器（去重：一次只排一个）。 */
 	let snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -2120,34 +1672,14 @@ wss.on("connection", (ws) => {
 	// cid getter lets plugins target THIS socket via host.sendTo(clientId).
 	const removePluginSender = pluginMgr.addSender(send, () => clientId);
 
-	/** DOM 授权落盘 + notice 反馈（两步握手的 grant 与单步 revoke 共用收尾）。
-	 *  cs 缺席（未 attach 完成）时只落盘不提示——消息本来就会在 attach 前排队。 */
-	const applyDomConsent = (pluginId: string, granted: boolean): void => {
-		void pluginMgr
-			.setDomConsent(pluginId, granted)
-			.then((r) => {
-				const cs2 = clientId ? service.get(clientId) : undefined;
-				if (r.error) cs2?.emitNotice("warning", `DOM 授权失败：${r.error}`, `DOM consent failed: ${r.error}`);
-				else if (r.changed)
-					cs2?.emitNotice(
-						"info",
-						granted ? `已授权插件「${pluginId}」完全 DOM 访问` : `已撤销插件「${pluginId}」完全 DOM 访问`,
-						granted
-							? `Granted full DOM access to plugin "${pluginId}"`
-							: `Revoked full DOM access from plugin "${pluginId}"`,
-					);
-			})
-			.catch(() => {});
-	};
-
 	const dispatch = (msg: ClientMessage): void => {
 		if (!clientId) {
 			pending.push(msg);
 			return;
 		}
 		const cs = service.get(clientId);
-		if (!cs || !attachDone) {
-			// Session not ready yet (hello processing / plugin chain) — hold the command.
+		if (!cs) {
+			// Session not ready yet (hello processing) — hold the command.
 			pending.push(msg);
 			return;
 		}
@@ -2161,24 +1693,11 @@ wss.on("connection", (ws) => {
 			return;
 		}
 		switch (msg.type) {
-			case "prompt": {
-				const hasAttach = Boolean(msg.attachments && msg.attachments.length > 0);
-				if (!msg.text?.trim() && !hasAttach) {
-					send({
-						type: "notice",
-						level: "warning",
-						text: "发送已忽略：提示词为空且未附带文件或上下文引用。",
-						textEn: "Prompt ignored: text is empty and no attachments were provided.",
-					});
-					break;
-				}
+			case "prompt":
 				void cs.prompt(msg.text, msg.attachments, msg.queue);
 				break;
-			}
 			case "queue_remove":
-				// #491：removeQueued 是 async——dispatch 是 fire-and-forget，缺 void 时
-				// 内部抛错即 unhandledRejection，而全仓没有兜底 handler，Node ≥15 直接崩进程。
-				void cs.removeQueued(msg.kind, msg.text, msg.index);
+				cs.removeQueued(msg.kind, msg.text, msg.index);
 				break;
 			case "draft_update":
 				cs.saveDraft?.(msg.sessionId, msg.text, msg.ts);
@@ -2202,16 +1721,10 @@ wss.on("connection", (ws) => {
 				void cs.listBgServers();
 				break;
 			case "new_chat":
-				void cs.newChat(msg.preset, msg.ephemeral);
+				void cs.newChat(msg.preset);
 				break;
 			case "edit_message":
 				void cs.editMessage(msg.messageId, msg.text, msg.attachments);
-				break;
-			case "fork_session":
-				void cs.forkSession?.(msg.messageId, msg.position, msg.conversationId);
-				break;
-			case "rollback_session":
-				void cs.rollbackSession?.(msg.messageId, msg.conversationId, msg.restoreWorkspace);
 				break;
 			case "cycle_model":
 				void cs.cycleModel();
@@ -2226,19 +1739,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "get_commands":
 				void cs.pushSlashCommands();
-				break;
-			case "get_tool_info":
-				// 工具卡右键菜单的「显示工具详细信息」：按需取一次工具定义（不进快照）。
-				// 引擎没实现（或旧版服务端）时回一条 unsupported，前端据此显示「不支持」
-				// 而不是永远转圈。
-				if (typeof cs.getToolInfo === "function") {
-					void cs.getToolInfo(msg.name);
-				} else {
-					send({ type: "tool_info", name: msg.name, found: false, unsupported: true });
-				}
-				break;
-			case "get_compacted_messages":
-				void cs.getCompactedMessages?.(msg.compactionMessageId, msg.conversationId);
 				break;
 			case "list_sessions":
 				void cs.refreshSessions();
@@ -2261,56 +1761,14 @@ wss.on("connection", (ws) => {
 			case "dismiss_conversation":
 				void cs.dismissConversation(msg.id, msg.withFinishedSubagents, msg.force);
 				break;
-			case "persist_conversation":
-				if (typeof cs.persistConversation === "function") {
-					void cs.persistConversation(msg.id);
-				}
-				break;
-			case "pin_conversation":
-				if (typeof cs.setConversationPinned === "function") {
-					void cs.setConversationPinned(msg.id, msg.pinned);
-				}
-				break;
-			case "pin_session":
-				if (typeof cs.pinSession === "function") {
-					void cs.pinSession(msg.path, msg.pinned);
-				}
-				break;
 			case "dismiss_finished_subagents":
 				void cs.dismissFinishedSubagents(msg.parentId);
-				break;
-			case "subagent_handoff":
-				void cs.handoffSubagent?.(msg.fromRunId, msg.toRunId, msg.payload);
 				break;
 			case "switch_session":
 				void cs.switchSession(msg.path);
 				break;
 			case "switch_conversation":
 				void cs.switchConversation(msg.id);
-				break;
-			case "take_over_conversation":
-				if (typeof service.takeOverConversation === "function") {
-					void service.takeOverConversation(clientId, msg.owner, msg.id);
-				} else {
-					send({
-						type: "notice",
-						level: "error",
-						text: "当前引擎不支持过户（take over），请用 pi 引擎",
-						textEn: "Takeover is not supported by the current engine; use the pi engine.",
-					});
-				}
-				break;
-			case "peek_elsewhere_question":
-				if (typeof service.peekElsewhereQuestion === "function") {
-					void service.peekElsewhereQuestion(clientId, msg.owner, msg.id);
-				} else {
-					send({
-						type: "notice",
-						level: "error",
-						text: "当前引擎不支持跨页作答，请用 pi 引擎",
-						textEn: "Cross-page answering is not supported by the current engine; use the pi engine.",
-					});
-				}
 				break;
 			case "list_files":
 				void cs.listFiles(msg.path);
@@ -2332,21 +1790,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "scm_commit":
 				void cs.scmQuery("commit", msg.reqId, { hash: msg.hash });
-				break;
-			case "scm_commitmsg":
-				if (typeof cs.scmGenCommitMessage === "function") {
-					void cs.scmGenCommitMessage(msg.reqId);
-				} else {
-					// DSH 等引擎没有 pi 的 ModelRuntime——照样应答一次（ok:false），
-					// 前端按钮不能因引擎差异卡在转圈。
-					send({
-						type: "scm_data",
-						reqId: msg.reqId,
-						kind: "commitmsg",
-						ok: false,
-						error: "当前引擎不支持 AI 生成提交信息（请用 pi 引擎）/ AI commit messages need the pi engine",
-					});
-				}
 				break;
 			case "read_file":
 				void cs.readFile(msg.path);
@@ -2381,12 +1824,6 @@ wss.on("connection", (ws) => {
 			case "set_model":
 				void cs.setModel(msg.modelId);
 				break;
-			case "set_default_model":
-				void cs.setDefaultModel?.(msg.modelId);
-				break;
-			case "clear_default_model":
-				cs.clearDefaultModel?.();
-				break;
 			case "set_thinking":
 				cs.setThinking(msg.level);
 				break;
@@ -2414,11 +1851,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "check_updates_all":
 				void cs.checkUpdatesAll(msg.force === true);
-				break;
-			case "check_plugin_updates":
-				if (typeof cs.checkPluginUpdates === "function") {
-					void cs.checkPluginUpdates(true);
-				}
 				break;
 			case "restart_service": {
 				// Same effect as `pi-web-ui server restart`: this process exits and its
@@ -2497,10 +1929,7 @@ wss.on("connection", (ws) => {
 				void cs.listProviders();
 				break;
 			case "fetch_models":
-				void cs.fetchModelsList(msg.reqId, msg.baseUrl, msg.apiKey, msg.authHeader, msg.api, msg.providerId);
-				break;
-			case "test_model_connection":
-				void cs.testModelConnection?.(msg.reqId, msg.baseUrl, msg.apiKey, msg.authHeader, msg.api, msg.providerId);
+				void cs.fetchModelsList(msg.reqId, msg.baseUrl, msg.apiKey, msg.authHeader, msg.api);
 				break;
 			case "refresh_provider_models":
 				void cs.refreshProviderModels(msg.providerId, msg.reqId);
@@ -2513,12 +1942,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "clone_provider":
 				void cs.cloneProvider(msg.provider, msg.reqId);
-				break;
-			case "enrich_models":
-				void cs.enrichModels(msg.reqId, msg.ids, msg.hints);
-				break;
-			case "abort_enrich_models":
-				cs.abortEnrichModels(msg.reqId);
 				break;
 			case "list_provider_keys":
 				cs.listProviderKeys();
@@ -2565,6 +1988,32 @@ wss.on("connection", (ws) => {
 			case "rename_terminal":
 				cs.getTerminalManager(msg.conversationId)?.rename(msg.terminalId, msg.title);
 				break;
+			case "tmux_new_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxNewWindow?.(msg.terminalId, msg.title);
+				break;
+			case "tmux_select_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxSelectWindow?.(msg.terminalId, msg.windowId);
+				break;
+			case "tmux_rename_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxRenameWindow?.(msg.terminalId, msg.windowId, msg.name);
+				break;
+			case "tmux_kill_window":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxKillWindow?.(msg.terminalId, msg.windowId);
+				break;
+			case "tmux_take_control":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxTakeControl?.(msg.terminalId, msg.readonly);
+				break;
+			case "tmux_adopt":
+				void cs
+					.getTerminalManager(msg.conversationId)
+					?.adoptTmux?.(`adopt-${Date.now().toString(36)}`, msg.session, 120, 40, msg.session);
+				break;
+			case "tmux_detach":
+				void cs.getTerminalManager(msg.conversationId)?.tmuxDetach?.(msg.terminalId);
+				break;
+			case "list_tmux_sessions":
+				void cs.getTerminalManager(msg.conversationId)?.listAdoptablePush?.();
+				break;
 			case "run_command":
 				cs.getTerminalManager(msg.conversationId)?.runCommand(
 					msg.terminalId,
@@ -2585,7 +2034,6 @@ wss.on("connection", (ws) => {
 					reviewModel: msg.reviewModel,
 					maxRounds: msg.maxRounds,
 					locked: msg.locked,
-					execModel: msg.execModel,
 				});
 				break;
 			case "clear_goal":
@@ -2603,14 +2051,12 @@ wss.on("connection", (ws) => {
 					reviewModel: msg.reviewModel,
 					maxRounds: msg.maxRounds,
 					locked: msg.locked,
-					execModel: msg.execModel,
 				});
 				break;
 			case "get_settings":
 				cs.pushSettings();
 				break;
 			case "set_settings":
-				// SAFETY: Both dispatch engines validate the explicitly enumerated settings fields below.
 				void (cs as unknown as { setSettings: (p: Record<string, unknown>) => Promise<void> }).setSettings({
 					promptMode: msg.promptMode,
 					customSystemPrompt: msg.customSystemPrompt,
@@ -2624,17 +2070,11 @@ wss.on("connection", (ws) => {
 					terminalToolsEnabled: msg.terminalToolsEnabled,
 					terminalBash: msg.terminalBash,
 					terminalBashIdleMs: msg.terminalBashIdleMs,
-					terminalBashMaxForegroundMs: (msg as { terminalBashMaxForegroundMs?: number }).terminalBashMaxForegroundMs,
-					toolWatchdogTimeoutMs: (msg as { toolWatchdogTimeoutMs?: number }).toolWatchdogTimeoutMs,
-					readDirEnabled: (msg as { readDirEnabled?: boolean }).readDirEnabled,
-					toolApprovalEnabled: (msg as { toolApprovalEnabled?: boolean }).toolApprovalEnabled,
 					editSoftEnabled: (msg as { editSoftEnabled?: boolean }).editSoftEnabled,
 					questionnaireEnabled: (msg as { questionnaireEnabled?: boolean }).questionnaireEnabled,
-					parallelReminderEnabled: (msg as { parallelReminderEnabled?: boolean }).parallelReminderEnabled,
 					goalModeEnabled: (msg as { goalModeEnabled?: boolean }).goalModeEnabled,
 					thinkingWrap: msg.thinkingWrap,
 					toolsWrap: msg.toolsWrap,
-					toolImagesEnabled: (msg as { toolImagesEnabled?: boolean }).toolImagesEnabled,
 					devNoCache: (msg as { devNoCache?: boolean }).devNoCache,
 					autoReload: (msg as { autoReload?: boolean }).autoReload,
 					skillsFullText: (msg as { skillsFullText?: string[] }).skillsFullText,
@@ -2644,8 +2084,6 @@ wss.on("connection", (ws) => {
 					visionBridgePrompt: msg.visionBridgePrompt,
 					subagentDefaultModel: (msg as { subagentDefaultModel?: string | null }).subagentDefaultModel,
 					retryMaxAttempts: (msg as { retryMaxAttempts?: number }).retryMaxAttempts,
-					softCapTokens: (msg as { softCapTokens?: number }).softCapTokens,
-					softCapByModel: (msg as { softCapByModel?: Record<string, number> }).softCapByModel,
 					reviewPrompt: msg.reviewPrompt,
 					reviewDisabledSkills: msg.reviewDisabledSkills,
 					markersEnabled: (msg as { markersEnabled?: boolean }).markersEnabled,
@@ -2699,151 +2137,51 @@ wss.on("connection", (ws) => {
 				const jobLang = () => cs?.getLang() ?? "en";
 				const jobId = String(msg.jobId ?? "");
 				const pluginId = String(msg.id ?? "");
-				// function 声明会提升、TS 对 msg 判别联合的收窄进不了闭包 —— 先拍平成常量。
-				const jobAction = msg.action;
-				const jobSpec = {
-					jobId,
-					action: jobAction,
-					id: pluginId,
-					source: msg.source,
-					build: msg.build === true,
-					noBuild: msg.noBuild === true,
-				};
-				const jobDone = (ok: boolean, error?: string) => {
-					send({
-						type: "plugin_job",
+				const started = pluginInstaller.start(
+					{
 						jobId,
-						action: jobAction,
-						pluginId,
-						phase: "done",
-						ok,
-						...(error ? { error } : {}),
-						output: "",
-					});
-				};
-				// 参数静态校验：参数非法直接拒绝，避免向客户端发起无意义/恶意的确认弹窗。
-				const argCheck = buildPluginJobArgs(jobSpec, DATA_DIR, jobLang);
-				if ("error" in argCheck) {
-					jobDone(false, argCheck.error);
-					break;
-				}
-				// 安装确认门（P0）：install/update 先经用户确认。第三方页面脚本可以直发
-				// plugin_job；拒绝/超时直接回一条 done，让面板上的作业就地结束（不占
-				// 安装锁、不弹「失败」之外的噪音）。卸载不在本门范围内（由面板本身发起）。
-				if (jobAction === "install" || jobAction === "update") {
-					const alreadyGranted = pluginMgr.permGrants.has("plugin-installer", "net", { host: "github.com" });
-					if (!alreadyGranted) {
-						send({
-							type: "plugin_job",
-							jobId,
-							action: jobAction,
-							pluginId,
-							phase: "start",
-						});
-						send({
-							type: "plugin_job",
-							jobId,
-							action: jobAction,
-							pluginId,
-							phase: "log",
-							line: jobLang() === "zh" ? "等待确认安装授权…" : "Waiting for install confirmation…",
-						});
-					}
-					void confirmPluginInstallHelper([{ id: pluginId, source: String(msg.source ?? "") }])
-						.then((confirmed) => {
-							if (!confirmed) {
-								jobDone(
-									false,
-									jobLang() === "zh"
-										? "用户未确认安装（拒绝或 120 秒超时）"
-										: "Installation not confirmed (rejected or timed out after 120s)",
-								);
-								return;
-							}
-							startPluginJob();
-						})
-						.catch(() => jobDone(false, jobLang() === "zh" ? "安装确认流程异常" : "Installation confirmation error"));
-					break;
-				}
-				startPluginJob();
-				// 真正派发作业（确认门通过后走这里）：被拒（忙 / 托管实例 / 参数非法）也要回
-				// 一条 done，让面板上的作业就地结束。
-				function startPluginJob(): void {
-					const started = pluginInstaller.start(jobSpec, {
+						action: msg.action,
+						id: pluginId,
+						source: msg.source,
+						build: msg.build === true,
+						noBuild: msg.noBuild === true,
+					},
+					{
 						lang: jobLang,
 						emit: (m) => send(m),
 						done: async (ok, info) => {
 							if (ok) {
 								await reloadPluginsAndPush(jobLang);
-								const isZh = jobLang() === "zh";
-								const actionLabel =
-									jobAction === "uninstall"
-										? isZh
-											? "卸载"
-											: "uninstalled"
-										: jobAction === "update"
-											? isZh
-												? "更新"
-												: "updated"
-											: isZh
-												? "安装"
-												: "installed";
-								cs?.emitNotice(
-									"info",
-									`插件「${pluginId}」${actionLabel}完成`,
-									`Plugin "${pluginId}" ${actionLabel} successfully`,
-								);
 							} else if (info.error) {
 								cs?.emitNotice("error", `插件操作失败：${info.error}`, `Plugin operation failed: ${info.error}`);
 							}
 						},
+					},
+				);
+				if (!started.ok) {
+					// 被拒（忙 / 托管实例 / 参数非法）也要回一条 done，让面板上的作业就地结束。
+					send({
+						type: "plugin_job",
+						jobId,
+						action: msg.action,
+						pluginId,
+						phase: "done",
+						ok: false,
+						error: started.error,
+						output: "",
 					});
-					if (!started.ok) jobDone(false, started.error);
 				}
 				break;
 			}
 			case "plugin_job_cancel":
 				pluginInstaller.cancel(String(msg.jobId ?? ""));
 				break;
-			// 注册面目录（DSH P2-7）：只读装配（slot/工具/宿主方法表+当前占用者），按需拉取。
-			case "plugin_api_catalog": {
-				const requestId = String(msg.requestId ?? "");
-				send({ type: "plugin_api_catalog_result", requestId, catalog: pluginMgr.getApiCatalog() });
-				break;
-			}
-			// 安装前先读 spec（DSH P0-3）：不联网也能查（形状/已装），GitHub 源再探一次
-			// raw manifest。结果只作引导（UI 把 problem 渲染成输入框下的一句话），不阻塞安装。
-			case "plugin_install_inspect": {
-				const requestId = String(msg.requestId ?? "");
-				const source = String(msg.source ?? "");
-				void inspectInstallSpec(source, {
-					pluginsDir: pluginMgr.pluginsDir,
-					...(typeof msg.explicitId === "string" && msg.explicitId.trim() ? { explicitId: msg.explicitId.trim() } : {}),
-					force: msg.force === true,
-				}).then((r) => {
-					send({
-						type: "plugin_install_inspect_result",
-						requestId,
-						source,
-						kind: r.spec.kind,
-						suggestedId: r.suggestedId,
-						installed: r.installed,
-						...(r.problem ? { problem: r.problem } : {}),
-						...(r.detail ? { detail: r.detail } : {}),
-						...(r.manifest ? { manifest: r.manifest } : {}),
-					});
-				});
-				break;
-			}
 			// -- 插件目录授权（issue #146）------------------------------------------
 			case "plugin_path_response": {
-				const id = String(msg.id ?? "");
-				const pending = pendingPathRequests.get(id);
-				// 来源绑定：应答必须来自弹窗广播时在线的 clientId——广播后才连上的
-				// 端没见过弹窗，忽略其代答（pending 保留，真正的弹窗端仍可答复）。
-				if (pending && clientId && pending.recipients.has(clientId)) {
+				const pending = pendingPathRequests.get(String(msg.id ?? ""));
+				if (pending) {
 					clearTimeout(pending.timer);
-					pendingPathRequests.delete(id);
+					pendingPathRequests.delete(String(msg.id ?? ""));
 					pending.resolve(msg.ok === true);
 				}
 				break;
@@ -2852,8 +2190,7 @@ wss.on("connection", (ws) => {
 			case "plugin_permission_response": {
 				const id = String(msg.id ?? "");
 				const pending = pendingPermissionRequests.get(id);
-				// 来源绑定：同 plugin_path_response——只有收到弹窗广播的端可代答。
-				if (pending && clientId && pending.recipients.has(clientId)) {
+				if (pending) {
 					clearTimeout(pending.timer);
 					pendingPermissionRequests.delete(id);
 					// 先答复者胜：通知其它在线端收起同一条请求（与目录授权不同，这里要显式 resolved）。
@@ -2872,46 +2209,22 @@ wss.on("connection", (ws) => {
 				break;
 			}
 			case "plugin_dom_consent": {
-				// grant 是提权方向：走两步握手——只生成在途 consent 请求并广播，不在此
-				// 处落盘；收到绑定来源的 plugin_dom_consent_response 后才 setDomConsent。
-				// 同 pluginId 已有在途请求时忽略（首个优先，120s 超时自动失效）。
-				if (msg.granted === true) {
-					const pid = typeof msg.pluginId === "string" ? msg.pluginId.trim() : "";
-					if (!pid || !pluginMgr.isDomPlugin(pid) || pendingDomConsents.has(pid)) break;
-					const id = randomUUID();
-					const timer = setTimeout(() => {
-						pendingDomConsents.delete(pid);
-					}, 120_000);
-					pendingDomConsents.set(pid, { id, pluginId: pid, recipients: new Set(pluginMgr.onlineClientIds()), timer });
-					// from = 发起端 clientId：前端只自动应答自己发起的授权（设置面板点击）。
-					const payload = JSON.stringify({ type: "plugin_dom_consent_request", id, pluginId: pid, from: clientId });
-					for (const client of wss.clients) {
-						if (client.readyState === WebSocket.OPEN) {
-							try {
-								client.send(payload);
-							} catch {
-								/* 死连接 */
-							}
-						}
-					}
-					break;
-				}
-				// revoke 是降权方向：单步直达（不在途等待），pluginId 校验交给 setDomConsent。
-				applyDomConsent(msg.pluginId, false);
-				break;
-			}
-			// -- DOM 授权两步握手的应答：按 id 回查在途请求，且应答连接必须在弹窗
-			// 广播时的在线端集合里，才允许把 grant 持久写盘。
-			case "plugin_dom_consent_response": {
-				const id = typeof msg.id === "string" ? msg.id : "";
-				const pendingConsent = findDomConsentById(id);
-				if (pendingConsent && clientId && pendingConsent.recipients.has(clientId)) {
-					clearTimeout(pendingConsent.timer);
-					pendingDomConsents.delete(pendingConsent.pluginId);
-					// ok=false = 显式拒绝：只清在途请求不落盘（当前前端自动应答只发
-					// true，这里守住协议语义，将来接拒绝按钮不用动服务端）。
-					if (msg.ok === true) applyDomConsent(pendingConsent.pluginId, true);
-				}
+				void pluginMgr
+					.setDomConsent(msg.pluginId, msg.granted === true)
+					.then((r) => {
+						if (r.error) cs?.emitNotice("warning", `DOM 授权失败：${r.error}`, `DOM consent failed: ${r.error}`);
+						else if (r.changed)
+							cs?.emitNotice(
+								"info",
+								msg.granted === true
+									? `已授权插件「${msg.pluginId}」完全 DOM 访问`
+									: `已撤销插件「${msg.pluginId}」完全 DOM 访问`,
+								msg.granted === true
+									? `Granted full DOM access to plugin "${msg.pluginId}"`
+									: `Revoked full DOM access from plugin "${msg.pluginId}"`,
+							);
+					})
+					.catch(() => {});
 				break;
 			}
 			case "plugin_path_revoke": {
@@ -2950,22 +2263,10 @@ wss.on("connection", (ws) => {
 						customCatalogPath: pluginMgr.customCatalogPath,
 						pluginsDir: join(DATA_DIR, "plugins"),
 						installer: pluginInstaller,
-						// 只更新市场列表时无需重启已激活插件，避免重复广播工作目录。
-						afterWrite: () => (msg.install === true ? reloadPluginsAndPush(syncLang) : pluginMgr.pushCatalog()),
+						afterWrite: () => reloadPluginsAndPush(syncLang),
 						lang: syncLang,
-						// 本地文件来源只允许工作区内（防任意路径文件探测 oracle）。
-						workspaceRoot: cs?.cwd ?? CWD,
-						// 安装确认门（P0）：拒绝/超时只写目录不安装。
-						confirmInstall: (items) => confirmPluginInstallHelper(items),
 					},
 				).then((r) => {
-					if (r.installRefused) {
-						cs?.emitNotice(
-							"warning",
-							"目录已同步，但安装未获用户确认（拒绝或超时），未安装任何插件",
-							"Catalog synced, but installation was not confirmed (denied or timed out) — nothing was installed",
-						);
-					}
 					send({
 						type: "plugin_catalog_sync_result",
 						requestId,
@@ -2999,56 +2300,7 @@ wss.on("connection", (ws) => {
 				void cs.rescanDshPatches?.();
 				break;
 			case "question_answer":
-				if (msg.owner) {
-					// 跨页作答：答案转交持有方会话（本页不持有该问卷）。
-					if (typeof service.answerElsewhereQuestion === "function") {
-						void service.answerElsewhereQuestion(clientId, msg.owner, msg.id, msg.answers, msg.cancelled);
-					} else {
-						send({
-							type: "notice",
-							level: "error",
-							text: "当前引擎不支持跨页作答，请用 pi 引擎",
-							textEn: "Cross-page answering is not supported by the current engine; use the pi engine.",
-						});
-					}
-				} else {
-					void cs.answerQuestion?.(msg.id, msg.answers, msg.cancelled);
-				}
-				break;
-			case "tool_approval_response":
-				cs.resolveToolApproval?.(msg.id, msg.decision, msg.editedParams, msg.reason, msg.scope);
-				break;
-			case "set_approval_policy":
-				cs.setApprovalPolicy?.({
-					conversationId: msg.conversationId,
-					allowAll: msg.allowAll,
-					categories: msg.categories,
-				});
-				break;
-			case "plan_update":
-				cs.updatePlan?.(msg.steps, msg.activeStepId, msg.conversationId);
-				break;
-			case "plan_step_update":
-				cs.updatePlanStep?.(msg.stepId, msg.patch, msg.conversationId);
-				break;
-			case "plan_step_delete":
-				cs.deletePlanStep?.(msg.stepId, msg.conversationId);
-				break;
-			case "plan_step_add":
-				cs.addPlanStep?.(msg.step, msg.afterStepId, msg.conversationId);
-				break;
-			case "plan_clean_handoff":
-				void cs.planCleanHandoff?.(msg.steps, msg.prompt);
-				break;
-			case "set_plan_mode":
-				// 计划模式（只规划不实施）：会话级开关，热生效（提示词重建 + 工具硬闸门）。
-				void cs.setPlanMode?.(msg.enabled, msg.conversationId);
-				break;
-			case "set_delegate_mode":
-				// 审查者模式（自动委派）：会话级开关，默认关。开启后本对话只审阅，
-				// 用户 prompt 由服务端转给常驻落盘执行对话。DSH 引擎的实现在
-				// setDelegateMode 里直接拒（无 customTools 注册面 → 闸门无处可挂）。
-				void cs.setDelegateMode?.(msg.enabled, msg.conversationId);
+				void cs.answerQuestion?.(msg.id, msg.answers, msg.cancelled);
 				break;
 			case "page_response":
 				// 浏览器（page-picker 扩展经前端）对 browser_page 的回包：恢复挂起的
@@ -3063,18 +2315,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "delete_subagent_template":
 				void cs.deleteSubagentTemplate(msg.name);
-				break;
-			case "save_approval_rule":
-				void cs.saveApprovalRule?.(msg.rule);
-				break;
-			case "save_approval_rules":
-				void cs.saveApprovalRules?.(msg.rules);
-				break;
-			case "delete_approval_rule":
-				void cs.deleteApprovalRule?.(msg.id);
-				break;
-			case "reset_builtin_approval_rule":
-				void cs.resetBuiltinApprovalRule?.(msg.id);
 				break;
 			case "apply_preset":
 				void cs.applyPreset(msg.name);
@@ -3098,12 +2338,11 @@ wss.on("connection", (ws) => {
 				try {
 					scheduler.upsert(msg.task);
 				} catch (err) {
-					const isVal = err instanceof SchedulerValidationError;
 					send({
 						type: "notice",
 						level: "error",
-						text: `保存定时任务失败：${isVal ? err.messageZh : (err as Error).message}`,
-						textEn: `Failed to save scheduled task: ${isVal ? err.messageEn : (err as Error).message}`,
+						text: `保存定时任务失败：${(err as Error).message}`,
+						textEn: `Failed to save scheduled task: ${(err as Error).message}`,
 					});
 				}
 				break;
@@ -3150,26 +2389,7 @@ wss.on("connection", (ws) => {
 		}
 	};
 
-	/** ready 握手帧：首连与重复 hello 的幂等回包共用同一构造，避免两处漂移。 */
-	const readyMsg = (cid: string): ServerMessage => ({
-		type: "ready",
-		clientId: cid,
-		serverVersion: VERSION,
-		protocolVersion: PROTOCOL_VERSION,
-		engine: ENGINE,
-		// This package's own version. `serverVersion` is the pi SDK's,
-		// and the client used to learn ours from the update check —
-		// which a managed instance never runs.
-		appVersion: appVersion(),
-		buildId: buildId(),
-		managed: MANAGED,
-		tabs: TABS ? [...TABS] : undefined,
-		service: SERVICE_INFO ?? undefined,
-	});
-
 	ws.on("message", (data) => {
-		tracked.isAlive = true;
-		tracked.missedPings = 0;
 		let msg: ClientMessage;
 		try {
 			msg = JSON.parse(data.toString()) as ClientMessage;
@@ -3178,40 +2398,27 @@ wss.on("connection", (ws) => {
 		}
 
 		if (msg.type === "hello") {
-			// 重放守卫：一条连接只允许 attach 一次。clientId 已赋值说明 hello 处理过
-			//（或进行中），再来的 hello 幂等回一条 ready 即可——否则重复 hello 会把
-			// service.attach 整个再跑一遍：重型 ClientSession 重复创建 + 旧 send sink
-			// 永久泄漏（removePluginSender 只在 close 时清一次）。
-			if (clientId) {
-				if (!closed) send(readyMsg(clientId));
-				return;
-			}
-			// clientId 校验：外部输入，类型/长度/字符集不合格直接换 randomUUID()——
-			// 它随后成为 ClientSession key 与上传落盘目录名（uploads/<clientId>/，
-			// saveUpload 的两条路径都从这里来，入口统一拦一次即可）。
-			const cid = validateClientId(msg.clientId) ?? randomUUID();
+			const cid = msg.clientId || randomUUID();
 			clientId = cid;
-			// issue #295：ready 先行 —— 传输握手不等待会话初始化。attach 会进 SDK 的
-			// resourceLoader.reload 等同步目录扫描，坏挂载/家目录下可能阻塞数十秒；
-			// ready 在握手里先发，前端立刻离开「正在连接」（快照随后到）。
-			if (!closed) {
-				send(readyMsg(cid));
-			}
-			// attach 慢提示：本体继续等，不取消；完成后照常走快照流程。
-			const slowTimer = setTimeout(() => {
-				if (closed) return;
-				send({
-					type: "notice",
-					level: "warning",
-					text: "会话初始化耗时较长（可能在扫描工作区目录），请稍候…",
-					textEn: "Session init is taking a while (possibly scanning the workspace) — hang on…",
-				});
-			}, ATTACH_SLOW_NOTICE_MS);
 			service
 				.attach(cid, send)
 				.then((cs) => {
-					clearTimeout(slowTimer);
 					if (closed) return;
+					send({
+						type: "ready",
+						clientId: cid,
+						serverVersion: VERSION,
+						protocolVersion: PROTOCOL_VERSION,
+						engine: ENGINE,
+						// This package's own version. `serverVersion` is the pi SDK's,
+						// and the client used to learn ours from the update check —
+						// which a managed instance never runs.
+						appVersion: appVersion(),
+						buildId: buildId(),
+						managed: MANAGED,
+						tabs: TABS ? [...TABS] : undefined,
+						service: SERVICE_INFO ?? undefined,
+					});
 					// Plugin catalog: re-scan + activate new dirs on every attach so
 					// freshly dropped plugins show up without a server restart.
 					pluginMgr
@@ -3245,66 +2452,35 @@ wss.on("connection", (ws) => {
 							} catch {
 								/* 推送失败不挡快照 */
 							}
-							replayQueued();
 						})
 						.catch(() => {
 							if (closed) return;
 							// ensureLoaded 失败（如磁盘读错）不能卡死快照——前端 30s 无消息
 							// 会重连，重连又失败会陷入循环。至少把状态推下去。
 							cs.flushSnapshot();
-							replayQueued();
 						});
 					// hello may carry the UI locale — persist it before replaying
 					// anything queued during startup (issue #91).
 					if (msg.locale) void service.setLocale(cid, msg.locale);
-					// attach 期间收到的命令先排队（dispatch 里的 pending），必须等插件链
-					// 就绪后再重放：prompt 里可能是插件命令（/probe-grant 等），目录由
-					// 下面的 applyPluginCommandCatalog 同步；提前重放会撞上「未知命令」。
-					// ready 先行（issue #295）之前，客户端收到 ready 时 attach 已完成，
-					// 首条命令天然落在插件加载之后；现在 ready 与 attach 脱钩，不等就重放
-					// 等于把竞态窗口从一个 RTT 放大到整个插件扫描期（CI 必现 grant 超时）。
-					const replayQueued = (): void => {
-						attachDone = true;
-						for (const m of pending.drain()) dispatch(m);
-					};
+					// Replay anything that arrived while the session was starting.
+					const queued = pending;
+					pending = [];
+					for (const m of queued) dispatch(m);
 				})
 				.catch((err: unknown) => {
 					// Admission refused (quiesce): close the socket so the browser
 					// reconnect loop keeps retrying until admission reopens. Do NOT
 					// leave a half-alive connection that can only show an error.
-					clearTimeout(slowTimer);
 					if (err instanceof QuiesceRejectedError) {
 						closed = true;
 						if (ws.readyState === WebSocket.OPEN) {
-							// 先发 4403 关闭帧，等它刷出去再真正撕连接：close 后立刻
-							// terminate 会把关闭握手一起掐掉，客户端只能看到 1006
-							// （quiesce-test 的 brand-new client 断言 4403）。
-							try {
-								ws.close(4403, "quiesced");
-							} catch {
-								/* already closing */
-							}
-							setTimeout(() => {
-								try {
-									if (ws.readyState !== WebSocket.CLOSED) ws.terminate?.();
-								} catch {
-									/* ignore */
-								}
-							}, 500);
-						} else {
-							try {
-								ws.terminate?.();
-							} catch {
-								/* ignore */
-							}
+							ws.close(4403, "quiesced");
 						}
+						ws.terminate?.();
 						return;
 					}
 					// Real init failure (bad agent dir etc.) — keep the connection
 					// open so the user can see the error and fix it.
-					// 排队的命令此时无会话可服务，直接丢弃（否则 attachDone 永 false，
-					// 队列越积越深；用户修好后重连会重发 get_state）。
-					pending.clear();
 					send({
 						type: "notice",
 						level: "error",
@@ -3321,7 +2497,7 @@ wss.on("connection", (ws) => {
 	ws.on("close", () => {
 		service.noteSocketClose();
 		closed = true;
-		pending.clear();
+		pending = [];
 		removePluginSender();
 		if (snapshotRetryTimer) {
 			clearTimeout(snapshotRetryTimer);
@@ -3362,14 +2538,6 @@ httpServer.listen(PORT, HOST, () => {
 	console.log(`    workspace   : ${CWD}`);
 	console.log(`    session dir : ${SESSION_DIR_ROOT}`);
 	console.log(`    pi SDK      : v${VERSION}`);
-	// issue #260：全局那份 pi SDK 不是服务在用的那份（自带副本赢在 Node 解析顺序上）。
-	// #321 起默认已反转（resolve-global-sdk 自动跟随更新的那份），这条提示只在
-	// 「进程没跟上」（升级发生在启动后 / 旧构建没注入钩子）或显式 PI_WEB_SDK=bundled
-	// 钉死自带副本时出现。
-	const sdkNote = sdkOriginNote(sdkCopies(), VERSION);
-	if (sdkNote) {
-		console.log(`    pi SDK note : ${sdkNote}`);
-	}
 	console.log(`    bind        : ${HOST}:${PORT}`);
 	console.log("");
 });
@@ -3377,44 +2545,30 @@ httpServer.listen(PORT, HOST, () => {
 // 上传文件保留期清理：启动扫一次 + 每 6 小时一次（best-effort，见 uploads.ts）
 scheduleUploadCleanup();
 
-// 开机目录预同步（issue #165）：拉取一份插件市场目录文档 → 写可安装列表 → 逐条安装/更新。
-// 官方社区清单（xing-shuyin/pi-web-ui-plugins，PR 经 CI 自动审核 + 构建发布）作为**默认来源**，
-// 开箱即用、无需配置 PI_WEB_PLUGIN_CATALOG_URL；显式设为空串或 off/0/false/no 可关闭。
-// 默认**仅同步市场目录列表，绝不自动安装插件**（用户在界面按需点击安装）。
-// 仅在显式配置 PI_WEB_PLUGIN_CATALOG_INSTALL=1/true 时才顺手全部安装（headless/容器预置镜像场景）。
-const OFFICIAL_PLUGIN_CATALOG_URL = "https://xing-shuyin.github.io/pi-web-ui-plugins/catalog.json";
-const BOOT_CATALOG_URL =
-	process.env.PI_WEB_PLUGIN_CATALOG_URL === undefined
-		? OFFICIAL_PLUGIN_CATALOG_URL
-		: process.env.PI_WEB_PLUGIN_CATALOG_URL.trim();
-const bootCatalogDisabled = !BOOT_CATALOG_URL || /^(0|off|false|no)$/i.test(BOOT_CATALOG_URL);
-const autoInstall = /^(1|true|yes)$/i.test(process.env.PI_WEB_PLUGIN_CATALOG_INSTALL ?? "");
-
-if (!bootCatalogDisabled) {
+// 开机目录预同步（issue #165）：PI_WEB_PLUGIN_CATALOG_URL 指向一份插件市场目录文档
+// （headless/预置场景，不开浏览器也能装插件）。只跑一次、失败只告警不阻断启动；
+// 条目逐条安装/更新（托管实例上安装会被安装器拒绝，但列表本身仍会更新）。
+const BOOT_CATALOG_URL = (process.env.PI_WEB_PLUGIN_CATALOG_URL ?? "").trim();
+if (BOOT_CATALOG_URL) {
 	void syncPluginCatalog(
 		BOOT_CATALOG_URL,
-		{ install: autoInstall },
+		{ install: true },
 		{
 			customCatalogPath: pluginMgr.customCatalogPath,
 			pluginsDir: join(DATA_DIR, "plugins"),
 			installer: pluginInstaller,
-			// 默认仅同步市场列表；重载插件会重复触发其激活广播。
-			afterWrite: () => (autoInstall ? reloadPluginsAndPush() : pluginMgr.pushCatalog()),
+			afterWrite: () => reloadPluginsAndPush(),
 		},
 	).then((r) => {
 		if (!r.ok) {
-			console.warn(`[catalog] 插件目录预同步失败（不阻断启动）: ${r.error}`);
+			console.warn(`[catalog] PI_WEB_PLUGIN_CATALOG_URL 同步失败（不阻断启动）: ${r.error}`);
 			return;
 		}
-		if (autoInstall) {
-			const bad = (r.installed ?? []).filter((i) => !i.ok);
-			console.log(
-				`[catalog] 插件目录预同步完成：安装 ${(r.installed ?? []).length - bad.length} 成功 / ${bad.length} 失败` +
-					(bad.length ? `：${bad.map((i) => `${i.id}(${i.error ?? "?"})`).join("；")}` : ""),
-			);
-		} else {
-			console.log(`[catalog] 插件市场列表预同步完成（共 ${(r.entries ?? []).length} 个条目，按需安装）`);
-		}
+		const bad = (r.installed ?? []).filter((i) => !i.ok);
+		console.log(
+			`[catalog] PI_WEB_PLUGIN_CATALOG_URL 同步完成：安装 ${(r.installed ?? []).length - bad.length} 成功 / ${bad.length} 失败` +
+				(bad.length ? `：${bad.map((i) => `${i.id}(${i.error ?? "?"})`).join("；")}` : ""),
+		);
 	});
 }
 
@@ -3493,7 +2647,6 @@ async function shutdown(signal: "SIGINT" | "SIGTERM" = "SIGINT"): Promise<void> 
 		pluginInstaller.dispose();
 		mcpHotReload.dispose();
 		mcpBridge.dispose();
-		await globalLspPool.shutdownAll();
 		await service.disposeAll();
 		// Don't let dead browsers hold the exit open: half-open WebSocket /
 		// keep-alive HTTP connections (e.g. test clients killed without
