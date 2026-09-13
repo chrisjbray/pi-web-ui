@@ -1,0 +1,39 @@
+# pi-web-ui systemd user unit - build and run from a local checkout.
+#
+# How to use this:
+#   1. Symlink BOTH the unit and the checkout dir into your user units:
+#        mkdir -p ~/.config/systemd/user
+#        ln -s /path/to/pi-web-ui/deploy/pi-web-ui-local.service \
+#          ~/.config/systemd/user/pi-web-ui-local.service
+#        ln -s /path/to/pi-web-ui \
+#          ~/.config/systemd/user/pi-web-ui
+#      ...or `systemctl --user edit pi-web-ui-local` with:
+#          [Service]
+#          WorkingDirectory=/path/to/pi-web-ui
+#   2. Reload and start:
+#        systemctl --user daemon-reload
+#        systemctl --user enable --now pi-web-ui-local
+#   3. Logs:
+#        journalctl --user -u pi-web-ui-local -f
+[Unit]
+Description=pi-web-ui (local checkout build-and-run)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/systemd/user/pi-web-ui
+ExecStart=/bin/sh -c 'npm ci --include=dev && npm run build && npm start'
+Restart=on-failure
+RestartSec=1
+Environment=NODE_ENV=development
+# Tailnet-only: reachable at http://100.68.255.48:8787 from tailnet peers,
+# refused off-tailnet. No nginx, no subpath, no firewall change needed:
+# tailscaled owns the address and only answers on tailscale0.
+Environment=PI_WEB_HOST=100.68.255.48
+Environment=PI_WEB_PORT=8787
+# Tool hang guard: one hour (server default is far shorter; long builds and
+# deep-agent runs otherwise get killed mid-flight).
+Environment=PI_WEB_TOOL_TIMEOUT_MS=3600000
+
+[Install]
+WantedBy=default.target
