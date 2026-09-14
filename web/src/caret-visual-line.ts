@@ -24,14 +24,18 @@ export interface CaretLineFlags {
 	last: boolean;
 }
 
-/** offsetTop 是取整像素；行高通常 ≥ 14px，1px 容差足以吸收取整误差。 */
-const ROW_TOLERANCE = 1;
+/** offsetTop 是取整像素；首行标记通常落在 0–3px（空块的首行基线偏移），
+ *  用半行高做容差：同行取整误差远小于半行，跨行差一整行。 */
+function rowTolerance(ta: HTMLTextAreaElement): number {
+	const lh = Number.parseFloat(getComputedStyle(ta).lineHeight) || 0;
+	return lh > 0 ? Math.max(2, lh / 2) : 2;
+}
 
 /** 零宽空格：让行尾标记在 pre-wrap 下真的占一个「折行点」，量得到 offsetTop。 */
 const CARET_MARK = "\u200b";
 
-/** 纯函数：按镜像测量的像素位置折算首/末视觉行。 */
-export function caretRowFlags(caretTop: number, endTop: number, tolerance = ROW_TOLERANCE): CaretLineFlags {
+/** 纯函数：按镜像测量的像素位置折算首/末视觉行。tolerance 缺省 1（单测/无布局宿主）。 */
+export function caretRowFlags(caretTop: number, endTop: number, tolerance = 1): CaretLineFlags {
 	return { first: caretTop <= tolerance, last: Math.abs(endTop - caretTop) <= tolerance };
 }
 
@@ -131,5 +135,5 @@ export function caretVisualLineFlags(ta: HTMLTextAreaElement): CaretLineFlags {
 	const measurable = el.offsetHeight > 0;
 	el.textContent = ""; // 别把整份草稿留在镜像里
 	if (!measurable && value !== "") return logical;
-	return caretRowFlags(caretTop, endTop);
+	return caretRowFlags(caretTop, endTop, rowTolerance(ta));
 }
