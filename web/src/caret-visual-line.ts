@@ -60,7 +60,9 @@ function getMirror(): HTMLDivElement {
 	s.margin = "0";
 	s.padding = "0";
 	s.border = "0";
-	s.boxSizing = "content-box";
+	// Must match the measured textarea: the app is global border-box (* rule),
+	// so content-box here would wrap at the wrong width and misjudge the row.
+	s.boxSizing = "border-box";
 	s.overflow = "visible";
 	document.body.appendChild(el);
 	mirrorEl = el;
@@ -88,8 +90,11 @@ function syncMirror(ta: HTMLTextAreaElement, el: HTMLDivElement): number {
 	s.wordBreak = cs.wordBreak || "normal";
 	s.direction = cs.direction;
 	s.writingMode = cs.writingMode;
-	// textarea 的内容盒宽度（clientWidth 已排除纵向滚动条）。
-	const width = ta.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+	s.paddingLeft = cs.paddingLeft;
+	s.paddingRight = cs.paddingRight;
+	// Mirror is border-box (same as the app) so it takes the full clientWidth:
+	// clientWidth already excludes the scrollbar but INCLUDES padding.
+	const width = ta.clientWidth;
 	if (!(width > 0)) return 0;
 	s.width = `${width}px`;
 	return width;
