@@ -53,6 +53,7 @@ import type { PluginCommandDef } from "../plugins.js";
 import { checkAll as checkAllUpdates, collectTargets, resolveNpmRegistry } from "../update-check.js";
 import { previewKind } from "../text-sniff.js";
 import { removeQueuedByIndexOrText } from "../queue-utils.js";
+import { ensureCredentialFilePermissions, writeCredentialFile } from "../model-admin.js";
 import type {
 	BgServer,
 	CommandDef,
@@ -402,6 +403,7 @@ export class DshClientSession {
 		this.roots = stateStore.getWorkspaceRoots(clientId, cwd);
 		this.dataDir = dataDir;
 		this.agentDir = agentDir;
+		ensureCredentialFilePermissions(this.agentDir);
 		this.sessionRoot = dshSessionRoot(dataDir);
 		try {
 			mkdirSync(this.sessionRoot, { recursive: true });
@@ -4151,7 +4153,8 @@ export class DshClientSession {
 				/* new file */
 			}
 			auth[this.normalizeDshProvider(provider)] = { type: "api_key", key };
-			writeJsonAtomicSync(authPath, auth);
+			writeCredentialFile(authPath, JSON.stringify(auth, null, 2) + "\n");
+			ensureCredentialFilePermissions(this.agentDir);
 			this.emit({
 				type: "notice",
 				level: "info",
@@ -4180,7 +4183,8 @@ export class DshClientSession {
 				return;
 			}
 			delete auth[pid];
-			writeJsonAtomicSync(authPath, auth);
+			writeCredentialFile(authPath, JSON.stringify(auth, null, 2) + "\n");
+			ensureCredentialFilePermissions(this.agentDir);
 			this.emit({
 				type: "notice",
 				level: "info",
