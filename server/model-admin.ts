@@ -11,7 +11,7 @@
  * 经 ModelAdminHost 与 ClientSession 解耦（同 settings/goal/slash 服务模式）。
  * UI 文案直接中文（服务端 notice 约定）。apiKey/headers 绝不下发浏览器。
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ServerMessage, UiModelConfigEntry, UiProviderConfig, ProviderKeyInfo } from "./protocol.js";
@@ -256,10 +256,38 @@ export interface ProviderKeysData {
 	keys: { name: string; apiKey: string }[];
 }
 
+/** Credential files hold raw provider API keys — always mode 0600. */
+export const CREDENTIAL_FILE_MODE = 0o600;
+
+/** Write a credential file (provider-keys.json / auth.json) with mode 0600.
+ *  The `mode` option covers creation; the chmod covers pre-existing files
+ *  (mode is ignored when the file already exists). Best-effort on Windows. */
+export function writeCredentialFile(path: string, data: string): void {
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, data, { mode: CREDENTIAL_FILE_MODE });
+	try {
+		chmodSync(path, CREDENTIAL_FILE_MODE);
+	} catch {
+		/* best-effort (win) */
+	}
+}
+
+/** Startup repair: chmod existing credential files to 0600 (best-effort). */
+export function ensureCredentialFilePermissions(agentDir: string): void {
+	for (const name of ["provider-keys.json", "auth.json"]) {
+		try {
+			chmodSync(join(agentDir, name), CREDENTIAL_FILE_MODE);
+		} catch {
+			/* missing / win — ignore */
+		}
+	}
+}
+
 export class ModelAdminService {
 	private readonly oauthFlows: ProviderOAuthFlowManager;
 
 	constructor(private readonly host: ModelAdminHost) {
+		ensureCredentialFilePermissions(host.agentDir);
 		this.oauthFlows = new ProviderOAuthFlowManager({
 			modelRuntime: host.modelRuntime,
 			emit: host.emit,
@@ -365,8 +393,14 @@ export class ModelAdminService {
 	}
 
 	private writeProviderKeys(data: Record<string, ProviderKeysData>): void {
-		mkdirSync(this.host.agentDir, { recursive: true });
-		writeFileSync(this.providerKeysPath(), JSON.stringify(data, null, 2) + "\n");
+		writeCredentialFile(this.providerKeysPath(), JSON.stringify(data, null, 2) + "\n");
+		// Keep the sibling credential file at 0600 too (e.g. adding an
+		// inactive key rewrites provider-keys.json but not auth.json).
+		try {
+			chmodSync(join(this.host.agentDir, "auth.json"), CREDENTIAL_FILE_MODE);
+		} catch {
+			/* missing / win — ignore */
+		}
 	}
 
 	/** Default name "密钥 N" for a provider's Nth key. */
@@ -466,7 +500,6 @@ export class ModelAdminService {
 	/** Persist the ACTIVE key's apiKey into auth.json + runtime override + refresh. */
 	private async applyActiveKey(pid: string, apiKey: string): Promise<void> {
 		const authPath = join(this.host.agentDir, "auth.json");
-		mkdirSync(this.host.agentDir, { recursive: true });
 		let data: Record<string, unknown> = {};
 		try {
 			data = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>;
@@ -474,7 +507,12 @@ export class ModelAdminService {
 			// no file yet / unparsable — start fresh
 		}
 		data[pid] = { type: "api_key", key: apiKey };
-		writeFileSync(authPath, JSON.stringify(data, null, 2) + "\n");
+		writeCredentialFile(authPath, JSON.stringify(data, null, 2) + "\n");
+		try {
+			chmodSync(this.providerKeysPath(), CREDENTIAL_FILE_MODE);
+		} catch {
+			/* missing / win — ignore */
+		}
 		const mr = this.host.modelRuntime();
 		await mr.setRuntimeApiKey(pid, apiKey);
 		await mr.refresh({ allowNetwork: true, providers: [pid] });
@@ -695,7 +733,7 @@ export class ModelAdminService {
 					// no file yet — nothing to clean
 				}
 				delete auth[pid];
-				writeFileSync(authPath, JSON.stringify(auth, null, 2) + "\n");
+				writeCredentialFile(authPath, JSON.stringify(auth, null, 2) + "\n");
 				const mr = this.host.modelRuntime();
 				await mr.removeRuntimeApiKey(pid);
 				await mr.refresh({ providers: [pid] });
@@ -783,7 +821,7 @@ export class ModelAdminService {
 				return;
 			}
 			delete data[pid];
-			writeFileSync(authPath, JSON.stringify(data, null, 2) + "\n");
+			writeCredentialFile(authPath, JSON.stringify(data, null, 2) + "\n");
 			// Clear every stored key so the provider returns to unconfigured.
 			delete keyData[pid];
 			this.writeProviderKeys(keyData);
