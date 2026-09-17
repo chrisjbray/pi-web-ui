@@ -10,7 +10,8 @@
  * 因此统一按「只移除第一处匹配」处理。
  */
 
-/** 移除列表中第一处等于 `text` 的项；找不到时返回入参的拷贝（不修改入参）。 */
+/**
+ * 移除列表中第一处等于 `text` 的项；找不到时返回入参的拷贝（不修改入参）。 */
 export function removeFirstOccurrence(list: readonly string[], text: string): string[] {
 	const index = list.indexOf(text);
 	if (index < 0) return [...list];
