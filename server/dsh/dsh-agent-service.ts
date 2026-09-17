@@ -25,7 +25,7 @@
  * BgServerTracker（后台任务）、TerminalManager（PTY）、uploads.ts。
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -51,6 +51,7 @@ import type { PluginCommandDef } from "../plugins.js";
 import { checkAll as checkAllUpdates, collectTargets, resolveNpmRegistry } from "../update-check.js";
 import { previewKind } from "../text-sniff.js";
 import { removeQueuedByIndexOrText } from "../queue-utils.js";
+import { ensureCredentialFilePermissions, writeCredentialFile } from "../model-admin.js";
 import type {
 	BgServer,
 	CommandDef,
@@ -399,6 +400,7 @@ export class DshClientSession {
 		this.roots = stateStore.getWorkspaceRoots(clientId, cwd);
 		this.dataDir = dataDir;
 		this.agentDir = agentDir;
+		ensureCredentialFilePermissions(this.agentDir);
 		this.sessionRoot = dshSessionRoot(dataDir);
 		try {
 			mkdirSync(this.sessionRoot, { recursive: true });
@@ -4087,8 +4089,8 @@ export class DshClientSession {
 				/* new file */
 			}
 			auth[this.normalizeDshProvider(provider)] = { type: "api_key", key };
-			mkdirSync(dirname(authPath), { recursive: true });
-			writeFileSync(authPath, JSON.stringify(auth, null, 2) + "\n");
+			writeCredentialFile(authPath, JSON.stringify(auth, null, 2) + "\n");
+			ensureCredentialFilePermissions(this.agentDir);
 			this.emit({
 				type: "notice",
 				level: "info",
@@ -4117,7 +4119,8 @@ export class DshClientSession {
 				return;
 			}
 			delete auth[pid];
-			writeFileSync(authPath, JSON.stringify(auth, null, 2) + "\n");
+			writeCredentialFile(authPath, JSON.stringify(auth, null, 2) + "\n");
+			ensureCredentialFilePermissions(this.agentDir);
 			this.emit({
 				type: "notice",
 				level: "info",
