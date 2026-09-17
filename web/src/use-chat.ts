@@ -79,7 +79,7 @@ export interface UpdateAllItem {
 	latestPublishedAt?: string | null;
 	upToDate: boolean;
 	error?: string;
-	/** git-extension only: `host/path` shorthand for the `pi update` command. */
+	/** git-extension only: `host/path` shorthand; update with `pi update git:<host/path>` (bare fails). */
 	source?: string;
 }
 

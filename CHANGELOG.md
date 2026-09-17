@@ -8,6 +8,12 @@
 每个版本的内容按"实际合入该版本发布的提交"归档（以 `package.json` 的 version 变更提交为准），
 而不是按提交日期聚类——连续快速发布的 patch 版本以此为准最准确。
 
+## [Unreleased]
+
+### Fixed
+
+- **git 源扩展更新命令补 `git:` 前缀**（P1 TODO 14）—— 更新面板为 git 源扩展生成的命令由 `pi update <host>/<path>` 改为 `pi update git:<host>/<path>`（裸路径会被 pi core 拒绝并提示 `Did you mean git:...?`）；已带 `git:` 前缀的输入不会重复加前缀。
+
 ## [0.89.0] — 2026-09-17
 
 ### Added

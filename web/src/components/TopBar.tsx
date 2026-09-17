@@ -354,9 +354,9 @@ export function TopBar({
 	};
 
 	/** Run the right update command for one or more components in a visible
-	 *  terminal tab (same SCM-style pattern as the self-update above): pi
+	 *  terminal tab (same SCM-style pattern as the self-update above): npm
 	 *  extensions go through `pi update npm:<name>` (they live under
-	 *  <agentDir>/npm), everything globally installed via `npm i -g`.
+	 *  <agentDir>/npm); git extensions go through `pi update git:<host>/<path>` (bare fails), everything globally installed via `npm i -g`.
 	 *  Multi-target runs are chained with `;` so one failing step never
 	 *  blocks the rest. Reuses the tab with the same title, else creates one. */
 	const runPkgUpdate = (items: UpdateAllItem[], title: string) => {

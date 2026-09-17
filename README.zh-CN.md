@@ -189,7 +189,7 @@
 
 - 前台运行 / 全局 npm 安装 / Docker（见 [Docker](#docker)）/ macOS launchd / Linux systemd / Windows 登录自启（HKCU `Run` 键 + 无控制台启动器 + 崩溃看门狗）/ 桌面快捷方式（`server shortcut`）。
 - `server install --print` 只打印将要写入的 launchd plist / systemd unit / Windows 启动器就退出，可在真正安装前先审阅。
-- **更新面板** —— 版本按钮在有新版本时显示黄点，另有「N 个更新」徽标；「检查全部更新」会比对本体、全局安装的 pi 核心与 `<agentDir>/npm/package.json` 里声明的直接依赖，每行都能单独更新，另有「全部更新」与「重新检查」；命令在可见终端里跑（pi 扩展走 `pi update npm:<名字>`，这是唯一能更新 pi 真正加载的那份的命令；其余走 `npm i -g <名字>@latest`）。刚发布不足 30 分钟会提醒 npm 缓存元数据可能还没同步。被 launchd/systemd/Windows 看门狗托管的实例多一个「重启服务」按钮；前台运行的实例没有，因为没有东西会把它拉回来。
+- **更新面板** —— 版本按钮在有新版本时显示黄点，另有「N 个更新」徽标；「检查全部更新」会比对本体、全局安装的 pi 核心与 `<agentDir>/npm/package.json` 里声明的直接依赖，每行都能单独更新，另有「全部更新」与「重新检查」；命令在可见终端里跑（npm pi 扩展走 `pi update npm:<名字>`；git 源扩展走 `pi update git:<host>/<路径>`，裸 `<host>/<路径>` 会报 `Did you mean git:...?`；其余走 `npm i -g <名字>@latest`）。刚发布不足 30 分钟会提醒 npm 缓存元数据可能还没同步。被 launchd/systemd/Windows 看门狗托管的实例多一个「重启服务」按钮；前台运行的实例没有，因为没有东西会把它拉回来。
 - **命令行更新插件** —— `pi-web-ui plugins --check-updates` 逐个对比插件记录的提交与远端 HEAD 并给出确切更新命令；每次 `install --force` 都会把旧版本快照到 `<dataDir>/plugin-backups/`（只留最近 3 份，拷贝失败自动回滚），所以 `pi-web-ui plugins --rollback <id>` 可以退回上一版。
 - pi CLI 里还有 `/webui`（来自随包的 `extensions/webui.ts`）：`/webui` 从 8787 起挑第一个空闲端口拉起服务，`--port 9000`、`--cwd <路径>`、`--no-browser`、`status`、`stop` 分别控制它；每个 pi 会话一个子进程，会话关闭时回收，不留孤儿进程。
 
