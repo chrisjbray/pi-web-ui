@@ -1688,7 +1688,7 @@ export const zh = {
 /* en                                                                  */
 /* ------------------------------------------------------------------ */
 
-const en: Record<keyof typeof zh, string> = {
+export const en: Record<keyof typeof zh, string> = {
 	/* common */
 	docTitle: "pi-web-ui — pi coding agent",
 	cancel: "Cancel",
@@ -2203,6 +2203,8 @@ const en: Record<keyof typeof zh, string> = {
 	previous: "Previous",
 	questionStep: "Q {cur} / {total}",
 	optionPreview: "Option preview",
+	noOptions: "(no options)",
+	inputPlaceholder: "Enter content",
 	questionTimeout: "⏳ {s}s left — auto-cancels on timeout",
 	questionTimeoutExpired: "Question timed out, resuming conversation…",
 	modelNoVision: "Current model {name} doesn't support images — switch to DeepSeek V4 Flash Vision (exp)",
@@ -2213,9 +2215,6 @@ const en: Record<keyof typeof zh, string> = {
 	dshVisionHiddenNote: "DSH supports real image input (DeepSeek V4 Flash Vision (exp) only) — no vision bridge needed",
 	dshNoReviewModel:
 		"DSH has no separate reviewer model — the model self-certifies goal completion; max rounds = auto-iteration count",
-	noOptions: "(no options)",
-	inputPlaceholder: "Enter content",
-
 	/* sound settings */
 	soundHeader: "Sound notifications",
 	enableSound: "Enable sound",
@@ -3238,16 +3237,16 @@ const en: Record<keyof typeof zh, string> = {
 	subagentTemplateEdit: "Edit",
 	subagentTemplateClosed: "Disabled",
 	tplDefaultBadge: "Built-in",
+	subagentTemplateOffHint:
+		"Disabled templates stay in the panel and can be re-enabled, but AI tools can't see or pick them",
+	subagentTemplateEnable: "Enable",
+	subagentTemplateDisable: "Disable",
 	subagentDefaultModelLabel: "Default subagent model",
 	subagentFollowMain: "Follow the main conversation's current model",
 	subagentDefaultModelHint:
 		"Fallback model for all subagents (a template's own model and the subagent_spawn model param take priority); does not change the main conversation's model.",
 	subagentNoModels:
 		"No usable models yet (configure a provider API key first) — subagents will follow the main conversation's model.",
-	subagentTemplateOffHint:
-		"Disabled templates stay in the panel and can be re-enabled, but AI tools can't see or pick them",
-	subagentTemplateEnable: "Enable",
-	subagentTemplateDisable: "Disable",
 	tplNamePlaceholder: "Template name (referenced by AI via subagent_spawn's template param)…",
 	tplDescriptionPlaceholder: "Description (AI uses it to judge when to pick this template)…",
 	tplDescriptionEnPlaceholder:
