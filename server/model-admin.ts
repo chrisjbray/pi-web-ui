@@ -256,10 +256,11 @@ export interface ProviderKeysData {
 	keys: { name: string; apiKey: string }[];
 }
 
-/** Credential files hold raw provider API keys — always mode 0600. */
+/** Credential files hold raw provider API keys — always mode 0600.
+ *  models.json can hold per-provider apiKey/headers, so it gets the same treatment. */
 export const CREDENTIAL_FILE_MODE = 0o600;
 
-/** Write a credential file (provider-keys.json / auth.json) with mode 0600.
+/** Write a credential file (provider-keys.json / auth.json / models.json) with mode 0600.
  *  The `mode` option covers creation; the chmod covers pre-existing files
  *  (mode is ignored when the file already exists). Best-effort on Windows. */
 export function writeCredentialFile(path: string, data: string): void {
@@ -274,7 +275,7 @@ export function writeCredentialFile(path: string, data: string): void {
 
 /** Startup repair: chmod existing credential files to 0600 (best-effort). */
 export function ensureCredentialFilePermissions(agentDir: string): void {
-	for (const name of ["provider-keys.json", "auth.json"]) {
+	for (const name of ["provider-keys.json", "auth.json", "models.json"]) {
 		try {
 			chmodSync(join(agentDir, name), CREDENTIAL_FILE_MODE);
 		} catch {
@@ -1524,7 +1525,7 @@ export class ModelAdminService {
 		const graduated = graduateOverlayModels(providers, official);
 		if (graduated.length === 0) return graduated;
 		try {
-			writeFileSync(this.modelsConfigPath(), JSON.stringify({ providers }, null, 2) + "\n");
+			writeCredentialFile(this.modelsConfigPath(), JSON.stringify({ providers }, null, 2) + "\n");
 		} catch {
 			return [];
 		}
@@ -1565,8 +1566,7 @@ export class ModelAdminService {
 		providers: Record<string, Record<string, unknown>>,
 		pid: string,
 	): Promise<void> {
-		mkdirSync(this.host.agentDir, { recursive: true });
-		writeFileSync(this.modelsConfigPath(), JSON.stringify({ providers }, null, 2) + "\n");
+		writeCredentialFile(this.modelsConfigPath(), JSON.stringify({ providers }, null, 2) + "\n");
 
 		// Allow a models.json entry to reuse the provider credential already
 		// stored in auth.json. Seed the shared runtime too, because older pi-ai
@@ -1733,7 +1733,7 @@ export class ModelAdminService {
 				return;
 			}
 			delete providers[providerId];
-			writeFileSync(this.modelsConfigPath(), JSON.stringify({ providers }, null, 2) + "\n");
+			writeCredentialFile(this.modelsConfigPath(), JSON.stringify({ providers }, null, 2) + "\n");
 			await this.host.modelRuntime().refresh();
 			this.host.invalidatePiConfig();
 			await this.listModelsConfig();
