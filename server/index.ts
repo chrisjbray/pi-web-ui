@@ -32,7 +32,7 @@ import { PROTOCOL_VERSION } from "./protocol-version.js";
 import { AgentService, workspacePath, QuiesceRejectedError } from "./agent-service.js";
 import { WS_MAX_PAYLOAD_BYTES, isAbsoluteWirePath, wireToAbs } from "./files-service.js";
 import { registerFileTransferRoutes } from "./file-transfer-routes.js";
-import { previewKind } from "./text-sniff.js";
+import { isAudioFile, previewKind } from "./text-sniff.js";
 import { startControlServer } from "./control-socket.js";
 import { scheduleUploadCleanup } from "./uploads.js";
 import { ensureWindowsBash, windowsBashDir } from "./ensure-bash.js";
@@ -237,6 +237,16 @@ function cookieToken(req: { headers: IncomingMessage["headers"] }): string {
 	return "";
 }
 
+/** Express 5 命名通配 `*splat` 的取值：单段是字符串，多段是字符串数组
+ *  （issue #225：直接 String() 会把多段用逗号拼成 "a,b.mjs"，插件 vendor 子
+ *  目录、嵌套文件预览、插件子路径 API 全 404）。统一拼回 "/" 即得 Express 4
+ *  语义；下游既有的越界/包含校验（workspacePath / resolvePluginClientFile）不变。 */
+function splatParam(req: { params: unknown }): string {
+	const v = (req.params as unknown as Record<string, string | string[] | undefined>).splat;
+	if (Array.isArray(v)) return v.join("/");
+	return String(v ?? "");
+}
+
 if (AUTH_TOKEN) {
 	// /api/health 保持开放：无敏感信息，容器/监控探针需要它。
 	// 但绝不能因命中 /api/health 就反射下发真实 token cookie（安全漏洞：issue #45）。
@@ -300,7 +310,9 @@ app.get("/api/health", (_req, res) => {
  *
  * Media preview (no download param): only image/video kinds are served —
  * text goes over the WebSocket, and exe/jar/etc. are never exposed here.
- * express's sendFile handles Range requests, so video seeking works.
+ * Audio files (isAudioFile: browser-playable containers only) are allowed too
+ * so present_files cards and the preview dialog can inline-play them.
+ * express's sendFile handles Range requests, so video/audio seeking works.
  *
  * Download (?download=1): any file kind is served with
  * Content-Disposition: attachment so the browser saves it instead of
@@ -336,7 +348,8 @@ app.get("/api/file", async (req, res) => {
 		// allowlist them explicitly here.
 		const lower = name.toLowerCase();
 		const isHtmlPreview = lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml");
-		if (!isDownload && kind !== "image" && kind !== "video" && !isHtmlPreview) {
+		const isAudioPreview = isAudioFile(name);
+		if (!isDownload && kind !== "image" && kind !== "video" && !isHtmlPreview && !isAudioPreview) {
 			res.status(400).end("not a previewable media file");
 			return;
 		}
@@ -348,7 +361,10 @@ app.get("/api/file", async (req, res) => {
 		if (isDownload) {
 			// res.download sets Content-Disposition: attachment and RFC 5987
 			// filename* encoding for non-ASCII names.
-			res.download(abs, name);
+			// dotfiles: allow — issue #223：Express 5 的 send 默认 dotfiles=ignore，
+			// 工作区/数据目录常位于隐藏目录下（如 ~/.pi-web），绝对路径含点号段会被判 404。
+			// 路径已由上方的 workspacePath/isAbsoluteWirePath 做工作区 containment 校验，放行安全。
+			res.download(abs, name, { dotfiles: "allow" });
 		} else {
 			if (isHtmlPreview) {
 				// Sandbox even a top-level navigation to this URL: a workspace
@@ -364,7 +380,7 @@ app.get("/api/file", async (req, res) => {
 				res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
 				res.setHeader("X-Content-Type-Options", "nosniff");
 			}
-			res.sendFile(abs);
+			res.sendFile(abs, { dotfiles: "allow" });
 		}
 	} catch {
 		res.status(404).end("not found");
@@ -387,10 +403,10 @@ app.get("/api/file", async (req, res) => {
  * get a sandboxed CSP (?allowJs=1 relaxes scripts only — never same-origin),
  * everything else streams with its real content type.
  */
-app.get("/api/preview/*", async (req, res) => {
+app.get("/api/preview/*splat", async (req, res) => {
 	try {
-		// SAFETY: Express wildcard captures are indexed string route parameters.
-		const captured = String((req.params as unknown as Record<string, string>)[0] ?? "");
+		// 多段路径的 splat 是数组（见 splatParam），拼回 "/" 后才是线形路径。
+		const captured = splatParam(req);
 		const ABS_MARKER = "__abs__/";
 		const cid = typeof req.query.clientId === "string" ? req.query.clientId : "";
 		const cs = cid ? service.get(cid) : undefined;
@@ -427,7 +443,7 @@ app.get("/api/preview/*", async (req, res) => {
 			const allowJs = req.query.allowJs === "1";
 			res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
 		}
-		res.sendFile(abs);
+		res.sendFile(abs, { dotfiles: "allow" });
 	} catch {
 		res.status(404).end("not found");
 	}
@@ -525,7 +541,10 @@ app.get("/themes/:id.css", (req, res) => {
 	}
 	res.setHeader("Content-Type", "text/css; charset=utf-8");
 	res.setHeader("Cache-Control", "no-cache");
-	res.sendFile(file);
+	// dotfiles: allow — issue #223：Express 5 的 send 默认 dotfiles=ignore，主题文件位于
+	// 隐藏目录下（如 ~/.pi-web/themes、npm 全局目录 ~/.local/…）时会被判 404。路径已由
+	// resolveThemeFile 校验（id 白名单 + 仅已知目录 + isFile），放行安全。
+	res.sendFile(file, { dotfiles: "allow" });
 });
 
 // Plugin client bundles: <dataDir>/plugins/<id>/client/* served at
@@ -537,9 +556,9 @@ const PLUGINS_DIR = join(DATA_DIR, "plugins");
 // 插件 HTTP 路由挂载点：host.route("GET", "/inbox") 实际暴露为
 // /plugins-api/<id>/inbox。PI_WEB_TOKEN 鉴权（上方 app.use）自动覆盖；
 // 响应已在前面过了 express.json。注意不要在此 catch-all 里消费 body。
-app.all(["/plugins-api/:id/*", "/plugins-api/:id"], (req, res) => {
-	// SAFETY: Express wildcard captures are strings indexed by 0.
-	const rest = String((req.params as unknown as Record<string, string | undefined>)[0] ?? "");
+app.all(["/plugins-api/:id/*splat", "/plugins-api/:id"], (req, res) => {
+	// 多段子路径的 splat 是数组（见 splatParam），拼回 "/" 后再交插件路由。
+	const rest = splatParam(req);
 	pluginMgr.handleHttp(String(req.params.id ?? ""), req.method, rest, req, res);
 });
 /** 通用插件代理（host.registerProxy 注册的前缀落到这里）：去前缀后原样透传到
@@ -604,9 +623,9 @@ app.use((req, res, next) => {
 	}
 	proxyHttp(hit, req, res);
 });
-app.get("/plugins/:id/client/*", (req, res) => {
-	// express 4 的通配参数在运行时落在 params[0]，但类型声明里没有 —— 显式取
-	const rest = String((req.params as unknown as Record<string, string | undefined>)[0] ?? "");
+app.get("/plugins/:id/client/*splat", (req, res) => {
+	// 多段子路径（插件 vendor/分包）的 splat 是数组（见 splatParam），拼回 "/"。
+	const rest = splatParam(req);
 	// 特权 DOM 门禁：声明了 dom 能力的插件，其 bundle 需用户逐个授权后才下发
 	// （同源 bundle 技术上拦不住 DOM 访问，门只能放在这里；见 server/plugin-dom.ts）。
 	if (pluginMgr.isDomBundleBlocked(String(req.params.id ?? ""))) {
@@ -623,7 +642,8 @@ app.get("/plugins/:id/client/*", (req, res) => {
 		res.setHeader("Content-Type", "text/javascript; charset=utf-8");
 	}
 	res.setHeader("Cache-Control", "no-cache"); // 开发期改文件即生效
-	res.sendFile(abs, (err) => {
+	// dotfiles: allow — issue #223：插件目录默认在 ~/.pi-web/plugins（隐藏目录段），同上需放行。
+	res.sendFile(abs, { dotfiles: "allow" }, (err) => {
 		if (err && !res.headersSent)
 			res
 				.status((err as NodeJS.ErrnoException & { statusCode?: number }).statusCode === 404 ? 404 : 500)
@@ -684,7 +704,8 @@ if (existsSync(webDist)) {
 		const stored = readDevNoCacheSetting();
 		const noStore = stored ?? envDefault;
 		res.setHeader("Cache-Control", noStore ? "no-store" : "public, max-age=0");
-		res.sendFile(join(webDist, "index.html"), (err) => {
+		// dotfiles: allow — issue #223：nvm 等安装路径本身在隐藏目录下（如 ~/.nvm/…），同上需放行。
+		res.sendFile(join(webDist, "index.html"), { dotfiles: "allow" }, (err) => {
 			if (err && !res.headersSent) {
 				res.status(503).send("正在更新 pi-web-ui，请稍后刷新…");
 			}
