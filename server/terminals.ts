@@ -763,6 +763,12 @@ export class TerminalManager {
 		private readonly lang?: () => ServerLang,
 	) {}
 
+	/** 过户：对话整体搬到另一个 ClientSession 时，把输出/退出事件改发给新宿主。
+	 *  PTY 本体不动（进程不重启，输出缓冲保留），只换投递地址. */
+	rebindEmit(emit: (msg: ServerMessage) => void): void {
+		this.emit = emit;
+	}
+
 	/** Start a plain interactive shell in the given directory.
 	 *
 	 *  v1 tmux 用户裸终端走 createTmux（async，会话 `pi-web-ui-<id>`，PTY 只读
@@ -1441,6 +1447,38 @@ export class TerminalManager {
 		return this.inputChecked(id, encoded.data);
 	}
 
+	/**
+	 * Kill the native PTY (issue #215：Windows ConPTY 关机死锁）。
+	 *
+	 * Windows 下 `pty.kill()` 底层走 `ClosePseudoConsole`，管道有未排空数据时会
+	 * 内核级同步死锁，直接冻住单线程事件循环（进程内 setTimeout 看门狗与二次
+	 * Ctrl+C 全灭）。所以 Windows 先走 Node 原生的 `process.kill(pid)`
+	 *（TerminateProcess，从不阻塞）把 shell 干掉：
+	 * - 关机（shutdown=true）：到此为止，不再调 `pty.kill()`。进程马上就
+	 *   `process.exit`，HPC 句柄由 OS 回收；再调只会自找死锁。
+	 * - 日常（tab 关闭/移出对话）：子进程已死、管道见 EOF 后再调 `pty.kill()`
+	 *   释放 HPC 句柄，此时不再阻塞（长驻服务必须释放句柄，不能像关机那样一走了之）。
+	 * 非 Windows 原样直调 `pty.kill()`。
+	 */
+	private killNative(entry: TermEntry, shutdown = false): void {
+		if (process.platform === "win32") {
+			const pid = (entry.pty as { pid?: number }).pid;
+			if (typeof pid === "number") {
+				try {
+					process.kill(pid);
+				} catch {
+					// already dead
+				}
+			}
+			if (shutdown) return;
+		}
+		try {
+			entry.pty.kill();
+		} catch {
+			// already dead
+		}
+	}
+
 	/** 解除静默看门狗（退出/关闭/全部停止时）。 */
 	private disarmIdleWatch(entry: TermEntry): void {
 		if (entry.idleTimer) {
@@ -1867,17 +1905,19 @@ export class TerminalManager {
 		this.adoptTimer.unref?.();
 	}
 
-	/** Kill every terminal owned by this conversation. */
-	killAll(): void {
+	/**
+	 * Kill every terminal owned by this conversation.
+	 * @param opts.shutdown=true = 进程关机路径（disposeAll）：Windows 下跳过
+	 * `pty.kill()`（见 killNative），只做 TerminateProcess + 状态清理，50ms 内退出。
+	 * 日常移出对话走默认 false，必须释放 HPC 句柄。
+	 */
+	killAll(opts?: { shutdown?: boolean }): void {
+		const shutdown = opts?.shutdown === true;
 		for (const entry of this.terms.values()) {
 			this.disarmIdleWatch(entry);
 			if (entry.exited) continue;
 			entry.exited = true;
-			try {
-				entry.pty.kill();
-			} catch {
-				// already dead
-			}
+			this.killNative(entry, shutdown);
 		}
 		for (const entry of this.terms.values()) {
 			for (const wake of entry.waiters) wake();
