@@ -46,10 +46,12 @@ import {
 	checkAll as checkAllUpdates,
 	collectTargets,
 	compareVersions as compareSemver,
+	detectPiSdkSplit,
 	resolveNpmRegistry,
 	sortUpdateItems,
 	type UpdateItem,
 } from "./update-check.js";
+import { isBundledInUse, sdkCopies } from "./sdk-origin.js";
 import { hasActiveSubagentRun, hasPendingWaitSubscription, shouldRetainActive } from "./wait-subscription-scan.js";
 import {
 	COMPACTION_PENDING_TYPE,
@@ -94,6 +96,7 @@ import {
 	isExtensionDisabled,
 	isExtensionEnabled,
 	normalizeDisabledPluginTools,
+	normalizePathKey,
 	normalizeRetryMaxAttempts,
 	normalizeSkillList,
 	type PromptMode,
@@ -103,6 +106,7 @@ import { bilingual, pick, resolveServerLang, type ServerLang } from "./i18n.js";
 import { SubagentTemplatesStore, pickTemplatePrompt, type SubagentTemplate } from "./subagent-templates.js";
 import { ApprovalRulesStore, type ApprovalRule } from "./approval-rules.js";
 import { ComposerDraftsStore } from "./composer-drafts.js";
+import { readPermissionFromSession } from "./permission-preset.js";
 import { createWorkspaceSnapshot, restoreWorkspaceSnapshot } from "./workspace-snapshot.js";
 import {
 	approvalSuppressionReason,
@@ -3052,7 +3056,10 @@ export class ClientSession {
 
 		let originalKeepRecent: number | undefined;
 		try {
-			originalKeepRecent = session.settingsManager.getCompactionSettings(model).keepRecentTokens;
+			originalKeepRecent =
+				(session.settingsManager.getCompactionSettings as unknown as (m?: unknown) => { keepRecentTokens?: number })(
+					model,
+				)?.keepRecentTokens ?? session.settingsManager.getCompactionSettings().keepRecentTokens;
 		} catch {
 			originalKeepRecent = undefined;
 		}
@@ -3892,7 +3899,10 @@ export class ClientSession {
 			createdAt: Date.now(),
 			agentPreset: this.settingsSvc.current.defaultAgentPreset ?? "standard",
 			presetLocked: false,
-			permissionPreset: this.settingsSvc.current.defaultPermissionPreset ?? "workspace-write-never",
+			permissionPreset:
+				readPermissionFromSession(runtime.session.sessionManager) ??
+				this.settingsSvc.current.defaultPermissionPreset ??
+				"workspace-write-never",
 			// A brand-new conversation is not yet LISTED — it enters the running
 			// list only when it is displaced to the background while still
 			// streaming (its runtime is what `listed` protects). A blank chat is
@@ -4092,7 +4102,9 @@ export class ClientSession {
 		await conv.session.bindExtensions({
 			mode: "rpc",
 			uiContext: this.webUi,
-			onError: this.makeExtensionErrorReporter(),
+			onError: this.makeExtensionErrorReporter(
+				conv.isEphemeral ? { text: `临时对话 ${conv.id}：`, textEn: `Ephemeral chat ${conv.id}: ` } : undefined,
+			),
 		});
 		conv.unsubscribe = conv.session.subscribe((event) => this.onEvent(conv, event));
 		// 新会话 / 切换会话 / 强杀重建的必经之路：刚创建的 runtime 用的是 SDK
@@ -6045,10 +6057,20 @@ export class ClientSession {
 	 * within UPDATE_ALL_CACHE_MS; pass force=true (explicit refresh) to bypass.
 	 */
 	async checkUpdatesAll(force = false): Promise<void> {
+		// issue #321：pi SDK 副本状态随结果下发（运行中是哪份 / 是否自带 / 机器上有没有
+		// 更新的），UI 据此在更新面板亮「重启跟上」与「安装全局引擎并切换」入口。
+		// 缓存命中也现算：用户升级全局 pi 不经本服务，缓存的 items 不影响这个判据，
+		// 探针本身有 10s memoize，重算便宜。
+		const piSdk = {
+			running: VERSION,
+			bundledInUse: isBundledInUse(sdkCopies(), VERSION),
+			newerInstalled: detectPiSdkSplit(VERSION)?.installed ?? null,
+		};
 		if (!force && this.updatesAllCache && Date.now() - this.updatesAllCache.at < ClientSession.UPDATE_ALL_CACHE_MS) {
 			this.emit({
 				type: "update_status_all",
 				items: this.updatesAllCache.items,
+				piSdk,
 			});
 			return;
 		}
@@ -6060,7 +6082,7 @@ export class ClientSession {
 				await checkAllUpdates(targets, undefined, () => this.getLang(), resolveNpmRegistry(this.agentDir)),
 			);
 			this.updatesAllCache = { at: Date.now(), items };
-			this.emit({ type: "update_status_all", items });
+			this.emit({ type: "update_status_all", items, piSdk });
 		} catch (err) {
 			// checkAll degrades per-item; only local enumeration blowing up lands
 			// here — still report a usable (webui-only) error item.
@@ -6814,7 +6836,19 @@ export class ClientSession {
 			});
 			return;
 		}
+		if (this.conv.permissionPreset === hit.value) {
+			return;
+		}
 		this.conv.permissionPreset = hit.value;
+		try {
+			// 持久会话：将权限变更写入会话转录日志，切会话/切项目重载时不丢失
+			const sm = this.conv.session.sessionManager as unknown as {
+				appendCustomEntry?: (customType: string, data: unknown) => void;
+			};
+			sm?.appendCustomEntry?.("permission/preset", { preset: hit.value });
+		} catch {
+			// best effort for in-memory sessions
+		}
 		this.emit({
 			type: "notice",
 			level: "info",
@@ -8061,12 +8095,25 @@ export class ClientSession {
 		try {
 			const conversationId = this.nextConversationId();
 			const terminals = this.makeTerminalManager(conversationId, this.cwd);
+			let sessionManager: SessionManager;
+			if (ephemeral) {
+				sessionManager = SessionManager.inMemory(this.cwd);
+				// 为无痕临时会话提供隔离的临时运行目录（供 SoL-Pi 等依赖 getSessionDir 的扩展正常放置缓存），
+				// 但保持 persist = false（不写 .jsonl 对话文件、不污染历史记录）
+				const ephemeralDir = join(this.agentDir, "ephemeral-sessions", conversationId);
+				try {
+					mkdirSync(ephemeralDir, { recursive: true });
+					(sessionManager as unknown as { sessionDir: string }).sessionDir = ephemeralDir;
+				} catch {}
+			} else {
+				sessionManager = SessionManager.create(this.cwd);
+			}
 			const runtime = await createAgentSessionRuntime(
 				this.makeRuntimeFactory(terminals, undefined, conversationId, prevModel ?? undefined),
 				{
 					cwd: this.cwd,
 					agentDir: this.agentDir,
-					sessionManager: ephemeral ? SessionManager.inMemory(this.cwd) : SessionManager.create(this.cwd),
+					sessionManager,
 				},
 			);
 			const conv = this.makeConversation(runtime, conversationId, terminals);
@@ -8434,6 +8481,12 @@ export class ClientSession {
 		conv.unsubscribe = undefined;
 		if (conv.isSubagent) {
 			const ephemeralDir = join(this.agentDir, "subagent-sessions", conv.id);
+			try {
+				rmSync(ephemeralDir, { recursive: true, force: true });
+			} catch {}
+		}
+		if (conv.isEphemeral) {
+			const ephemeralDir = join(this.agentDir, "ephemeral-sessions", conv.id);
 			try {
 				rmSync(ephemeralDir, { recursive: true, force: true });
 			} catch {}
@@ -9129,6 +9182,12 @@ export class ClientSession {
 			}
 			conv.isSubagent = false;
 			conv.isEphemeral = false;
+			if (wasEphemeral) {
+				const ephemeralDir = join(this.agentDir, "ephemeral-sessions", conv.id);
+				try {
+					rmSync(ephemeralDir, { recursive: true, force: true });
+				} catch {}
+			}
 
 			this.emitConversations();
 			await this.pushProjects();
@@ -10109,7 +10168,7 @@ export class ClientSession {
 		const run: Promise<ProjectSummary[] | null> = (async () => {
 			try {
 				const saved = this.stateStore.get(this.clientId);
-				const removedProjects = new Set(this.stateStore.getRemovedProjects(this.clientId));
+				const removedProjects = new Set(this.stateStore.getRemovedProjects(this.clientId).map(normalizePathKey));
 				const map = new Map<string, number>();
 				for (const p of saved.projects) map.set(p.path, p.lastUsed);
 				const all = await SessionManager.listAll(piSessionsRoot());
@@ -10124,7 +10183,7 @@ export class ClientSession {
 				// is useless in the picker. Tombstoned entries (explicitly removed by
 				// the user) stay hidden even though session files still mention them.
 				const projects: ProjectSummary[] = [...map.entries()]
-					.filter(([path]) => !removedProjects.has(path) && existsSync(path))
+					.filter(([path]) => !removedProjects.has(normalizePathKey(path)) && existsSync(path))
 					.map(([path, lastUsed]) => ({ path, lastUsed }))
 					.sort((a, b) => b.lastUsed - a.lastUsed)
 					.slice(0, 20);
@@ -10143,11 +10202,17 @@ export class ClientSession {
 	}
 
 	/** 缓存命中时把当前 cwd 并进去：命中则刷新 lastUsed 重排，未命中则补到首位
-	 *  （remember 刚写入的新项目在 TTL 窗口内也可见，不必等下一次扫盘）。 */
+	 *  （remember 刚写入的新项目在 TTL 窗口内也可见，不必等下一次扫盘）。
+	 *  若当前工作区已被显式移出，则不强行塞回最近列表。 */
 	private withCurrentCwd(projects: ProjectSummary[], now: number): ProjectSummary[] {
-		if (projects.some((p) => p.path === this.cwd)) {
+		const currentKey = normalizePathKey(this.cwd);
+		const removedKeys = new Set(this.stateStore.getRemovedProjects(this.clientId).map(normalizePathKey));
+		if (removedKeys.has(currentKey)) {
+			return projects;
+		}
+		if (projects.some((p) => normalizePathKey(p.path) === currentKey)) {
 			return projects
-				.map((p) => (p.path === this.cwd && p.lastUsed < now ? { ...p, lastUsed: now } : p))
+				.map((p) => (normalizePathKey(p.path) === currentKey && p.lastUsed < now ? { ...p, lastUsed: now } : p))
 				.sort((a, b) => b.lastUsed - a.lastUsed);
 		}
 		return [{ path: this.cwd, lastUsed: now }, ...projects].slice(0, 20);

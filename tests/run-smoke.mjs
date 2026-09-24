@@ -11,6 +11,14 @@
  *   - 真模型 live：goal-review-loop、live-test（需已运行 server）、update-test。
  *
  * 用法：node tests/run-smoke.mjs [name1 name2 …]   # 无参 = 全量
+ *       node tests/run-smoke.mjs --core          # PR 快检子集（CORE，见下）
+ *       node tests/run-smoke.mjs --jobs=4         # 并行（默认 4 worker；--jobs=1 串行）
+ *       node tests/run-smoke.mjs --retry-once     # 首轮失败重跑一次（标 FLAKY）
+ *
+ * 分层策略（CI 提速：PR 只跑 CORE，push main + nightly 跑全量）：
+ * - CORE = 协议/快照/安全/审批/插件接线/并发代表，~20 个，2~4 分钟；
+ * - 全量 = CORE + 慢/重插件（ssh 现场 npm 装、vscode 大插件等）+ 各家回归，~9 分钟；
+ * - 新测试默认进 ALL；只有「零 token、自包含、跑得快（<20s）、稳」才进 CORE。
  */
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -121,6 +129,33 @@ const ALL = [
 	"workspace-roots-test",
 ];
 
+// PR 快检子集：信号密度最高的协议/安全/插件接线代表。push main + nightly 跑全量。
+// 选入标准：零 token、自包含、单测 <20s、历史稳定；慢机（ssh 现场装包）与
+// 超重插件（vscode 全链路 ~40s）放全量，由 main/nightly 覆盖。
+const CORE = [
+	"snapshot-delta-test", // 快照增量 rev 链（v0.95.0 回归过）
+	"token-auth-test", // 鉴权
+	"quiesce-test", // 排空门禁 + 4403（v0.95.0 回归过）
+	"settings-test",
+	"slash-commands-test",
+	"approval-policy-test",
+	"approval-rules-test",
+	"plugin-test", // 插件基线（激活/命令/推送）
+	"plugin-command-test",
+	"plugin-grants-test", // 目录授权接线（v0.95.0 回归过）
+	"plugin-api-catalog-test", // 注册面目录（v0.95.0 回归过）
+	"plugin-settings-test",
+	"plugin-cwd-test", // cwd 安全
+	"running-list-test", // 并发列表口径
+	"takeover-test", // 过户代表（6 合 1 前先留这一个）
+	"switch-session-background-test",
+	"cross-client-session-test",
+	"preview-test", // 附件/预览
+	"ephemeral-chat-test", // v0.95 新特性
+	"shutdown-test",
+	"restart-service-test",
+];
+
 // 不在默认清单里的脚本：
 //   - 需外部已运行 server（attach 型，默认 8787）：ws-session-test /
 //     file-upload-test / image-paste-test / commands-test(8791) /
@@ -133,34 +168,110 @@ const ALL = [
 //   - title-jsonl-test：已修复（原 lsof/URL.pathname 的 Windows 兼容问题），本地可跑；
 //   - 浏览器 E2E 见文件头注释（headless Chrome 路径写死本机）。
 
-const targets = process.argv.length > 2 ? process.argv.slice(2) : ALL;
+const rawArgs = process.argv.slice(2);
+// --core = PR 快检子集；--retry-once = 首轮失败的用例最后重跑一次（慢机偶发红自愈，
+// 重跑过的标 FLAKY，重跑还挂的才算真失败）；其余位置参数 = 指定测试名。
+const wantCore = rawArgs.includes("--core");
+const wantRetry = rawArgs.includes("--retry-once");
+const named = rawArgs.filter((a) => !a.startsWith("--"));
+const targets = named.length > 0 ? named : wantCore ? [...CORE] : ALL;
+if (wantCore && named.length === 0)
+	console.log(`ℹ 快检模式：${CORE.length} 个核心测试（全量 ${ALL.length} 个走 main push / nightly）`);
+// CORE 与 ALL 同步守卫：改名/删测试忘了同步 CORE 时响亮失败，而不是静默少跑。
+for (const c of CORE) {
+	if (!ALL.includes(c)) {
+		console.error(`✗ CORE 里有 ALL 不认识的测试：${c}（改名/删除后请同步 CORE）`);
+		process.exit(1);
+	}
+}
 const results = [];
 
+async function runOne(name, port) {
+	// 并行时每个 worker 拿固定分配端口（argv[2] 契约：读 argv[2] 的测试用它，
+	// 不读的走各自默认固定端口——全仓已扫过，ALL 内默认端口两两不撞）。
+	const args = port === undefined ? [] : [String(port)];
+	return await new Promise((resolveRun) => {
+		const child = spawn(process.execPath, [join(here, `${name}.mjs`), ...args], {
+			// 测试脚本内相对路径（如 dist/server/index.js）以仓库根为基准
+			cwd: dirname(here),
+			env: process.env,
+		});
+		// 并行时输出各自缓存，结束后再整段打印，否则多进程日志搅成一团。
+		let out = "";
+		child.stdout.on("data", (d) => (out += d));
+		child.stderr.on("data", (d) => (out += d));
+		child.on("exit", (code) => resolveRun({ ok: code === 0, out }));
+		child.on("error", (err) => resolveRun({ ok: false, out: out + String(err) }));
+	});
+}
+
+// 并行 worker 槽位端口：9100 + 槽位*20（+1..+9 留给 mock/第二 server；
+// 随机端口测试用 20000+/30000+ 段，固定端口测试用 87xx~89xx，均不撞）。
+const slotPort = (slot) => 9100 + slot * 20;
+
+const jobsArg = rawArgs.find((a) => a.startsWith("--jobs="));
+const jobs = Math.max(1, Number((jobsArg ?? "").split("=")[1] ?? 4) || 4);
+if (jobs > 1) console.log(`ℹ 并行模式：${jobs} worker（串行用 --jobs=1；各 worker 端口见 ▶ 行）`);
+
+// win32 跳过名单先落定（不占 worker）。
+const queue = [];
 for (const name of targets) {
-	if (process.platform === "win32" && WIN32_KNOWN_ENV_FAIL.has(name) && process.argv.length <= 2) {
+	if (process.platform === "win32" && WIN32_KNOWN_ENV_FAIL.has(name) && named.length === 0) {
 		results.push({ name, ok: true, skipped: true });
 		console.log(`\n⏭ ${name} — Windows 环境已知噪音（node-pty/libuv），跳过；ubuntu CI 正常跑`);
 		continue;
 	}
-	const file = join(here, `${name}.mjs`);
-	process.stdout.write(`\n▶ ${name}\n`);
-	const ok = await new Promise((resolveRun) => {
-		const child = spawn(process.execPath, [file], {
-			// 测试脚本内相对路径（如 dist/server/index.js）以仓库根为基准
-			cwd: dirname(here),
-			stdio: "inherit",
-			env: process.env,
-		});
-		child.on("exit", (code) => resolveRun(code === 0));
-		child.on("error", () => resolveRun(false));
-	});
-	results.push({ name, ok });
+	queue.push(name);
+}
+
+if (jobs <= 1) {
+	for (const name of queue) {
+		process.stdout.write(`\n▶ ${name}\n`);
+		const r = await runOne(name);
+		process.stdout.write(r.out);
+		results.push({ name, ok: r.ok });
+	}
+} else {
+	// 定长 worker 池：每个 worker 跑完一个立刻领下一个（慢测试不堵快测试）。
+	let next = 0;
+	const worker = async (slot) => {
+		for (;;) {
+			const i = next++;
+			if (i >= queue.length) return;
+			const name = queue[i];
+			const port = slotPort(slot);
+			process.stdout.write(`\n▶ ${name}（worker${slot} :${port}）\n`);
+			const r = await runOne(name, port);
+			process.stdout.write(`\n----- ${name} 输出开始 -----\n${r.out}----- ${name} 输出结束 -----\n`);
+			results.push({ name, ok: r.ok });
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(jobs, queue.length) }, (_, s) => worker(s)));
+	// 并行完成顺序不定，汇总前按 targets 原序排回来。
+	results.sort((a, b) => targets.indexOf(a.name) - targets.indexOf(b.name));
+}
+
+// 失败重跑一次：只救「偶发红」（慢机时序），真回归重跑也挂，不掩盖。
+if (wantRetry) {
+	const failed = results.filter((r) => !r.ok && !r.skipped);
+	if (failed.length > 0) {
+		console.log(`\n↻ 首轮 ${failed.length} 个失败，重跑一次确认是否为偶发：${failed.map((r) => r.name).join(", ")}`);
+		for (const r of failed) {
+			// 重跑串行逐个来（并行已证过有问题，再并行没有意义），端口用槽位 0。
+			const r2 = await runOne(r.name, slotPort(0));
+			process.stdout.write(r2.out);
+			r.flaky = r2.ok; // 重跑过 = 偶发（标 FLAKY）；还挂 = 真失败
+			r.ok = r2.ok;
+		}
+	}
 }
 
 console.log("\n===== 冒烟汇总 =====");
 let failures = 0;
 for (const r of results) {
-	console.log(`${r.skipped ? "⏭" : r.ok ? "✓" : "✗"} ${r.name}${r.skipped ? "（跳过）" : ""}`);
+	console.log(
+		`${r.skipped ? "⏭" : r.ok ? (r.flaky ? "✓~" : "✓") : "✗"} ${r.name}${r.skipped ? "（跳过）" : r.flaky ? "（FLAKY：首轮挂、重跑过，慢机时序嫌疑，值得看一眼）" : ""}`,
+	);
 	if (!r.ok) failures++;
 }
 console.log(`\n${results.length - failures}/${results.length} 通过`);

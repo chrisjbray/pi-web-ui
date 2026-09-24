@@ -12,6 +12,7 @@
  * 结构化子集 GoalConversation 传入（真实 Conversation 满足该结构），会话创建/对话框
  * 取消/git diff 等宿主能力走回调，便于独立测试。UI 文案直接中文（服务端 notice 约定）。
  */
+import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 import {
@@ -472,6 +473,7 @@ export class GoalService {
 		);
 
 		let refinedGoal = "";
+		let goalEphemeralDir: string | undefined;
 		try {
 			const wmSpec = opts?.wizardModel ? this.resolveReviewModel(opts.wizardModel) : null; // reuse the honest "provider/id" parser
 			const services = await createAgentSessionServices({
@@ -654,9 +656,16 @@ export class GoalService {
 				},
 			});
 
+			const sm = SessionManager.inMemory(this.host.cwd());
+			goalEphemeralDir = join(services.agentDir, "goal-sessions", `wizard-${Date.now()}`);
+			try {
+				mkdirSync(goalEphemeralDir, { recursive: true });
+				(sm as unknown as { sessionDir: string }).sessionDir = goalEphemeralDir;
+			} catch {}
+
 			const srv = await createAgentSessionFromServices({
 				services,
-				sessionManager: SessionManager.inMemory(this.host.cwd()),
+				sessionManager: sm,
 				customTools: [goalAsk],
 				...(model ? { model } : {}),
 			});
@@ -708,6 +717,11 @@ export class GoalService {
 			wgoal.wizard.status = "";
 			wgoal.wizard.statusEn = "";
 			this.wizardSession = null;
+			if (goalEphemeralDir) {
+				try {
+					rmSync(goalEphemeralDir, { recursive: true, force: true });
+				} catch {}
+			}
 			this.emitGoalStatus();
 		}
 
@@ -894,10 +908,13 @@ export class GoalService {
 		// Goal review hook: after the run finished normally, if a goal is
 		// active (and it belonged to the ACTIVE conversation) and we're not
 		// already mid-review, spawn the isolated reviewer.
+		// Only run when verdict is pending — failed/blocked terminal goals must not
+		// re-trigger reviews on subsequent unrelated conversational turns.
 		if (
 			g.goal &&
 			g.conversationId === conv.id &&
 			!g.reviewing &&
+			g.verdict === "pending" &&
 			!conv.wizardRunning &&
 			!this.host.isDisposed() &&
 			this.goalEnabled()
@@ -1297,8 +1314,7 @@ export class GoalService {
 			} catch {
 				// Best-effort.
 			}
-			g.conversationId = null;
-			g.goal = null; // loop blocked — clear the active goal
+			g.reviewing = false;
 			this.emitGoalStatus();
 			this.host.flushSnapshot();
 			return;
@@ -1310,6 +1326,8 @@ export class GoalService {
 		if (!isLastRound) {
 			g.status = `本轮不通过，正在把意见交给 agent 修改（${roundsZh}）…`;
 			g.statusEn = `Round failed, sending feedback to the agent (${roundsEn})…`;
+			// 注入修改意见后保持 verdict 为 pending，让 agent 下一次答完后继续下一轮审查
+			g.verdict = "pending";
 			this.host.emit({
 				type: "notice",
 				level: "warning",
@@ -1374,8 +1392,7 @@ export class GoalService {
 			text: "目标未通过审查（已达最大轮数）",
 			textEn: "Goal failed review (max rounds reached)",
 		});
-		g.conversationId = null;
-		g.goal = null; // loop exhausted — clear the active goal
+		g.reviewing = false; // 审查结束：保留 g.goal 与 g.conversationId，让用户看到未通过的目标，不丢弃目标文本
 		this.emitGoalStatus();
 		this.host.flushSnapshot();
 	}
