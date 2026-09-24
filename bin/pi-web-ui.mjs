@@ -55,9 +55,9 @@ import { fileURLToPath } from "node:url";
 const BIN_DIR = dirname(fileURLToPath(import.meta.url));
 /** <pkg>/dist/server/index.js — the actual server entry. */
 const SERVER_ENTRY = join(BIN_DIR, "..", "dist", "server", "index.js");
-/** 可选的「优先用全局/祖先那份 pi SDK」解析钩子（issue #260，`PI_WEB_SDK=global` 才生效）。
+/** 「机器上有更新的 pi 副本就跟随它」解析钩子（issue #260；#321 起默认启用）。
  *  必须早于任何 SDK 静态 import 加载 —— 所以每条启动路径都把它当 `--import` 传进去；
- *  默认不启用时它自己什么都不做（见 server/resolve-global-sdk.ts）。 */
+ *  PI_WEB_SDK=bundled 显式钉死自带副本（见 server/resolve-global-sdk.ts）。 */
 const SDK_HOOK = join(BIN_DIR, "..", "dist", "server", "resolve-global-sdk.js");
 /** dist 可能是旧构建（没有这个钩子文件）—— 只有文件在才注入：`--import <missing>` 会让
  *  CLI/服务直接起不来，那比少个开关严重得多。 */
@@ -519,8 +519,16 @@ function winIcoPath() {
 	return join(winServiceDir(), APP_ICO_NAME);
 }
 
-/** Full path to Windows PowerShell 5.1. */
+/** Full path to Windows PowerShell. Prefers pwsh.exe (PowerShell 7) when it is
+ * resolvable on PATH: some machines ship Windows PowerShell 5.1 as a broken
+ * stub whose launch fails silently, so probe for a working shell first and
+ * fall back to the built-in path. */
 function winPowershell() {
+	const which = spawnSync("where.exe", ["pwsh.exe"], { encoding: "utf8" });
+	if (which.status === 0) {
+		const first = (which.stdout ?? "").trim().split(/\r?\n/)[0];
+		if (first) return first;
+	}
 	return join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
@@ -535,12 +543,13 @@ function winWscript() {
  * Resolve the real node binary. fnm/volta/nvm shims (e.g. fnm_multishells)
  * point into temp dirs that vanish when the installing shell exits — the
  * baked-in launcher scripts must use the stable real path instead.
+ * Also applies resolveNode() so Bun-hosted pi never bakes in pi.exe.
  */
 function realNode() {
 	try {
-		return realpathSync(process.execPath);
+		return realpathSync(resolveNode());
 	} catch {
-		return process.execPath;
+		return resolveNode();
 	}
 }
 
@@ -682,7 +691,11 @@ function buildWinHiddenVbs(ps1Path) {
 function installWinShortcut(opts) {
 	const { name, port, cwd, dataDir, engine, host, agentDir } = serviceOptions(opts);
 	const env = serviceEnv(port, cwd, dataDir, engine, host, agentDir);
-	const url = `http://localhost:${port}`;
+	// The server binds 127.0.0.1 by default; PowerShell 7's Invoke-WebRequest
+	// resolves `localhost` to ::1 first and hangs until TimeoutSec when nothing
+	// listens on IPv6, making the health probe misfire ("server not running").
+	// Pin the probe (and the opened URL) to the IPv4 loopback the server uses.
+	const url = `http://127.0.0.1:${port}`;
 	const ps1Path = winShortcutPs1Path(name);
 	const ps1 = buildWinShortcutPs1(env, cwd, name, url, winLogPath(name), winPidFilePath(name));
 	if (opts.print) {

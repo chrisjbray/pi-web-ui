@@ -9658,6 +9658,20 @@ div.chead[role="button"]:focus-visible,
 	flex-direction: column;
 	gap: 8px;
 }
+.dialog-custom-row {
+	display: flex;
+	gap: 8px;
+	margin-top: 4px;
+}
+.dialog-custom-row .dialog-input {
+	flex: 1;
+	font-size: 13px;
+	padding: 7px 10px;
+}
+.dialog-custom-row .btn {
+	padding: 6px 14px;
+	font-size: 13px;
+}
 
 .dialog-option {
 	display: block;
@@ -13986,6 +14000,15 @@ button.source-default-toggle {
 .dd-all-item.warn .dd-all-vers,
 .dd-all-item.err .dd-all-vers {
 	color: inherit;
+}
+
+/* issue #321：pi-core 行的「服务运行 vX」小标注 —— 行里的大版本号是全局 pi CLI
+ * 的，不是本服务实际加载的自带副本；两者有差距时摆在一起说清楚。 */
+.dd-split-run {
+	flex-shrink: 0;
+	font-family: var(--mono);
+	font-size: 10.5px;
+	opacity: 0.75;
 }
 
 /* Per-row "update" button (plugins + the pi core, not the web UI itself). */

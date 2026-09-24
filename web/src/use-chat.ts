@@ -229,6 +229,10 @@ export interface ChatState {
 	} | null;
 	/** All-source update check (webui + pi core + installed packages). */
 	updatesAll: UpdateAllItem[] | null;
+	/** issue #321：pi SDK 副本状态（update_status_all 随发）。`running` = 本进程实际
+	 *  加载的版本；`bundledInUse` = 加载的是随包自带那份（未跟随全局）；
+	 *  `newerInstalled` = 机器上更新的 pi 版本（全局 CLI / 被遮蔽副本），null = 没有。 */
+	updatesSdk: { running: string; bundledInUse: boolean; newerInstalled: string | null } | null;
 	/** Extension widgets (TUI overlays bridged to the web UI). */
 	widgets: { key: string; lines: string[] }[];
 	/** Extension footer statuses (setStatus bridge). */
@@ -516,7 +520,12 @@ type Action =
 				error?: string;
 			};
 	  }
-	| { type: "update_status_all"; items: UpdateAllItem[] }
+	| {
+			type: "update_status_all";
+			items: UpdateAllItem[];
+			/** issue #321：pi SDK 副本状态快照。 */
+			piSdk?: { running: string; bundledInUse: boolean; newerInstalled: string | null };
+	  }
 	| { type: "updates_check_started" }
 	| { type: "widgets"; widgets: { key: string; lines: string[] }[] }
 	| { type: "statuses"; statuses: { key: string; text: string | undefined }[] }
@@ -914,7 +923,7 @@ function reducer(state: ChatState, action: Action): ChatState {
 		case "update_status":
 			return { ...state, update: action.status };
 		case "update_status_all":
-			return { ...state, updatesAll: action.items };
+			return { ...state, updatesAll: action.items, updatesSdk: action.piSdk ?? null };
 		case "updates_check_started":
 			// Forced re-check: clear stale rows so the "checking" state renders.
 			return { ...state, updatesAll: null };
@@ -1094,6 +1103,24 @@ function writeLastCwd(cwd: string): void {
 	}
 }
 
+/** 当用户移出最近项目时，若与上次记忆目录匹配，则同步清除该记忆，避免重启后自动切回并复活墓碑。 */
+export function clearLastCwdIfMatches(path: string): void {
+	try {
+		const current = localStorage.getItem(LAST_CWD_KEY);
+		if (!current) return;
+		const norm = (s: string) =>
+			s
+				.trim()
+				.replace(/[\\/]+$/, "")
+				.toLowerCase();
+		if (current === path || norm(current) === norm(path)) {
+			localStorage.removeItem(LAST_CWD_KEY);
+		}
+	} catch {
+		/* ignore */
+	}
+}
+
 /** Resolve the WebSocket URL: same host when served by the backend, or the Vite proxy in dev. */
 function wsUrl(): string {
 	const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1131,6 +1158,7 @@ export function useChat() {
 		pathCompletions: [],
 		update: null,
 		updatesAll: null,
+		updatesSdk: null,
 		widgets: [],
 		statuses: [],
 		dialog: null,
@@ -1625,7 +1653,7 @@ export function useChat() {
 					dispatch({ type: "update_status", status: msg });
 					break;
 				case "update_status_all":
-					dispatch({ type: "update_status_all", items: msg.items });
+					dispatch({ type: "update_status_all", items: msg.items, piSdk: msg.piSdk });
 					break;
 				case "widgets":
 					dispatch({ type: "widgets", widgets: msg.widgets });
