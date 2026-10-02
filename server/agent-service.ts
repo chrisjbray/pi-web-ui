@@ -1728,7 +1728,7 @@ function pluginToolToDefinition(tool: PluginAgentTool): ToolDefinition {
  * carry no .text — else all collide as txt:45h:0); toolCall-first blocks key
  * by call id (unique per call, stable across snapshots).
  */
-<<<<<export function contentFingerprint(m: AgentMessage): string {
+export function contentFingerprint(m: AgentMessage): string {
 	const content = (m as unknown as { content?: unknown }).content;
 	if (!Array.isArray(content) || content.length === 0) return "empty";
 	const first = content[0] as {
