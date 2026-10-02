@@ -14,8 +14,8 @@
  * 设计上服务端不做网络探测（不拉 manifest）：名称/简介/图标由条目本身携带
  * （作者填），id 由来源推导或作者显式指定 —— 保持离线可用、可单测。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { writeJsonAtomicSync } from "./atomic-file.js";
 import type { UiPluginCatalogEntry } from "./protocol.js";
 import { normalizeIconSvg } from "./icon-svg.js";
 import { pick, type ServerLang } from "./i18n.js";
@@ -60,10 +60,7 @@ function readJsonSafe<T>(path: string, fallback: T): T {
 }
 
 function atomicWrite(path: string, data: unknown): void {
-	mkdirSync(dirname(path), { recursive: true });
-	const tmp = `${path}.tmp-${process.pid}`;
-	writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-	renameSync(tmp, path);
+	writeJsonAtomicSync(path, data);
 }
 
 /** 把任意对象规范化为合法条目；非法则返回 null。 */
@@ -73,6 +70,7 @@ function toEntry(raw: Record<string, unknown>, builtin: boolean): UiPluginCatalo
 	const id = deriveCatalogId(typeof raw.id === "string" ? raw.id.trim() : undefined, source);
 	if (!ID_RE.test(id)) return null;
 	const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : id;
+	const nameEn = typeof raw.nameEn === "string" && raw.nameEn.trim() ? raw.nameEn.trim() : undefined;
 	const description =
 		typeof raw.description === "string" && raw.description.trim() ? raw.description.trim() : undefined;
 	const descriptionEn =
@@ -85,6 +83,7 @@ function toEntry(raw: Record<string, unknown>, builtin: boolean): UiPluginCatalo
 		name,
 		source,
 		builtin,
+		...(nameEn ? { nameEn } : {}),
 		...(description ? { description } : {}),
 		...(descriptionEn ? { descriptionEn } : {}),
 		...(icon ? { icon } : {}),
@@ -93,7 +92,11 @@ function toEntry(raw: Record<string, unknown>, builtin: boolean): UiPluginCatalo
 	};
 }
 
-/** 读合并后的目录：builtin 在前，custom 在后（同 id 时 custom 覆盖 builtin）。 */
+/** 读合并后的目录：builtin 在前，custom 在后（同 id 时 custom 覆盖 builtin）。
+ *  custom 覆盖 builtin 时强制打 `overridesBuiltin: true` 标记（builtin 同时为
+ *  false）：显示字段（name/icon/description）来自用户可写来源，可能仿冒官方条目，
+ *  前端据此把它标识为「自定义覆盖」。source 始终保留真实（custom）安装来源，
+ *  不允许伪装成官方来源。 */
 export function readCatalog(builtinPath: string, customPath: string): UiPluginCatalogEntry[] {
 	const out: UiPluginCatalogEntry[] = [];
 	const seen = new Set<string>();
@@ -118,8 +121,12 @@ export function readCatalog(builtinPath: string, customPath: string): UiPluginCa
 		const e = it && typeof it === "object" ? toEntry(it as Record<string, unknown>, false) : null;
 		if (!e) continue;
 		const idx = out.findIndex((x) => x.id === e.id);
-		if (idx >= 0) out[idx] = e;
-		else out.push(e);
+		if (idx >= 0) {
+			// 覆盖了同名 builtin 条目：强制带标识（不信任 custom 文件里的任何自标字段）。
+			out[idx] = { ...e, builtin: false, overridesBuiltin: true };
+		} else {
+			out.push(e);
+		}
 		seen.add(e.id);
 	}
 	return out;
@@ -263,6 +270,7 @@ export function writeCustomCatalog(customPath: string, incoming: UiPluginCatalog
 		id: e.id,
 		source: e.source,
 		name: e.name,
+		...(e.nameEn ? { nameEn: e.nameEn } : {}),
 		...(e.description ? { description: e.description } : {}),
 		...(e.descriptionEn ? { descriptionEn: e.descriptionEn } : {}),
 		...(e.icon ? { icon: e.icon } : {}),

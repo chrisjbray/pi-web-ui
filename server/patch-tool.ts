@@ -12,11 +12,10 @@
 import { resolve } from "node:path";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { pick, type ServerLang } from "./i18n.js";
 import {
 	applyHashlinePatch,
-	computeFileHash,
 	formatHashlineHeader,
-	formatNumberedLines,
 	globalSnapshotStore,
 	type PatchApplyReport,
 } from "./hashline-engine.js";
@@ -27,29 +26,27 @@ export const PATCH_TOOL_NAME = "patch";
 export interface PatchToolOptions {
 	cwd: string;
 	ownerId?: string;
+	lang?: () => ServerLang;
 }
 
 export function makePatchTool(options: PatchToolOptions) {
 	const cwd = options.cwd;
+	const getLang = options.lang ?? (() => "en");
 
 	return defineTool({
 		name: PATCH_TOOL_NAME,
+		promptSnippet:
+			"apply content-hashed, line-anchored patches to workspace files (prevents stale edits, line drift, and indentation hallucination)",
 		label: "Apply Hashline patch",
-		description: `Apply high-reliability, content-hashed, line-anchored patches to files in the workspace.
-Designed to prevent stale edits, line-drift, and indentation hallucination.
-Each file section starts with \`[path#TAG]\` (or \`[path]\` if hash is not yet known).
-Supports:
-- \`PUT N.=M:\` replace original inclusive lines N to M with following \`+TEXT\` lines.
-- \`PUT N*:\` replace entire syntactic block starting at line N (closing brace/indentation resolved automatically).
-- \`PUT <N:\` insert lines before line N (\`PUT <1:\` = head of file).
-- \`PUT >N:\` insert lines after line N (\`PUT >$:\` = end of file).
-- \`CUT N.=M [@name]\` / \`CUT N* [@name]\` delete lines and save to register.
-- \`PUT <N @name\` / \`PUT >N @name\` paste register.
-- \`REM\` delete file.
-- \`MV dest/path\` move/rename file.
-- Body rows under \`:\` headers MUST start with \`+\` (\`+TEXT\`, \`+\` for blank line).
-If file content diverged, the engine attempts automatic 3-way merge recovery.
-After successful patch, the tool returns the next anchor tag and live LSP diagnostics for subsequent edits.`,
+		description: `Apply content-hashed, line-anchored patches to workspace files — prevents stale edits, line drift, and indentation hallucination.
+Each file section starts with \`[path#TAG]\` (or \`[path]\` if the hash is unknown yet). Operations:
+- \`PUT N.=M:\` replace lines N..M (inclusive) with the following \`+TEXT\` lines.
+- \`PUT N*:\` replace the whole syntactic block starting at line N (closing brace/indent auto-resolved).
+- \`PUT <N:\` insert before line N (\`<1\` = head of file); \`PUT >N:\` insert after (\`>$\` = end).
+- \`CUT N.=M [@name]\` / \`CUT N* [@name]\` delete lines and save to register; \`PUT <N @name\` / \`PUT >N @name\` paste it.
+- \`REM\` delete file; \`MV dest/path\` move/rename file.
+- Body rows under \`:\` headers MUST start with \`+\` (\`+\` alone = blank line).
+On divergence the engine attempts a 3-way merge. After success the tool returns the next anchor tag and live LSP diagnostics.`,
 		parameters: Type.Object({
 			patch: Type.String({
 				description:
@@ -57,11 +54,14 @@ After successful patch, the tool returns the next anchor tag and live LSP diagno
 			}),
 			timeout: Type.Optional(
 				Type.Number({
-					description: "Optional execution timeout in seconds.",
+					minimum: 1,
+					maximum: 300,
+					description: "Optional execution timeout in seconds (1-300).",
 				}),
 			),
 		}),
 		async execute(_callId, params: { patch: string; timeout?: number }, _signal, _onUpdate, _ctx) {
+			const L = getLang();
 			const patchText = typeof params?.patch === "string" ? params.patch : "";
 			if (!patchText.trim()) {
 				const emptyReport: PatchApplyReport = {
@@ -71,7 +71,12 @@ After successful patch, the tool returns the next anchor tag and live LSP diagno
 					error: "Empty patch",
 				};
 				return {
-					content: [{ type: "text", text: "Error: No patch content provided." }],
+					content: [
+						{
+							type: "text",
+							text: pick(L, "错误：未提供任何 patch 补丁内容。", "Error: No patch content provided."),
+						},
+					],
 					details: emptyReport,
 				};
 			}
@@ -83,7 +88,12 @@ After successful patch, the tool returns the next anchor tag and live LSP diagno
 
 			if (!report.ok) {
 				return {
-					content: [{ type: "text", text: `Patch Failed:\n${report.summary}` }],
+					content: [
+						{
+							type: "text",
+							text: pick(L, `补丁应用失败：\n${report.summary}`, `Patch Failed:\n${report.summary}`),
+						},
+					],
 					details: report,
 				};
 			}
@@ -93,12 +103,24 @@ After successful patch, the tool returns the next anchor tag and live LSP diagno
 			for (const r of report.results) {
 				if (r.op !== "deleted" && r.newHash) {
 					const targetPath = r.newPath || r.filePath;
-					textOutput.push(`\nNext edit anchor for ${targetPath}: \`${formatHashlineHeader(targetPath, r.newHash)}\``);
+					textOutput.push(
+						pick(
+							L,
+							`\n${targetPath} 的下一处编辑锚点：\`${formatHashlineHeader(targetPath, r.newHash)}\``,
+							`\nNext edit anchor for ${targetPath}: \`${formatHashlineHeader(targetPath, r.newHash)}\``,
+						),
+					);
 					try {
 						const fullPath = resolve(cwd, targetPath);
 						const diags = await getLiveLspDiagnostics(fullPath, cwd);
 						if (diags) {
-							textOutput.push(`\nLive LSP diagnostics for ${targetPath}:\n${diags}`);
+							textOutput.push(
+								pick(
+									L,
+									`\n${targetPath} 的实时 LSP 诊断：\n${diags}`,
+									`\nLive LSP diagnostics for ${targetPath}:\n${diags}`,
+								),
+							);
 						}
 					} catch {}
 				}

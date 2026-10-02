@@ -6,11 +6,14 @@
  *
  * 从 agent-service.ts 抽出，行为保持不变。
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { writeJsonAtomicSync } from "./atomic-file.js";
 import { normalizeSoftCapByModel, normalizeSoftCapTokens } from "./soft-cap.js";
 import { deriveLegacy, legacyToDisabled, normalizeDisabledAgentTools } from "./tool-manager.js";
-import type { UiAlign, UiLayoutPrefs } from "./protocol.js";
+import { UI_SLOTS } from "./plugins.js";
+import type { UiAlign, UiLayoutPrefs, UiSlotId } from "./protocol.js";
 
 /** System-prompt mode: append the custom text to the built prompt, or replace
  *  the whole system prompt with it. (遗留字段：主会话已迁移到 compose 模板，
@@ -165,6 +168,30 @@ export function normalizeUiLayout(v: unknown): UiLayoutPrefs {
 	}
 	// 顶栏按钮文字总开关：只收布尔值（缺席 = 显示，兼容老存档）。
 	const topbarText = typeof o.topbarText === "boolean" ? (o.topbarText as boolean) : undefined;
+	// 用户自定义槽位/位置：只收合法 slot 字符串
+	let slots: Record<string, UiSlotId> | undefined;
+	if (o.slots && typeof o.slots === "object" && !Array.isArray(o.slots)) {
+		slots = {};
+		for (const [k, val] of Object.entries(o.slots as Record<string, unknown>).slice(0, 200)) {
+			if (k.length > 0 && k.length <= 96 && typeof val === "string" && UI_SLOTS.has(val)) {
+				slots[k] = val as UiSlotId;
+			}
+		}
+		if (Object.keys(slots).length === 0) slots = undefined;
+	}
+	// 品牌槽位同样折进 host:brand
+	if (slots && ("host:brand-logo" in slots || "host:brand-name" in slots)) {
+		const out: Record<string, UiSlotId> = {};
+		for (const [k, val] of Object.entries(slots)) {
+			if (k === "host:brand-logo" || k === "host:brand-name") continue;
+			out[k] = val;
+		}
+		if (out[BRAND_NEW] === undefined) {
+			const picked = slots["host:brand-logo"] ?? slots["host:brand-name"];
+			if (picked !== undefined) out[BRAND_NEW] = picked;
+		}
+		slots = Object.keys(out).length ? out : undefined;
+	}
 	return {
 		...(hidden ? { hidden } : {}),
 		...(shown ? { shown } : {}),
@@ -173,6 +200,7 @@ export function normalizeUiLayout(v: unknown): UiLayoutPrefs {
 		...(align ? { align } : {}),
 		...(labels ? { labels } : {}),
 		...(topbarText !== undefined ? { topbarText } : {}),
+		...(slots ? { slots } : {}),
 	};
 }
 
@@ -242,6 +270,10 @@ export interface ClientSettings {
 	scmCommitMsgPromptMode: PromptMode;
 	/** SCM「AI 生成提交信息」自定义提示词（空 = 内置默认）。 */
 	scmCommitMsgPrompt: string;
+	/** 计划模式提示词模式：追加/替换内置默认（语义同 promptMode）。 */
+	planModePromptMode: PromptMode;
+	/** 计划模式自定义提示词（空 = 内置默认）。 */
+	planModePrompt: string;
 	/** Extra instructions appended to the built-in goal-review prompt. */
 	reviewPrompt: string;
 	/** Skills disabled only for the isolated goal-reviewer. */
@@ -303,6 +335,8 @@ export interface SettingsPreset extends Omit<
 	| "visionBridgePrompt"
 	| "scmCommitMsgPromptMode"
 	| "scmCommitMsgPrompt"
+	| "planModePromptMode"
+	| "planModePrompt"
 	| "questionnaireEnabled"
 	| "goalModeEnabled"
 	| "parallelReminderEnabled"
@@ -405,7 +439,7 @@ export function normalizeWorkspaceRoots(v: unknown): string[] {
 		const p = raw.trim();
 		if (!p || !isAbsolute(p)) continue;
 		const abs = resolve(p);
-		const key = process.platform === "win32" ? abs.toLowerCase() : abs;
+		const key = normalizePathKey(abs);
 		if (seen.has(key)) continue;
 		seen.add(key);
 		out.push(abs);
@@ -431,6 +465,8 @@ export interface ClientState {
 		reviewModel: string | null;
 		maxRounds: number;
 		locked: boolean;
+		/** 目标模式 2.0：执行者模型（"provider/id"；null/缺省 = 跟随）。 */
+		execModel?: string | null;
 	};
 	/** Settings-panel state (system prompt mode/text + disabled skills/
 	 *  extensions) so toggles survive a reload. */
@@ -472,11 +508,17 @@ export interface ClientState {
 	defaultProviderKeys?: Record<string, string>;
 	/** 内置标记工具开关（全局 + 按 marker 禁用）。 */
 	markers?: MarkerSettings;
+	/** 用户钉住（常驻运行列表）的会话文件路径列表，按项目 (cwd) 索引持久化在 __settings__ 下。 */
+	pinnedSessions?: Record<string, string[]>;
 	/** Browser UI locale code as reported by hello/set_locale (e.g. "zh",
 	 *  "en", "ja"). Server resolves it via resolveServerLang (non-zh →
 	 *  English default, issue #91) for tool return values / AI prompts.
 	 *  Missing = never reported → English. */
 	locale?: string;
+	/** 客户端最近活跃时间（epoch ms）。服务端在 per-client 写路径上打点（内存态，
+	 *  随任意后续 save 落盘）；旧存档缺省时按 max(projects[].lastUsed, interrupted[].at)
+	 *  推断。仅用于死 clientId 清理（issue #441），不参与任何业务语义。 */
+	lastActive?: number;
 }
 
 /** 跨平台（尤其是 Windows）路径归一化键：统一转绝对路径，并在 Windows 下转小写以消除大小写与正反斜杠差异。 */
@@ -489,6 +531,20 @@ export function normalizePathKey(p: string): string {
 	}
 }
 
+/** 死 clientId 状态的保留期（issue #441）：距最近活跃超过该时长的 per-client 键在
+ *  加载/定期扫描时淘汰。取 30 天——clientId 存 sessionStorage，每个标签页每次会话
+ *  都生成新 id，远超 30 天才回来的标签页实际等同全新会话，误伤概率可忽略。 */
+export const CLIENT_STATE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** per-client 键数上限（issue #441）：活跃客户端数超过该值时按最近活跃保留前 50、
+ *  淘汰最旧的。兜底上限：完全无时间戳可推断的存量键不按年龄淘汰，靠它保证
+ *  client-state.json 不随时间无界膨胀。 */
+export const MAX_TRACKED_CLIENTS = 50;
+
+/** 死键清理扫描的最小间隔：load() 是所有读写的高频入口，扫描按 1 小时节流，
+ *  首次加载必扫。 */
+export const CLIENT_STATE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
 /**
  * Persists which workspace each browser client last used + which workspaces it
  * has opened, so a server restart / page reload restores the same project and
@@ -497,6 +553,9 @@ export function normalizePathKey(p: string): string {
  */
 export class ClientStateStore {
 	private cache: Record<string, ClientState> | null = null;
+
+	/** 上次死键清理扫描的时间戳（epoch ms；0 = 尚未扫过，首次 load 必扫）。 */
+	private lastSweepAt = 0;
 
 	constructor(private filePath: string) {}
 
@@ -515,7 +574,10 @@ export class ClientStateStore {
 	}
 
 	private load(): Record<string, ClientState> {
-		if (this.cache) return this.cache;
+		if (this.cache) {
+			this.sweepStaleClientsIfNeeded();
+			return this.cache;
+		}
 		try {
 			const parsed = JSON.parse(readFileSync(this.filePath, "utf8")) as Record<string, ClientState>;
 			this.cache = parsed && typeof parsed === "object" ? parsed : {};
@@ -539,21 +601,76 @@ export class ClientStateStore {
 				}
 			}
 		}
-		if (migrated) {
+		// 死键清理（issue #441）：在墓碑迁移之后做——各 client 的墓碑已先并入全局键，
+		// 淘汰死 client 不会丢墓碑；合并一次 save 落盘（迁移和淘汰只发生一次时也只写一遍）。
+		this.lastSweepAt = Date.now();
+		const evicted = this.sweepDeadClients();
+		if (migrated || evicted > 0) {
 			this.save();
 		}
 		return this.cache;
 	}
 
+	/** 死键清理的节流入口：首次 load 必扫，之后按 CLIENT_STATE_SWEEP_INTERVAL_MS 节流。 */
+	private sweepStaleClientsIfNeeded(): void {
+		if (Date.now() - this.lastSweepAt < CLIENT_STATE_SWEEP_INTERVAL_MS) return;
+		this.lastSweepAt = Date.now();
+		if (this.sweepDeadClients() > 0) this.save();
+	}
+
+	/** 淘汰长期不活跃的 per-client 状态（issue #441）。
+	 *
+	 * 背景：clientId 存 sessionStorage——每个浏览器标签页每次会话都生成新 id，服务端
+	 * 却为每个见过的 id 永久建键（projects / workspaceRoots / projectProviderKeys /
+	 * projectModels…），client-state.json 随死键线性膨胀，save() 的同步
+	 * JSON.stringify + writeFileSync 成本也随之线性增长。
+	 *
+	 * 策略（保守，只动内存态，下次任意 save 自然落盘；绝不直接删文件）：
+	 * - 距最近活跃超过 CLIENT_STATE_RETENTION_MS（30 天）的 clientId 淘汰。活跃时间
+	 *   优先取显式 lastActive（写路径 touchClient 维护），旧存档回退按
+	 *   max(projects[].lastUsed, interrupted[].at) 推断；推断值写回内存态，随下次
+	 *   save 落盘。完全无时间戳可推断的（无法判定活跃度）不按年龄淘汰，仅受数量上限约束。
+	 * - 淘汰后仍超过 MAX_TRACKED_CLIENTS（50）时按最近活跃保留前 50，其余淘汰
+	 *   （无时间戳的排最旧优先淘汰）。
+	 * - 全局键 __settings__ 永不淘汰：设置面板 config / 预设 / 墓碑都在它下面，
+	 *   与任何 clientId 无关。
+	 *
+	 * 返回淘汰的键数（0 = 无变化，调用方无需为此 save）。 */
+	private sweepDeadClients(): number {
+		const all = this.cache;
+		if (!all) return 0;
+		const now = Date.now();
+		const dead = new Set<string>();
+		const activity = new Map<string, number>();
+		for (const [id, state] of Object.entries(all)) {
+			if (id === ClientStateStore.GLOBAL_SETTINGS_KEY) continue;
+			let at = state.lastActive ?? 0;
+			if (at <= 0) {
+				for (const p of state.projects ?? []) if (p.lastUsed > at) at = p.lastUsed;
+				for (const i of state.interrupted ?? []) if (i.at > at) at = i.at;
+				if (at > 0) state.lastActive = at;
+			}
+			activity.set(id, at);
+			if (at > 0 && now - at > CLIENT_STATE_RETENTION_MS) dead.add(id);
+		}
+		if (activity.size - dead.size > MAX_TRACKED_CLIENTS) {
+			const survivors = [...activity.entries()].filter(([id]) => !dead.has(id)).sort((a, b) => b[1] - a[1]);
+			for (const [id] of survivors.slice(MAX_TRACKED_CLIENTS)) dead.add(id);
+		}
+		for (const id of dead) delete all[id];
+		return dead.size;
+	}
+
+	/** 打点客户端活跃时间（内存态，随任意后续 save 落盘；不主动触发 save）。
+	 *  仅在 per-client 写路径上调用，键尚不存在时是 no-op（创建方随后 ??= 补上）。 */
+	private touchClient(all: Record<string, ClientState>, clientId: string): void {
+		const state = all[clientId];
+		if (state) state.lastActive = Date.now();
+	}
+
 	private save(): void {
 		try {
-			mkdirSync(dirname(this.filePath), { recursive: true });
-			// Atomic write (tmp + rename): a crash mid-write must never leave a
-			// half-written JSON — that would wipe ALL persisted state (recent
-			// projects / presets / settings / goal prefs) on next load.
-			const tmp = `${this.filePath}.${process.pid}.tmp`;
-			writeFileSync(tmp, JSON.stringify(this.cache, null, 2) + "\n");
-			renameSync(tmp, this.filePath);
+			writeJsonAtomicSync(this.filePath, this.cache);
 		} catch {
 			// best effort
 		}
@@ -567,6 +684,7 @@ export class ClientStateStore {
 	remember(clientId: string, cwd: string): void {
 		const all = this.load();
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		state.lastCwd = cwd;
 		const now = Date.now();
 		const targetKey = normalizePathKey(cwd);
@@ -574,6 +692,12 @@ export class ClientStateStore {
 			{ path: cwd, lastUsed: now },
 			...state.projects.filter((p) => normalizePathKey(p.path) !== targetKey),
 		].slice(0, 30);
+		// Also persist in global settings so new tabs and sessions inherit it immediately
+		const globalState = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
+		globalState.projects = [
+			{ path: cwd, lastUsed: now },
+			...(globalState.projects ?? []).filter((p) => normalizePathKey(p.path) !== targetKey),
+		].slice(0, 50);
 		// Opening the workspace again clears its removal tombstone across all clients and global settings.
 		for (const cState of Object.values(all)) {
 			if (cState.removedProjects?.length) {
@@ -593,6 +717,7 @@ export class ClientStateStore {
 		const all = this.load();
 		const targetKey = normalizePathKey(cwd);
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		state.projects = state.projects.filter((p) => normalizePathKey(p.path) !== targetKey);
 		if (state.lastCwd && normalizePathKey(state.lastCwd) === targetKey) delete state.lastCwd;
 		const removed = (state.removedProjects ?? []).filter((p) => normalizePathKey(p) !== targetKey);
@@ -632,6 +757,92 @@ export class ClientStateStore {
 		return result;
 	}
 
+	/**
+	 * Get recent projects merged across the client's own history, global settings,
+	 * and other clients in this store, filtering out tombstoned paths and non-existent paths.
+	 *
+	 * 性能（issue #441）：先按 lastUsed 排序截断到 30 条，再对候选做存活性探测——
+	 * 旧实现先对全部合并路径逐个同步 existsSync 再截断，Windows 上已断连的网络
+	 * 驱动器单次 existsSync 可阻塞数秒且直接跑在事件循环上，会把整个服务界面
+	 * （所有客户端 WS/HTTP）冻结。截断后探测把单次探测次数封顶 30；探测改异步
+	 * fsPromises.access（调用链本就是 async），不再阻塞事件循环。代价是前 30 名
+	 * 里有失效路径时不再回补更旧的项目（列表可能短于 30），属可接受的取舍。
+	 */
+	async getRecentProjects(clientId: string): Promise<{ path: string; lastUsed: number }[]> {
+		const all = this.load();
+		const removedKeys = new Set(this.getRemovedProjects(clientId).map(normalizePathKey));
+		const map = new Map<string, { path: string; lastUsed: number }>();
+
+		const merge = (list?: { path: string; lastUsed: number }[]) => {
+			if (!list) return;
+			for (const p of list) {
+				if (!p?.path) continue;
+				const key = normalizePathKey(p.path);
+				if (removedKeys.has(key)) continue;
+				const existing = map.get(key);
+				if (!existing || p.lastUsed > existing.lastUsed) {
+					map.set(key, { path: p.path, lastUsed: p.lastUsed });
+				}
+			}
+		};
+
+		// Merge client's own projects first, then global settings, then all other clients
+		merge(all[clientId]?.projects);
+		merge(all[ClientStateStore.GLOBAL_SETTINGS_KEY]?.projects);
+		for (const [id, cState] of Object.entries(all)) {
+			if (id !== clientId && id !== ClientStateStore.GLOBAL_SETTINGS_KEY) {
+				merge(cState.projects);
+			}
+		}
+
+		// 先截断后探测：探测次数 ≤ 30，且并发执行（Promise.allSettled 吸收单点失败）。
+		const candidates = [...map.values()].sort((a, b) => b.lastUsed - a.lastUsed).slice(0, 30);
+		const probes = await Promise.allSettled(candidates.map((p) => this.pathExists(p.path)));
+		return candidates.filter((_, i) => {
+			const probe = probes[i];
+			return probe?.status === "fulfilled" && probe.value;
+		});
+	}
+
+	/** 单条路径的存活性探测（issue #441）：异步 access，绝不阻塞事件循环。
+	 *  独立成 protected 方法便于单测用子类覆写做计数探针。 */
+	protected async pathExists(path: string): Promise<boolean> {
+		return fsPromises.access(path).then(
+			() => true,
+			() => false,
+		);
+	}
+
+	/** Record discovered projects into global settings cache (without clobbering tombstones). */
+	mergeDiscoveredProjects(projects: { path: string; lastUsed: number }[]): void {
+		if (!projects.length) return;
+		const all = this.load();
+		const globalState = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
+		const removedKeys = new Set((globalState.removedProjects ?? []).map(normalizePathKey));
+		const map = new Map<string, { path: string; lastUsed: number }>();
+		for (const p of globalState.projects ?? []) {
+			const key = normalizePathKey(p.path);
+			if (!removedKeys.has(key)) map.set(key, p);
+		}
+		let changed = false;
+		for (const p of projects) {
+			const key = normalizePathKey(p.path);
+			if (removedKeys.has(key)) continue;
+			const existing = map.get(key);
+			if (!existing) {
+				map.set(key, p);
+				changed = true;
+			} else if (p.lastUsed > existing.lastUsed) {
+				existing.lastUsed = p.lastUsed;
+				changed = true;
+			}
+		}
+		if (changed) {
+			globalState.projects = [...map.values()].sort((a, b) => b.lastUsed - a.lastUsed).slice(0, 50);
+			this.save();
+		}
+	}
+
 	/** Last-used goal/review prefs for a client, or undefined if never set. */
 	getGoalPrefs(clientId: string): ClientState["goalPrefs"] {
 		const s = this.load()[clientId];
@@ -640,6 +851,7 @@ export class ClientStateStore {
 			reviewModel: s.goalPrefs.reviewModel ?? null,
 			maxRounds: s.goalPrefs.maxRounds ?? 0,
 			locked: s.goalPrefs.locked ?? true,
+			execModel: s.goalPrefs.execModel ?? null,
 		};
 	}
 
@@ -652,6 +864,7 @@ export class ClientStateStore {
 	saveWorkspaceRoots(clientId: string, cwd: string, roots: string[]): void {
 		const all = this.load();
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		const next = normalizeWorkspaceRoots(roots);
 		if (next.length === 0) {
 			if (state.workspaceRoots) {
@@ -671,6 +884,7 @@ export class ClientStateStore {
 		if (!code) return;
 		const all = this.load();
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		if (state.locale === code) return;
 		state.locale = code;
 		this.save();
@@ -680,10 +894,12 @@ export class ClientStateStore {
 	saveGoalPrefs(clientId: string, prefs: ClientState["goalPrefs"]): void {
 		const all = this.load();
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		state.goalPrefs = {
 			reviewModel: prefs?.reviewModel ?? null,
 			maxRounds: prefs?.maxRounds ?? 0,
 			locked: prefs?.locked ?? true,
+			execModel: prefs?.execModel ?? null,
 		};
 		this.save();
 	}
@@ -694,6 +910,7 @@ export class ClientStateStore {
 		if (list.length === 0) return;
 		const all = this.load();
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		state.interrupted = list.slice(0, 8);
 		this.save();
 	}
@@ -705,6 +922,7 @@ export class ClientStateStore {
 		const state = all[clientId];
 		const list = state?.interrupted;
 		if (list?.length && state) {
+			this.touchClient(all, clientId);
 			delete state.interrupted;
 			this.save();
 		}
@@ -769,6 +987,8 @@ export class ClientStateStore {
 			visionBridgePrompt: stored?.visionBridgePrompt ?? "",
 			scmCommitMsgPromptMode: stored?.scmCommitMsgPromptMode === "replace" ? "replace" : "append",
 			scmCommitMsgPrompt: stored?.scmCommitMsgPrompt ?? "",
+			planModePromptMode: stored?.planModePromptMode === "replace" ? "replace" : "append",
+			planModePrompt: stored?.planModePrompt ?? "",
 			subagentDefaultModel: stored?.subagentDefaultModel ?? null,
 			retryMaxAttempts: normalizeRetryMaxAttempts(stored?.retryMaxAttempts),
 			softCapTokens: normalizeSoftCapTokens(stored?.softCapTokens),
@@ -824,8 +1044,15 @@ export class ClientStateStore {
 			toolImagesEnabled: settings.toolImagesEnabled ?? cur.toolImagesEnabled ?? true,
 			skillsFullText: normalizeSkillList(settings.skillsFullText ?? cur.skillsFullText),
 			visionBridgeEnabled: settings.visionBridgeEnabled ?? cur.visionBridgeEnabled ?? true,
-			visionBridgeModel: settings.visionBridgeModel ?? cur.visionBridgeModel ?? null,
-			subagentDefaultModel: settings.subagentDefaultModel ?? cur.subagentDefaultModel ?? null,
+			// 按键存在性合并：null 是合法值（清除语义），`null ?? cur` 会把旧值
+			// 复活到磁盘（设置面板清空后重启又回来）。settings-service 持久化
+			// 时传全量对象，键总在；其他调用方传 partial，键缺 = 保持旧值。
+			visionBridgeModel:
+				"visionBridgeModel" in settings ? (settings.visionBridgeModel ?? null) : (cur.visionBridgeModel ?? null),
+			subagentDefaultModel:
+				"subagentDefaultModel" in settings
+					? (settings.subagentDefaultModel ?? null)
+					: (cur.subagentDefaultModel ?? null),
 			retryMaxAttempts: normalizeRetryMaxAttempts(
 				settings.retryMaxAttempts ?? cur.retryMaxAttempts ?? DEFAULT_RETRY_MAX_ATTEMPTS,
 			),
@@ -835,6 +1062,8 @@ export class ClientStateStore {
 			visionBridgePrompt: settings.visionBridgePrompt ?? cur.visionBridgePrompt ?? "",
 			scmCommitMsgPromptMode: settings.scmCommitMsgPromptMode ?? cur.scmCommitMsgPromptMode ?? "append",
 			scmCommitMsgPrompt: settings.scmCommitMsgPrompt ?? cur.scmCommitMsgPrompt ?? "",
+			planModePromptMode: settings.planModePromptMode ?? cur.planModePromptMode ?? "append",
+			planModePrompt: settings.planModePrompt ?? cur.planModePrompt ?? "",
 			reviewPrompt: settings.reviewPrompt ?? cur.reviewPrompt ?? "",
 			reviewDisabledSkills: settings.reviewDisabledSkills ?? cur.reviewDisabledSkills ?? [],
 			disabledPlugins: settings.disabledPlugins ?? cur.disabledPlugins ?? [],
@@ -899,6 +1128,7 @@ export class ClientStateStore {
 		(gMap[cwd] ??= {})[provider] = keyName;
 
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		const map = (state.projectProviderKeys ??= {});
 		const inner = (map[cwd] ??= {});
 		inner[provider] = keyName;
@@ -1006,6 +1236,7 @@ export class ClientStateStore {
 		(globalState.projectModels ??= {})[cwd] = modelId;
 		// 同时写入本客户端
 		const state = (all[clientId] ??= { projects: [] });
+		this.touchClient(all, clientId);
 		(state.projectModels ??= {})[cwd] = modelId;
 		this.save();
 	}
@@ -1060,6 +1291,72 @@ export class ClientStateStore {
 		const state = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
 		(state.defaultProviderKeys ??= {})[provider] = keyName;
 		this.save();
+	}
+
+	/** 获取某项目已钉住的会话文件路径列表。 */
+	getPinnedSessions(cwd: string): string[] {
+		const normCwd = normalizePathKey(cwd);
+		const map = this.load()[ClientStateStore.GLOBAL_SETTINGS_KEY]?.pinnedSessions;
+		return map?.[normCwd] ?? [];
+	}
+
+	/** 钉住 / 取消钉住某个会话文件。 */
+	setSessionPinned(cwd: string, sessionPath: string, pinned: boolean): void {
+		const normCwd = normalizePathKey(cwd);
+		const normPath = normalizePathKey(sessionPath);
+		const absPath = resolve(sessionPath);
+		const all = this.load();
+		const state = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
+		const map = (state.pinnedSessions ??= {});
+		const list = map[normCwd] ?? [];
+		const filtered = list.filter((p) => normalizePathKey(p) !== normPath);
+		if (pinned) {
+			filtered.push(absPath);
+			map[normCwd] = filtered;
+		} else {
+			if (filtered.length > 0) {
+				map[normCwd] = filtered;
+			} else {
+				delete map[normCwd];
+			}
+		}
+		if (Object.keys(map).length === 0) {
+			delete state.pinnedSessions;
+		}
+		this.save();
+	}
+
+	/** 检查某个会话文件是否已被钉住。 */
+	isSessionPinned(cwd: string, sessionPath: string): boolean {
+		const list = this.getPinnedSessions(cwd);
+		const norm = normalizePathKey(sessionPath);
+		return list.some((p) => normalizePathKey(p) === norm);
+	}
+
+	/** 会话文件被删除时清理钉住记录。 */
+	cleanPinnedSession(sessionPath: string): void {
+		const norm = normalizePathKey(sessionPath);
+		const all = this.load();
+		const map = all[ClientStateStore.GLOBAL_SETTINGS_KEY]?.pinnedSessions;
+		if (!map) return;
+		let changed = false;
+		for (const [cwdKey, list] of Object.entries(map)) {
+			const next = list.filter((p) => normalizePathKey(p) !== norm);
+			if (next.length !== list.length) {
+				changed = true;
+				if (next.length > 0) {
+					map[cwdKey] = next;
+				} else {
+					delete map[cwdKey];
+				}
+			}
+		}
+		if (changed) {
+			if (Object.keys(map).length === 0) {
+				delete all[ClientStateStore.GLOBAL_SETTINGS_KEY]!.pinnedSessions;
+			}
+			this.save();
+		}
 	}
 
 	/** 全局默认 key 跟随删除：被删的 key 若是全局默认记的，指到接替者（无接替则删引用）。 */

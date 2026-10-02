@@ -18,6 +18,7 @@ import {
 	FiTerminal,
 	FiVolume2,
 } from "react-icons/fi";
+import { LuMessageSquareDashed } from "react-icons/lu";
 import type { ChatState, UpdateAllItem } from "../use-chat";
 import type { CommandDef } from "../types";
 import { buildUpdateCommand } from "../update-command";
@@ -36,6 +37,7 @@ import {
 	setPluginViewOrder,
 	setPluginViewPinned,
 	type UiSlotEntry,
+	type UiSlotId,
 } from "../ui-slots";
 import { fitTopbar, MOBILE_ASIDE_TOPBAR_IDS, sortOverflowMenuItems } from "../topbar-fit";
 import { openContextMenu } from "../context-menu-state";
@@ -384,15 +386,83 @@ export function TopBar({
 		}
 	};
 
-	/** 右键一个顶栏条目 → 打开 contextmenu.topbar 槽位（插件可往里贡献菜单项）。 */
+	/** 右键一个顶栏条目 → 打开 contextmenu.topbar 槽位（支持位置切换 + 插件菜单项）。 */
 	const openItemMenu = (e: React.MouseEvent, id: string, label: string) => {
 		e.preventDefault();
+		e.stopPropagation();
+		const layout = chat.settings?.uiLayout;
+		const setItemSlot = (targetSlot: UiSlotId) => {
+			const slots = { ...layout?.slots, [id]: targetSlot };
+			appSend({ type: "set_settings", uiLayout: { ...layout, slots } });
+		};
+		const hideItem = () => {
+			const hidden = new Set(layout?.hidden ?? []);
+			hidden.add(id);
+			appSend({ type: "set_settings", uiLayout: { ...layout, hidden: [...hidden] } });
+		};
+		const menuEntries: UiSlotEntry[] = [
+			{
+				id: "host:move-bottom",
+				slot: "contextmenu.topbar",
+				source: "host",
+				label: t("moveToBottom"),
+				kind: "action",
+				order: 10,
+				align: "start",
+				hidden: false,
+				userOverrides: [],
+				arrangedBy: [],
+			},
+			{
+				id: "host:move-left",
+				slot: "contextmenu.topbar",
+				source: "host",
+				label: t("moveToLeft"),
+				kind: "action",
+				order: 20,
+				align: "start",
+				hidden: false,
+				userOverrides: [],
+				arrangedBy: [],
+			},
+			{
+				id: "host:move-right",
+				slot: "contextmenu.topbar",
+				source: "host",
+				label: t("moveToRight"),
+				kind: "action",
+				order: 30,
+				align: "start",
+				hidden: false,
+				userOverrides: [],
+				arrangedBy: [],
+			},
+			{
+				id: "host:hide-item",
+				slot: "contextmenu.topbar",
+				source: "host",
+				label: t("uiLayoutRestore"),
+				kind: "action",
+				order: 40,
+				align: "start",
+				hidden: false,
+				userOverrides: [],
+				arrangedBy: [],
+			},
+			...(uiContextTopbar ?? []),
+		];
 		openContextMenu({
 			x: e.clientX,
 			y: e.clientY,
 			slot: "contextmenu.topbar",
 			target: { id, label },
-			entries: uiContextTopbar ?? [],
+			entries: menuEntries,
+			onHostAction: (entry) => {
+				if (entry.id === "host:move-bottom") setItemSlot("bottombar");
+				else if (entry.id === "host:move-left") setItemSlot("sidebar.left");
+				else if (entry.id === "host:move-right") setItemSlot("sidebar.right");
+				else if (entry.id === "host:hide-item") hideItem();
+			},
 		});
 	};
 	// 受管标记与自身版本号：走全局（web/src/app-globals.ts），整个连接内不变。
@@ -582,7 +652,9 @@ export function TopBar({
 												? t("kindPiCore")
 												: item.kind === "git-extension"
 													? t("kindGitExtension")
-													: t("kindPackage")}
+													: item.kind === "plugin"
+														? t("kindPlugin")
+														: t("kindPackage")}
 									</span>
 									<span
 										className="dd-all-vers"
@@ -601,6 +673,16 @@ export function TopBar({
 										) : item.kind === "git-extension" ? (
 											item.upToDate ? (
 												stripGitSha(item.current)
+											) : (
+												shortGitRange(item.current, item.latest)
+											)
+										) : item.kind === "plugin" ? (
+											item.upToDate ? (
+												item.current.startsWith("v") ? (
+													item.current
+												) : (
+													stripGitSha(item.current)
+												)
 											) : (
 												shortGitRange(item.current, item.latest)
 											)
@@ -893,10 +975,7 @@ export function TopBar({
 					focusComposer();
 				}}
 			>
-				{/* emoji 也是图标：必须带 .chip-emoji，否则顶栏「只显示图标」模式下会被
-				    `.topbar.no-labels .chip > span` 连同文字标签一起藏掉，按钮变成空方块
-				    （溢出菜单 portal 在 body 下不受影响 —— 所以是「折叠进 ⋯ 才看得见」）。 */}
-				<span className="chip-emoji">🎭</span>
+				<LuMessageSquareDashed />
 				<span>{t("newChatEphemeral")}</span>
 			</button>
 		),
@@ -1156,6 +1235,42 @@ export function TopBar({
 				<FiGithub />
 			</a>
 		),
+		"host:conn": (
+			<span className="chip" data-tip={chat.status}>
+				<span className={`status-dot ${chat.status === "open" ? "ok" : "busy"}`} />
+				<span className="chip-sub">{chat.status}</span>
+			</span>
+		),
+		"host:engine": (
+			<span className="chip" data-tip="engine">
+				<span className="chip-sub">{chat.engine ?? "pi"}</span>
+			</span>
+		),
+		"host:ctx": (
+			<span className="chip" data-tip={t("contextUsage")}>
+				<span className="chip-sub">
+					{(chat.state?.stats?.contextUsage?.tokens ?? 0) > 0
+						? `${chat.state?.stats?.contextUsage?.tokens}`
+						: t("contextUsage")}
+				</span>
+			</span>
+		),
+		"host:cost": (
+			<span className="chip" data-tip={t("cumulativeCost")}>
+				<span className="chip-sub">${(chat.state?.stats?.cost ?? 0).toFixed(4)}</span>
+			</span>
+		),
+		"host:cwd": (
+			<button
+				type="button"
+				className="chip"
+				data-tip={chat.state?.cwd ?? ""}
+				onClick={() => setProjectPickerOpen(true)}
+			>
+				<FiFolder />
+				<span className="chip-sub">{chat.state?.cwd?.split(/[/\\]/).pop() || chat.state?.cwd}</span>
+			</button>
+		),
 	};
 
 	/** 桌面工具 chips 的可见性历史口径（不扩大）：只有 search / tasks / settings 这几个成员
@@ -1275,6 +1390,16 @@ export function TopBar({
 	/** 直流子节点（已滤掉 spacer）就是按这个顺序排的，宽度缓存必须按它一一对应 ——
 	 *  按 slot 顺序对应会在混排时把别人的宽度记到自己名下。 */
 	const keptVisual = visualAll.filter((it) => !droppedIds.has(it.id));
+	// 审查 #6：measure 被 ResizeObserver 的 effect 捕获（只在 measureKey 变化时重建），
+	// 闭包里的 visualAll/keptVisual 会过期。条目集挂 ref，measure 一律读 ref ——
+	// RO 回调永远量到当前渲染的条目（ref 同步声明在 measure 的 layout effect 之前，
+	// 保证同一次提交里先更新再测量）。
+	const visualAllRef = useRef(visualAll);
+	const keptVisualRef = useRef(keptVisual);
+	useLayoutEffect(() => {
+		visualAllRef.current = visualAll;
+		keptVisualRef.current = keptVisual;
+	});
 	const measure = () => {
 		const flow = flowRef.current;
 		// jsdom / 未挂载（没有 ResizeObserver）：不丢任何条目 —— 宁可全画，也不清空顶栏。
@@ -1282,15 +1407,16 @@ export function TopBar({
 		const kids = Array.from(flow.children).filter((el) => !el.classList.contains("tb-spacer"));
 		// 每个条目恰好渲染一个元素（宿主条目都是单根元素）；数量对不上就不猜了 —— 全保留。
 		// 手机端固定位（📁）挂在直流外面：只比对直流内的条目数（keptVisual）。
-		if (kids.length === keptVisual.length) {
-			keptVisual.forEach((it, i) => widthCacheRef.current.set(it.id, (kids[i] as HTMLElement).offsetWidth));
+		const kept = keptVisualRef.current;
+		if (kids.length === kept.length) {
+			kept.forEach((it, i) => widthCacheRef.current.set(it.id, (kids[i] as HTMLElement).offsetWidth));
 		}
 		const gap = Number.parseFloat(getComputedStyle(flow).columnGap) || 0;
 		// 「⋯」按钮是流容器的**兄弟**节点：flex 已经把它占的宽度从 clientWidth 里扣掉了，
 		// 所以这里不用为它预留（reserve = 0）。没有 slot 元数据的条目（回退模式）不参与溢出
 		// （宽度传 0 = 不可丢），否则菜单里会出现画不出来的幽灵项。
 		// 极窄屏下放不下的视觉尾部条目退进溢出，而不是把顶栏撑成两行。
-		const fitInput = visualAll;
+		const fitInput = visualAllRef.current;
 		const next = fitTopbar(
 			fitInput.map((it) => ({ id: it.id, width: it.entry ? (widthCacheRef.current.get(it.id) ?? 0) : 0 })),
 			flow.clientWidth,
@@ -1329,6 +1455,12 @@ export function TopBar({
 		(id) => slotRank.get(id) ?? 999999,
 	);
 
+	/** 溢出菜单行首的图标字：只认「非拉丁字母」的（emoji / 符号）—— 拉丁词表名
+	 *  （如 "mic"）当图标画出来是乱码，直接当标签文字用。抽成函数是因为 select 行
+	 *  与扁平行两处都要判，且要拿到同一个字形去渲染成独立的图标格（见菜单里的
+	 *  「图标槽」CSS：图标独占一格，文字左缘才对得齐）。 */
+	const menuIcon = (it: UiSlotEntry): string | null => (it.icon && !/[a-z]/i.test(it.icon) ? it.icon : null);
+
 	// 顶栏按钮文字总开关（设置 → 界面布局 → 顶栏，默认开）：关掉后顶栏只剩图标
 	// （数字角标保留；溢出菜单里仍带文字；实现见 styles.css 的 .topbar.no-labels）。
 	const hideTopbarText = chat.settings?.uiLayout?.topbarText === false;
@@ -1344,7 +1476,7 @@ export function TopBar({
 				{segCenter.map((it) => (
 					<Fragment key={it.id}>{it.node}</Fragment>
 				))}
-				{segEnd.length > 0 && <span className="tb-spacer" aria-hidden="true" />}
+				{segCenter.length > 0 && <span className="tb-spacer" aria-hidden="true" />}
 				{segEnd.map((it) => (
 					<Fragment key={it.id}>{it.node}</Fragment>
 				))}
@@ -1417,11 +1549,11 @@ export function TopBar({
 							// kind="select" 在溢出菜单里同样落成下拉（label + select 一行）。
 							if (it.kind === "select" && it.options?.length) {
 								return (
-									<label key={it.id} className="plugin-topbar-overflow-select" title={it.hint ?? it.label}>
-										<span>
-											{it.icon && !/[a-z]/i.test(it.icon) ? `${it.icon} ` : ""}
-											{it.label}
-										</span>
+									<label key={it.id} className="plugin-topbar-overflow-select tb-row" title={it.hint ?? it.label}>
+										{/* 图标独占一格（.plugin-icon-glyph）；没有图标时由 CSS ::before 补同宽占位，
+									    文字左缘才能和带图标的行对齐（见 styles.css「菜单行的图标槽」）。 */}
+										{menuIcon(it) ? <span className="plugin-icon-glyph">{menuIcon(it)}</span> : null}
+										<span className="tb-row-text">{it.label}</span>
 										<select
 											aria-label={it.label}
 											value={it.options.some((o) => o.value === it.value) ? (it.value as string) : it.options[0]!.value}
@@ -1444,6 +1576,7 @@ export function TopBar({
 									key={it.id}
 									type="button"
 									role="menuitem"
+									className="tb-row"
 									title={it.hint ?? it.label}
 									onClick={() => {
 										setTopbarMenuOpen(false);
@@ -1451,8 +1584,8 @@ export function TopBar({
 										if (!dispatchHostOverflow(it)) onUiAction?.(it);
 									}}
 								>
-									{it.icon && !/[a-z]/i.test(it.icon) ? `${it.icon} ` : ""}
-									{it.label}
+									{menuIcon(it) ? <span className="plugin-icon-glyph">{menuIcon(it)}</span> : null}
+									<span className="tb-row-text">{it.label}</span>
 								</button>
 							);
 						})}

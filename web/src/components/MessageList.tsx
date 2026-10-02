@@ -11,6 +11,7 @@ import { collectQuestionAttachments } from "../question-attachments";
 
 import { parseSkillBlock } from "../skill-block";
 import { CollapsedMessage } from "./CollapsedMessage";
+import { reviewFoldKind } from "../goal-review-fold";
 import { LazyMount } from "./LazyMount";
 import {
 	applyPlan,
@@ -29,6 +30,9 @@ import { renderSlotToolbar } from "../slot-toolbar";
 import { useT } from "../i18n";
 import { isExportableMessage, setExportMessageCatalog, useExportImage } from "../export-image-state";
 import { SaveImageDialog } from "./SaveImageDialog";
+import { SelectionQuoteButton } from "./SelectionQuoteButton";
+import { TextQuoteCard } from "./TextQuoteCard";
+import { splitQuotedPrompt } from "../../../server/text-quote.js";
 
 /** Stable shared empty map — passing this (instead of a fresh Map) lets
  *  React.memo skip messages that have no live tool output to show. */
@@ -83,6 +87,7 @@ function QueuedMessage({
 	onRecallQueued?: (kind: "steer" | "followUp", text: string, index: number) => void;
 }) {
 	const t = useT();
+	const parsed = splitQuotedPrompt(text);
 	return (
 		<div className="msg msg-user msg-queued" data-role="user">
 			<div className="msg-meta">
@@ -117,7 +122,10 @@ function QueuedMessage({
 			</div>
 			<div className="msg-body">
 				<div className="msg-text">
-					<Markdown text={text} hardBreaks />
+					{parsed.quotes.map((quote, i) => (
+						<TextQuoteCard key={`quote-${i}`} quote={quote} />
+					))}
+					<Markdown text={parsed.text} hardBreaks />
 				</div>
 			</div>
 		</div>
@@ -221,6 +229,11 @@ export function MessageList({
 	const prevScrollHeightRef = useRef(0);
 	/** 用户已主动离开底部：流式结束 / finalize 塌缩时不再自动吸回。 */
 	const escapedRef = useRef(false);
+	const pauseForSelection = useCallback(() => {
+		escapedRef.current = true;
+		stickRef.current = false;
+		setStickBottom(false);
+	}, []);
 	/** Timestamp until which scroll events are treated as programmatic. */
 	const progUntilRef = useRef(0);
 	/** Messages the user expanded from the collapsed view — stay expanded. */
@@ -809,6 +822,12 @@ export function MessageList({
 
 	return (
 		<div className={`messages-wrap${exportImage.open ? " messages-exporting" : ""}`}>
+			<SelectionQuoteButton
+				rootRef={scrollRef}
+				sessionId={state.sessionId}
+				enabled={!exportImage.open}
+				onSelect={pauseForSelection}
+			/>
 			<div
 				// anchor-live：未钉底（逃逸阅读）时启用原生滚动锚定，兜住部分跨视口
 				// 边缘消息的占位⇄真身互换跳动；与钉底期的程序性再钉互斥（那时无此类）。
@@ -827,6 +846,25 @@ export function MessageList({
 				{state.messages.map((m, i) => {
 					// system 不占位——旧快照残留的空 SYSTEM 气泡直接丢掉，不进折叠行也不进 LazyMount。
 					if (m.role === "system") return null;
+					// 目标审查回合的指令与纯 verdict 结论默认折叠成摘要行（结论卡已有人话
+					// 翻译，裸 JSON 只留审计入口；点开展开看原文，记忆沿用 expanded）。
+					const fold = reviewFoldKind(m);
+					if (fold && !expanded.has(m.id)) {
+						return (
+							<CollapsedMessage
+								key={m.id}
+								message={m}
+								onExpand={expand}
+								summary={
+									fold.kind === "prompt"
+										? t("goalBarReviewing")
+										: fold.verdict === "pass"
+											? t("goalBarPassed")
+											: t("goalBarFailed")
+								}
+							/>
+						);
+					}
 					const isOld = i < recentStart;
 					const isExpandedOld = isOld && expanded.has(m.id);
 					if (isOld && !isExpandedOld) {
@@ -945,8 +983,17 @@ export function MessageList({
 				))}
 			</div>
 			{!stickBottom && (
-				<button type="button" className="scroll-bottom" onClick={scrollToBottom}>
-					<FiArrowDown /> {t("backToBottom")}
+				<button
+					type="button"
+					className="scroll-bottom"
+					title={t("backToBottom")}
+					aria-label={t("backToBottom")}
+					onClick={scrollToBottom}
+				>
+					<FiArrowDown />
+					{/* 文字包 span：窄屏（≤380px）只藏它退成纯图标（.scroll-bottom-label），
+					    藏的是标签而不是整块，按钮本体的点击区与 title/aria 都在。 */}
+					<span className="scroll-bottom-label">{t("backToBottom")}</span>
 				</button>
 			)}
 			<SearchBar

@@ -30,8 +30,9 @@
  *    - 内存缓存 + 文件 mtime 感知，支持直接编辑 JSON 文件热生效。
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve, sep } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { resolve, sep } from "node:path";
+import { writeJsonAtomicSync } from "./atomic-file.js";
 import type { UiApprovalCategory } from "./protocol.js";
 
 /** 工具调用审批命中动作：需审批 / 直接拒绝 / 直接放行（白名单）。 */
@@ -42,6 +43,23 @@ export type ApprovalRuleField = "command" | "path" | "params";
 
 /** 匹配方式。 */
 export type ApprovalRuleMatchKind = "regex" | "glob" | "contains" | "prefix" | "outside_workspace";
+
+/**
+ * 跨平台判定 target 路径是否严格位于 root 目录内部或就是 root 本身。
+ * 针对 Windows 盘符大小写不敏感及正反斜杠统一进行规范化，防止 .. 路径穿越逃逸。
+ */
+export function isPathInsideRoot(target: string, root: string): boolean {
+	const normTarget = resolve(target);
+	const normRoot = resolve(root);
+	if (process.platform === "win32") {
+		const lowerTarget = normTarget.toLowerCase();
+		const lowerRoot = normRoot.toLowerCase();
+		return (
+			lowerTarget === lowerRoot || lowerTarget.startsWith(lowerRoot + sep) || lowerTarget.startsWith(lowerRoot + "/")
+		);
+	}
+	return normTarget === normRoot || normTarget.startsWith(normRoot + sep);
+}
 
 /** 审批规则定义（也与 wire 协议 UiApprovalRule 同形）。 */
 export interface ApprovalRule {
@@ -120,6 +138,21 @@ export function globToRegex(pattern: string): RegExp {
 }
 
 /**
+ * 从工具参数里取「这次调用动的是哪个文件」。SDK 内置 read/write/edit 用 `path`，read 还有
+ * `file_path` 别名，部分扩展（如 pi-better-edit 的 edit）用 `file` —— 三种都认，否则叠在
+ * 扩展实现之上的权限沙箱与审批规则会静默放行（取不到 → 空串 → 被判成工作区内）。
+ */
+export function extractTargetPath(params: unknown): string {
+	if (!params || typeof params !== "object") return "";
+	const obj = params as Record<string, unknown>;
+	for (const key of ["path", "file_path", "file"]) {
+		const value = obj[key];
+		if (typeof value === "string" && value.trim()) return value;
+	}
+	return "";
+}
+
+/**
  * 从工具参数对象中提取待检查文本。
  */
 export function extractRuleFieldValue(field: ApprovalRuleField, toolName: string, params: unknown): string {
@@ -131,7 +164,7 @@ export function extractRuleFieldValue(field: ApprovalRuleField, toolName: string
 		return String(obj.command ?? "");
 	}
 	if (field === "path") {
-		return String(obj.path ?? "");
+		return extractTargetPath(params);
 	}
 	if (field === "params") {
 		try {
@@ -164,9 +197,10 @@ export function matchApprovalRule(
 	if (rule.match === "outside_workspace") {
 		const targetPath = extractRuleFieldValue("path", toolName, params);
 		if (!targetPath) return false;
-		const abs = isAbsolute(targetPath) ? targetPath : resolve(cwd, targetPath);
+		// 无论相对或绝对路径，统一经 resolve(cwd, targetPath) 规范化并消除 ".."
+		const abs = resolve(cwd, targetPath);
 		const allRoots = [resolve(cwd), ...workspaceRoots.map((r) => resolve(r))];
-		const inside = allRoots.some((r) => abs === r || abs.startsWith(r + sep));
+		const inside = allRoots.some((r) => isPathInsideRoot(abs, r));
 		return !inside;
 	}
 
@@ -242,7 +276,8 @@ export const DEFAULT_APPROVAL_RULES: ApprovalRule[] = [
 		tools: ["bash"],
 		field: "command",
 		match: "regex",
-		value: "\\brm\\s+-[a-zA-Z0-9]*[rf][a-zA-Z0-9]*\\s+((\\/)|(~)|(\\.\\.)|(\\*)|(\\.\\/))",
+		value:
+			"\\brm\\s+((-[a-zA-Z0-9]*[rf][a-zA-Z0-9]*|--recursive|--force)\\s+)+(((\\/)|(~)|(\\.\\.)|(\\*)|(\\.\\/))|[a-zA-Z]:[\\\\/])",
 		action: "ask",
 		label: "递归/强制删除 (rm -rf)",
 		labelEn: "Recursive/force delete (rm -rf)",
@@ -257,12 +292,12 @@ export const DEFAULT_APPROVAL_RULES: ApprovalRule[] = [
 		tools: ["bash"],
 		field: "command",
 		match: "regex",
-		value: "\\b(del|rmdir)\\s+\\/[fsq]",
+		value: "\\b(del|rmdir|rd)\\s+[/\\-][fsq]",
 		action: "ask",
-		label: "Windows 强制删除 (del/rmdir)",
-		labelEn: "Windows force delete (del/rmdir)",
-		reason: "检测到高风险的 Windows 强制/递归删除目录命令 (del/rmdir /s /q)",
-		reasonEn: "Detected high-risk Windows force/recursive deletion command (del/rmdir /s /q)",
+		label: "Windows 强制删除 (del/rmdir/rd)",
+		labelEn: "Windows force delete (del/rmdir/rd)",
+		reason: "检测到高风险的 Windows 强制/递归删除目录命令 (del/rmdir/rd /s /q)",
+		reasonEn: "Detected high-risk Windows force/recursive deletion command (del/rmdir/rd /s /q)",
 		categoryId: "bash.win-del",
 		builtin: true,
 	},
@@ -479,10 +514,7 @@ export class ApprovalRulesStore {
 
 	private saveSeeded(names: Set<string>): void {
 		try {
-			mkdirSync(dirname(this.seededPath()), { recursive: true });
-			const tmp = `${this.seededPath()}.${process.pid}.tmp`;
-			writeFileSync(tmp, JSON.stringify([...names].sort(), null, 2) + "\n");
-			renameSync(tmp, this.seededPath());
+			writeJsonAtomicSync(this.seededPath(), [...names].sort());
 		} catch {
 			// best effort
 		}
@@ -538,10 +570,7 @@ export class ApprovalRulesStore {
 
 	private persist(): void {
 		try {
-			mkdirSync(dirname(this.filePath), { recursive: true });
-			const tmp = `${this.filePath}.${process.pid}.tmp`;
-			writeFileSync(tmp, JSON.stringify(this.rules ?? [], null, 2) + "\n");
-			renameSync(tmp, this.filePath);
+			writeJsonAtomicSync(this.filePath, this.rules ?? []);
 			try {
 				this.lastMtime = statSync(this.filePath).mtimeMs;
 			} catch {
@@ -589,6 +618,21 @@ export class ApprovalRulesStore {
 			if (ids.has(r.id)) return `规则 id 冲突: ${r.id}`;
 			ids.add(r.id);
 			normalized.push(r);
+		}
+
+		// 内置规则是安全底线：整表替换绝不能把它们裁掉（旧客户端 / 并发竞态都
+		// 可能送来缺内置规则的清单）。缺失的按默认定义补种、追加到队尾——与
+		// load/resetBuiltin 同口径；插队首会改变用户 allow 规则的 first-match
+		// 语义。id 命中内置定义的一律强制 builtin 标记（同 upsert 的保护），
+		// 防止 remove() 的内置不可删保护被绕过。
+		for (const def of DEFAULT_APPROVAL_RULES) {
+			if (!ids.has(def.id)) {
+				normalized.push({ ...def, tools: [...def.tools] });
+				ids.add(def.id);
+			} else {
+				const i = normalized.findIndex((r) => r.id === def.id);
+				normalized[i].builtin = true;
+			}
 		}
 
 		this.rules = normalized;

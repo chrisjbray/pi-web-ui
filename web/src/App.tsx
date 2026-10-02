@@ -15,10 +15,13 @@ import { RightPanel } from "./components/RightPanel";
 import { MessageList } from "./components/MessageList";
 import { ChatInput } from "./components/ChatInput";
 import { GoalBar } from "./components/GoalBar";
+import { FiRefreshCw } from "react-icons/fi";
 
 import { FooterBar } from "./components/FooterBar";
+import { SideDock } from "./components/SideDock";
 import { Dialog } from "./components/Dialog";
 import { DshQuestionDialog } from "./components/DshQuestionDialog";
+import { presetText } from "./components/DshPresetBar";
 // 终端视图懒加载：xterm.js 体积大且只在切到终端时才需要，拆出主包
 const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
 import { ScmPanel } from "./components/SCMPanel";
@@ -42,6 +45,7 @@ import { ensurePluginViewLoaded } from "./plugin-loader";
 import { registerAttachmentSink, insertTextAtCursor, removeMentionFromComposer } from "./composer-bridge";
 import { appendDraftAttachments } from "./composer-draft";
 import { useComposerSessionReset } from "./use-composer-session";
+import { splitQuotedPrompt } from "../../server/text-quote.js";
 import {
 	syncPluginViews,
 	subscribeLoadedPluginViews,
@@ -78,10 +82,13 @@ import { fileToProcessedImage, isRasterImage, type ProcessedImage } from "./imag
 import { randomUuid } from "./uuid";
 import { recordModelUsage } from "./model-usage";
 import { loadSoundSettings, playSound, saveSoundSettings, type SoundKind, type SoundSettings } from "./sounds";
+import { assistantPlainText, loadTtsSettings, saveTtsSettings, speak, type TtsSettings } from "./tts";
+import { shouldSuppressNotify, currentPresence } from "./notify";
 import { useWideChat } from "./chat-width-settings";
 import { registerFilePreviewHost } from "./file-preview-bridge";
 import { projectNameFromCwd, useProjectTitle } from "./title-settings";
 import { notify } from "./notify";
+import { diffStreamingCues } from "./streaming-cues";
 import { useTheme } from "./theme";
 import { useWallpaperEffect } from "./wallpaper";
 
@@ -95,7 +102,8 @@ export interface PendingAttachment {
 	 *  "reference"/"lines" = 工作区路径引用（文件内容不进 prompt）。
 	 *  "inline" = 旧版「全文注入」的遗留值（服务端按 reference 处理）；粘贴图片 /
 	 *  上传文件没有 mode（path 为空，模式对它们无意义）。 */
-	mode?: "inline" | "reference" | "lines" | "page" | "conversation";
+	mode?: "inline" | "reference" | "lines" | "page" | "conversation" | "quote";
+	quote?: import("./types").TextQuote;
 	/** mode "conversation" + 引用运行中对话的 id（如 "c3"）。 */
 	conversationId?: string;
 	/** mode "conversation" + 引用历史会话的转录文件 path。 */
@@ -155,12 +163,22 @@ const PANEL_DEFAULT = 240;
 type PanelSide = "left" | "right";
 const panelWidthKey = (side: PanelSide) => `pi-web-ui:${side}-panel-width`;
 function readPanelWidth(side: PanelSide): number {
-	const v = Number(localStorage.getItem(panelWidthKey(side)));
-	return Number.isFinite(v) && v >= PANEL_MIN && v <= PANEL_MAX ? v : PANEL_DEFAULT;
+	try {
+		const v = Number(localStorage.getItem(panelWidthKey(side)));
+		return Number.isFinite(v) && v >= PANEL_MIN && v <= PANEL_MAX ? v : PANEL_DEFAULT;
+	} catch {
+		// storage 不可用（隐私模式等）：回默认宽度。这两个读在 useState 初始化器里，
+		// 抛错会让整个 App 首帧白屏 —— 与 use-chat.ts/theme.ts 的兜底风格一致。
+		return PANEL_DEFAULT;
+	}
 }
 const panelCollapsedKey = (side: PanelSide) => `pi-web-ui:${side}-panel-collapsed`;
 function readPanelCollapsed(side: PanelSide): boolean {
-	return localStorage.getItem(panelCollapsedKey(side)) === "1";
+	try {
+		return localStorage.getItem(panelCollapsedKey(side)) === "1";
+	} catch {
+		return false;
+	}
 }
 
 /** 面板与主区之间的拖拽分隔条：拖动改宽度，双击复位。 */
@@ -182,7 +200,11 @@ function ResizeHandle({ side, width, onResize }: { side: PanelSide; width: numbe
 				window.removeEventListener("pointermove", move);
 				window.removeEventListener("pointerup", up);
 				document.body.classList.remove("panel-resizing");
-				localStorage.setItem(panelWidthKey(side), String(last));
+				try {
+					localStorage.setItem(panelWidthKey(side), String(last));
+				} catch {
+					/* storage 不可用：本次拖拽照常生效，只是不持久化 */
+				}
 			};
 			window.addEventListener("pointermove", move);
 			window.addEventListener("pointerup", up);
@@ -218,23 +240,46 @@ type ViewName = "chat" | "terminal" | "git" | `plugin:${string}`;
  * 插件项目会话的目录授权（issue #146）：插件经 host.openSession 打开一个新目录的会话前，
  * 宿主必须先让用户点头；确认过的目录记在这里（localStorage，按浏览器），下次不再问。
  * 已在「最近项目」里的目录视为用户自己用过的，也不问。
+ *
+ * 键按插件隔离：旧版所有插件共用一个全局键，A 插件拿到的授权对 B 插件天然生效（一次
+ * 确认全网通行）。带 pluginId 的读写走 `pi-web-ui:plugin-path-grants:<pluginId>`；
+ * 该插件首读且只有旧全局键时，把旧记录**迁移**到它名下（保住升级前「确认过不再问」的
+ * 体验，之后各插件的授权各自演化）；宿主桥归因不了调用方时回退旧全局键（见
+ * plugin-host.ts 的 pluginApiCaller）。
  */
 const PLUGIN_PATH_GRANTS_KEY = "pi-web-ui:plugin-path-grants";
+const pluginPathGrantsKey = (pluginId?: string) =>
+	pluginId ? `${PLUGIN_PATH_GRANTS_KEY}:${pluginId}` : PLUGIN_PATH_GRANTS_KEY;
 
-function readPluginPathGrants(): string[] {
+function parseGrants(raw: string | null): string[] {
+	if (raw === null) return [];
 	try {
-		const raw = localStorage.getItem(PLUGIN_PATH_GRANTS_KEY);
-		const arr = raw ? (JSON.parse(raw) as unknown) : [];
+		const arr = JSON.parse(raw) as unknown;
 		return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
 	} catch {
 		return [];
 	}
 }
 
-function addPluginPathGrant(path: string): void {
+function readPluginPathGrants(pluginId?: string): string[] {
 	try {
-		const next = [...new Set([...readPluginPathGrants(), path])];
-		localStorage.setItem(PLUGIN_PATH_GRANTS_KEY, JSON.stringify(next));
+		const key = pluginPathGrantsKey(pluginId);
+		if (localStorage.getItem(key) !== null) return parseGrants(localStorage.getItem(key));
+		if (!pluginId) return [];
+		// 迁移：该插件还没有自己的授权记录时，接管旧全局键（升级前所有插件共用），
+		// 用户在旧版确认过的目录不因升级重新弹框。
+		const grants = parseGrants(localStorage.getItem(PLUGIN_PATH_GRANTS_KEY));
+		localStorage.setItem(key, JSON.stringify(grants));
+		return grants;
+	} catch {
+		return [];
+	}
+}
+
+function addPluginPathGrant(path: string, pluginId?: string): void {
+	try {
+		const next = [...new Set([...readPluginPathGrants(pluginId), path])];
+		localStorage.setItem(pluginPathGrantsKey(pluginId), JSON.stringify(next));
 	} catch {
 		/* 隐私模式等：授权只在本次会话内有效 */
 	}
@@ -370,13 +415,17 @@ export function App() {
 	const uiChatHeader = useMemo(() => uiSlots["chat.header"].filter((e) => !e.hidden), [uiSlots]);
 	const uiChatEmpty = useMemo(() => uiSlots["chat.empty"].filter((e) => !e.hidden), [uiSlots]);
 	const uiFilePreviewToolbar = useMemo(() => uiSlots["file.preview.toolbar"].filter((e) => !e.hidden), [uiSlots]);
-	// DSH 预设名录 id→显示名（左栏徽标；dshPresets 对象不变时引用稳定，不破坏 LeftPanel memo）。
+	// 预设名录 id→显示名（左栏徽标；dshPresets 对象不变时引用稳定，不破坏 LeftPanel memo）。
+	// 徽标文案随界面语言定（内置五档走 i18n，其余取服务端 nameEn ?? name）——locale 进
+	// 依赖：切语言要重算，否则徽标留着上一种语言的文案。
 	const presetNames = useMemo(
-		() => Object.fromEntries((chat.dshPresets?.presets ?? []).map((p) => [p.id, p.name ?? p.id])),
+		() => Object.fromEntries((chat.dshPresets?.presets ?? []).map((p) => [p.id, presetText(p, locale, t).name])),
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[chat.dshPresets],
+		[chat.dshPresets, locale],
 	);
 	const uiNoticeActions = useMemo(() => uiSlots["notice.actions"].filter((e) => !e.hidden), [uiSlots]);
+	const uiSidebarLeft = useMemo(() => uiSlots["sidebar.left"] ?? [], [uiSlots]);
+	const uiSidebarRight = useMemo(() => uiSlots["sidebar.right"] ?? [], [uiSlots]);
 	/** 点一个插件顶栏条目：缺省 action（或 "view"）由宿主切成插件视图；其余交给插件
 	 *  （按需加载它的客户端 bundle；没人接管就提示一句，不让按钮看起来"点了没用"）。
 	 *  kind="select" 的渲染层把选中的 value 经第二个参数传进来，转给插件 handler。 */
@@ -514,7 +563,16 @@ export function App() {
 				listProjects: () => chatRefForPlugins.current.projects.map((p) => p.path),
 				grantedPaths: readPluginPathGrants,
 				grantPath: addPluginPathGrant,
-				confirm: (opts) => new Promise<boolean>((resolve) => setPluginPathConfirm({ path: opts.path, resolve })),
+				confirm: (opts) =>
+					new Promise<boolean>((resolve) => {
+						if (pluginPathConfirmRef.current) {
+							resolve(false);
+							return;
+						}
+						const req = { path: opts.path, resolve };
+						pluginPathConfirmRef.current = req;
+						setPluginPathConfirm(req);
+					}),
 				// 宿主 API v10 弹窗（modal.dialog 槽位）：条目必须存在且未被隐藏，否则拒绝。
 				openModal: (id) => {
 					const target = String(id ?? "").trim();
@@ -609,13 +667,21 @@ export function App() {
 	const [rightCollapsed, setRightCollapsed] = useState(() => readPanelCollapsed("right"));
 	const toggleLeft = useCallback(() => {
 		setLeftCollapsed((v) => {
-			localStorage.setItem(panelCollapsedKey("left"), v ? "0" : "1");
+			try {
+				localStorage.setItem(panelCollapsedKey("left"), v ? "0" : "1");
+			} catch {
+				/* storage 不可用（隐私模式等）：折叠照常，只是不持久化 */
+			}
 			return !v;
 		});
 	}, []);
 	const toggleRight = useCallback(() => {
 		setRightCollapsed((v) => {
-			localStorage.setItem(panelCollapsedKey("right"), v ? "0" : "1");
+			try {
+				localStorage.setItem(panelCollapsedKey("right"), v ? "0" : "1");
+			} catch {
+				/* storage 不可用（隐私模式等）：折叠照常，只是不持久化 */
+			}
 			return !v;
 		});
 	}, []);
@@ -642,6 +708,7 @@ export function App() {
 	const [pluginPathConfirm, setPluginPathConfirm] = useState<{ path: string; resolve: (ok: boolean) => void } | null>(
 		null,
 	);
+	const pluginPathConfirmRef = useRef<typeof pluginPathConfirm>(null);
 	// 插件宿主对话框（host.dialogs.*，API v8）：同一时刻只允许一个，
 	// 已有未决时新请求直接回绝（confirm 回 false，select/input 回 {ok:false,error:"busy"}）。
 	const [pluginDialog, setPluginDialog] = useState<{
@@ -763,6 +830,8 @@ export function App() {
 
 	// -- sound notifications --------------------------------------------------
 	const [sound, setSound] = useState<SoundSettings>(loadSoundSettings);
+	// -- local TTS announcements (Settings → Sound & Voice) -------------------
+	const [tts, setTts] = useState<TtsSettings>(loadTtsSettings);
 	// -- theme (whole stylesheet swap) ---------------------------------------
 	const { themes, theme, switchTheme, reloadThemes } = useTheme();
 	// -- chat wallpaper (message-list background image, issue #100) -------------
@@ -833,11 +902,13 @@ export function App() {
 		}, 8000);
 		return () => clearTimeout(timer);
 	}, [pluginNotify]);
-	const prevStreaming = useRef<boolean | null>(null);
-	const prevDialogId = useRef<number | null>(null);
-	const prevQuestionId = useRef<string | null>(null);
-	const prevRemoteQuestionId = useRef<string | null>(null);
-	const prevQuestionConvs = useRef<Set<string>>(new Set());
+	const prevStreamingMapRef = useRef<Map<string, boolean> | null>(null);
+	const prevActiveIdRef = useRef<string | null>(null);
+	const latestMessagesRef = useRef(chat.state?.messages);
+	latestMessagesRef.current = chat.state?.messages;
+	const notifiedDialogIds = useRef<Set<number>>(new Set());
+	const notifiedQuestionIds = useRef<Set<string>>(new Set());
+	const notifiedApprovalIds = useRef<Set<string>>(new Set());
 	const lastErrorNotice = useRef(0);
 	// Remembers a terminal-view click made before the WebSocket is ready.
 	const terminalOpenRequested = useRef(false);
@@ -847,6 +918,10 @@ export function App() {
 	useEffect(() => {
 		saveSoundSettings(sound);
 	}, [sound]);
+
+	useEffect(() => {
+		saveTtsSettings(tts);
+	}, [tts]);
 
 	// Maintenance watcher: when a `pi remove …` / `pi-web-ui install|uninstall …`
 	// command tab transitions running → exited, re-discover extensions/skills
@@ -874,55 +949,129 @@ export function App() {
 	}, [chat.terminals, send]);
 
 	// Run start / end cues (streaming edge transitions).
+	// 按会话 id 独立跟踪状态跳变，彻底杜绝切换对话时将其他会话的状态误判为本会话的 start/done，
+	// 并在后台对话完成时及时提示（issue：切换对话误报完成、后台对话延迟到切换才提醒）。
 	useEffect(() => {
-		const streaming = chat.state?.isStreaming ?? false;
-		const prev = prevStreaming.current;
-		prevStreaming.current = streaming;
-		if (prev === null) return; // first observation — don't cue
-		if (!prev && streaming) playSound("start", sound);
-		else if (prev && !streaming) {
-			playSound("done", sound);
-			// OS/PWA notification for when the user stepped away (not focused).
-			void notify(t("notifyDoneTitle"), t("notifyDoneBody"));
+		const activeId = chat.state?.conversationId ?? null;
+		const cues = diffStreamingCues(
+			prevStreamingMapRef.current,
+			activeId,
+			chat.state?.isStreaming ?? false,
+			chat.conversations,
+			prevActiveIdRef.current,
+		);
+		prevStreamingMapRef.current = cues.nextMap;
+		prevActiveIdRef.current = activeId;
+
+		if (cues.startCue) {
+			playSound("start", sound);
 		}
-	}, [chat.state?.isStreaming, sound]);
+
+		if (cues.finishedConvs.length > 0) {
+			playSound("done", sound);
+
+			const activeFinished = cues.finishedConvs.find((c) => c.isActive);
+			if (activeFinished) {
+				// 前台活动对话完成
+				void notify(t("notifyDoneTitle"), t("notifyDoneBody"));
+				if (tts.enabled && !shouldSuppressNotify(currentPresence())) {
+					if (tts.readReplies) {
+						const body = assistantPlainText(latestMessagesRef.current);
+						if (body) speak(body, tts);
+						else if (tts.announce) speak(t("ttsAnnounceDone"), tts);
+					} else if (tts.announce) {
+						speak(t("ttsAnnounceDone"), tts);
+					}
+				}
+			}
+			// 后台对话完成（可能与其他会话同批）：逐条弹通知带标题；TTS 只播报一次，
+			// 且前台完成时让位给正文朗读，不叠加固定句。
+			for (const bg of cues.finishedConvs.filter((c) => !c.isActive)) {
+				const body = bg.title ? `${bg.title}：${t("notifyDoneBody")}` : t("notifyDoneBody");
+				void notify(t("notifyDoneTitle"), body);
+			}
+			if (!activeFinished && tts.enabled && tts.announce && !shouldSuppressNotify(currentPresence())) {
+				speak(t("ttsAnnounceDone"), tts);
+			}
+		}
+	}, [chat.state?.conversationId, chat.state?.isStreaming, chat.conversations, sound, tts, t]);
 
 	// Questionnaire cue — each new dialog id + each new DSH question id.
 	// dialog = 扩展 select/confirm/input；question = ask_user_question 问卷。
-	// 之前只监听了 dialog，问卷出来没有提示音（issue：当前问卷出来没有问卷的提示音）。
+	// 按 ID 集合去重，彻底避免在不同对话间切换时重复响铃和弹通知。
 	useEffect(() => {
 		const id = chat.dialog?.id ?? null;
-		if (id !== null && id !== prevDialogId.current) {
+		if (id !== null && !notifiedDialogIds.current.has(id)) {
+			notifiedDialogIds.current.add(id);
+			if (notifiedDialogIds.current.size > 64) {
+				const oldest = notifiedDialogIds.current.values().next().value;
+				if (oldest !== undefined) notifiedDialogIds.current.delete(oldest);
+			}
 			playSound("question", sound);
 			void notify(t("notifyQuestionTitle"), t("notifyQuestionBody"));
+			if (tts.enabled && tts.announce && !shouldSuppressNotify(currentPresence())) speak(t("ttsAnnounceQuestion"), tts);
 		}
-		prevDialogId.current = id;
-	}, [chat.dialog, sound]);
+	}, [chat.dialog, sound, tts, t]);
 
 	useEffect(() => {
 		const qid = chat.question?.id ?? null;
 		const rid = chat.remoteQuestion ? `${chat.remoteQuestion.owner}:${chat.remoteQuestion.id}` : null;
-		if (qid !== null && qid !== prevQuestionId.current) {
-			playSound("question", sound);
-			void notify(t("notifyQuestionTitle"), t("notifyQuestionBody"));
+		let shouldCue = false;
+
+		if (qid !== null && !notifiedQuestionIds.current.has(qid)) {
+			notifiedQuestionIds.current.add(qid);
+			shouldCue = true;
 		}
-		if (rid !== null && rid !== prevRemoteQuestionId.current) {
-			// 跨页问卷到了本页：同样响铃 + 通知（这正是手机端要的提醒）。
-			playSound("question", sound);
-			void notify(t("notifyQuestionTitle"), t("notifyQuestionBody"));
+		if (rid !== null && !notifiedQuestionIds.current.has(rid)) {
+			notifiedQuestionIds.current.add(rid);
+			shouldCue = true;
 		}
-		prevQuestionId.current = qid;
-		prevRemoteQuestionId.current = rid;
 
 		// 后台会话的问卷：弹窗不跨会话打扰，但提示音与系统通知照旧（避免只剩静默角标）。
-		const qConvs = new Set(chat.conversations.filter((c) => c.hasQuestion).map((c) => c.id));
-		const newBgQuestion = [...qConvs].some((id) => !prevQuestionConvs.current.has(id));
-		if (newBgQuestion && qid === null) {
+		// 遇到新的后台问卷时，将其 ID 记入已提醒 Set，防止用户切入该会话时二次响铃。
+		for (const c of chat.conversations) {
+			if (!c.hasQuestion) continue;
+			const qKey = c.questionId ? `q:${c.questionId}` : `conv-q:${c.id}`;
+			if (!notifiedQuestionIds.current.has(qKey)) {
+				notifiedQuestionIds.current.add(qKey);
+				if (c.questionId) notifiedQuestionIds.current.add(c.questionId);
+				if (qid !== c.questionId) {
+					shouldCue = true;
+				}
+			}
+		}
+
+		if (notifiedQuestionIds.current.size > 64) {
+			const oldest = notifiedQuestionIds.current.values().next().value;
+			if (oldest !== undefined) notifiedQuestionIds.current.delete(oldest);
+		}
+
+		if (shouldCue) {
 			playSound("question", sound);
 			void notify(t("notifyQuestionTitle"), t("notifyQuestionBody"));
+			if (tts.enabled && tts.announce && !shouldSuppressNotify(currentPresence())) speak(t("ttsAnnounceQuestion"), tts);
 		}
-		prevQuestionConvs.current = qConvs;
-	}, [chat.question, chat.remoteQuestion, chat.conversations, sound]);
+	}, [chat.question, chat.remoteQuestion, chat.conversations, sound, tts, t]);
+
+	// Tool-approval cue (issue #288)：高危操作等待用户批准 —— 此前是唯一静默的
+	// 拦截事件（done/question/error 都有提示音 + 桌面通知，唯独审批没有），AI 会
+	// 在后台干等。补齐同款三通道：提示音 + 桌面通知 + TTS 播报。
+	// 按 ID 集合去重，切换会话核对代码后再切回时绝不重复响铃。
+	useEffect(() => {
+		const approval = chat.approval;
+		const id = approval?.id ?? null;
+		if (id !== null && !notifiedApprovalIds.current.has(id)) {
+			notifiedApprovalIds.current.add(id);
+			if (notifiedApprovalIds.current.size > 64) {
+				const oldest = notifiedApprovalIds.current.values().next().value;
+				if (oldest !== undefined) notifiedApprovalIds.current.delete(oldest);
+			}
+			playSound("approval", sound);
+			const tool = typeof approval?.toolName === "string" ? approval.toolName : "";
+			void notify(t("notifyApprovalTitle"), tool ? t("notifyApprovalBodyTool", { tool }) : t("notifyApprovalBody"));
+			if (tts.enabled && tts.announce && !shouldSuppressNotify(currentPresence())) speak(t("ttsAnnounceApproval"), tts);
+		}
+	}, [chat.approval, sound, tts, t]);
 
 	// Error cue — new error notices only.
 	useEffect(() => {
@@ -931,8 +1080,9 @@ export function App() {
 			lastErrorNotice.current = err.id;
 			playSound("error", sound);
 			void notify(t("notifyErrorTitle"), t("notifyErrorBody"));
+			if (tts.enabled && tts.announce && !shouldSuppressNotify(currentPresence())) speak(t("ttsAnnounceError"), tts);
 		}
-	}, [chat.notices, sound]);
+	}, [chat.notices, sound, tts, t]);
 	// live-preview 工具的自动开页：工具结果末尾的确定性链接行即标记（渲染出来本身
 	// 也是可点兜底）。消息 id 去重（重连重放不二次开）；多标签页只让当前聚焦的开，
 	// 没焦点/弹窗被拦时推一条带地址的 notice（聊天里的链接照样可点）。
@@ -945,7 +1095,9 @@ export function App() {
 			let url = "";
 			for (const b of m.content ?? []) {
 				if ((b as { type?: string }).type !== "text") continue;
-				const hit = /🔗 已自动在浏览器打开\]\((\/[^)\s]+)\)/.exec((b as { text?: string }).text ?? "");
+				// (\/(?!\/) 拒绝 // 开头：协议相对 URL（//evil.com/x）会被浏览器按当前
+				// 协议解析成站外地址，根部署下 appUrl 又原样返回，挡不住跳站外。
+				const hit = /🔗 已自动在浏览器打开\]\((\/(?!\/)[^)\s]+)\)/.exec((b as { text?: string }).text ?? "");
 				if (hit?.[1]) {
 					url = hit[1];
 					break;
@@ -954,7 +1106,12 @@ export function App() {
 			if (!url) continue;
 			let opened: Window | null = null;
 			try {
-				if (document.hasFocus()) opened = window.open(appUrl(url), "_blank", "noopener");
+				// 打开前再校验最终 URL 与应用同源（第二道闸）：不同源一律不自动开，
+				// 只推带地址的 notice —— 聊天里的链接照样可点，用户自己决定去不去。
+				const finalUrl = new URL(appUrl(url), window.location.href);
+				if (finalUrl.origin === window.location.origin && document.hasFocus()) {
+					opened = window.open(finalUrl.href, "_blank", "noopener");
+				}
 			} catch {
 				opened = null;
 			}
@@ -1044,7 +1201,7 @@ export function App() {
 			const bannerId = `question-${c.id}`;
 			// 当前激活的会话不显示后台横幅（它由中央模态对话框处理）
 			if (c.id === activeConvId) {
-				dismissBanner(bannerId);
+				dismissBanner(bannerId, { silent: true });
 				continue;
 			}
 			// 已被用户主动关闭的该次问卷不再重复弹出
@@ -1064,103 +1221,121 @@ export function App() {
 				},
 				onClick: () => {
 					panelSend({ type: "switch_conversation", id: c.id });
-					dismissBanner(bannerId);
-					if (c.questionId) dismissedQuestionIdsRef.current.add(c.questionId);
+					dismissBanner(bannerId, { silent: true });
 				},
 			});
 		}
 
 		// 会话已无问卷或已被移除时，自动收起对应横幅
-		dismissBannersWhere((b) => {
-			const convId = b.data?.conversationId as string | undefined;
-			if (!convId) return false;
-			return !currentQuestionConvIds.has(convId) || convId === activeConvId;
-		});
+		dismissBannersWhere(
+			(b) => {
+				const convId = b.data?.conversationId as string | undefined;
+				if (!convId) return false;
+				return !currentQuestionConvIds.has(convId) || convId === activeConvId;
+			},
+			{ silent: true },
+		);
 	}, [chat.conversations, activeConvId, panelSend, t]);
 
 	// -- pasted / dropped / uploaded images (no workspace path) ---------------
 	const pasteImageId = useRef(0);
 	const lastVisionWarn = useRef(0);
-	const attachImage = (img: ProcessedImage) => {
-		// Warn when the current model can't see images — the image would still
-		// be attached but silently ignored by the provider. Throttled so adding
-		// several images at once produces one notice, not a stack.
-		const now = Date.now();
-		if (chat.state?.model && !chat.state.model.vision) {
-			if (now - lastVisionWarn.current > 10000) {
-				lastVisionWarn.current = now;
-				pushNotice("warning", t("imageNotSupported"));
+	// 以下四个函数都要作为 props 传给 memo 化的 ChatInput：流式重渲染期间引用必须
+	// 稳定，否则 shallow 比较失效、输入框整棵重渲染。之前用 useCallback(fn, [fn])
+	// 包普通函数 —— 依赖每次渲染都是新的，包装形同虚设；这里改成依赖正确的
+	// useCallback（deps 里的 chat.state?.model 是服务端跨快照复用的稳定引用）。
+	const attachImage = useCallback(
+		(img: ProcessedImage) => {
+			// Warn when the current model can't see images — the image would still
+			// be attached but silently ignored by the provider. Throttled so adding
+			// several images at once produces one notice, not a stack.
+			const now = Date.now();
+			if (chat.state?.model && !chat.state.model.vision) {
+				if (now - lastVisionWarn.current > 10000) {
+					lastVisionWarn.current = now;
+					pushNotice("warning", t("imageNotSupported"));
+				}
 			}
-		}
-		const key = `paste-${++pasteImageId.current}`;
-		setAttachments((prev) => [
-			...prev,
-			{
-				path: "",
-				key,
-				name: img.name,
-				imageData: img.data,
-				mimeType: img.mimeType,
-			},
-		]);
-	};
-	const addImageFiles = async (files: File[]) => {
-		for (const f of files) {
-			const img = await fileToProcessedImage(f);
-			if (!img) {
-				pushNotice("error", t("imageLoadFailed", { name: f.name }));
-				continue;
+			const key = `paste-${++pasteImageId.current}`;
+			setAttachments((prev) => [
+				...prev,
+				{
+					path: "",
+					key,
+					name: img.name,
+					imageData: img.data,
+					mimeType: img.mimeType,
+				},
+			]);
+		},
+		[chat.state?.model, pushNotice, t],
+	);
+	const addImageFiles = useCallback(
+		async (files: File[]) => {
+			for (const f of files) {
+				const img = await fileToProcessedImage(f);
+				if (!img) {
+					pushNotice("error", t("imageLoadFailed", { name: f.name }));
+					continue;
+				}
+				attachImage(img);
 			}
-			attachImage(img);
-		}
-	};
+		},
+		[attachImage, pushNotice, t],
+	);
 
 	// -- dropped / uploaded files (any type, no workspace path) ---------------
 	/** Keep in sync with MAX_UPLOAD_BYTES in agent-service.ts. */
 	const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 	const uploadId = useRef(0);
-	const attachLocalFile = async (f: File) => {
-		if (f.size > MAX_UPLOAD_BYTES) {
-			pushNotice("warning", t("fileTooLarge", { name: f.name, size: MAX_UPLOAD_BYTES / 1024 / 1024 }));
-			return;
-		}
-		let base64: string;
-		try {
-			const dataUrl = await new Promise<string>((res, rej) => {
-				const r = new FileReader();
-				r.onload = () => res(r.result as string);
-				r.onerror = () => rej(r.error ?? new Error("read failed"));
-				r.readAsDataURL(f);
-			});
-			base64 = dataUrl.replace(/^data:[^;]*;base64,/, "");
-		} catch {
-			pushNotice("error", t("fileLoadFailed", { name: f.name }));
-			return;
-		}
-		const key = `upload-${++uploadId.current}`;
-		setAttachments((prev) => [
-			...prev,
-			{
-				path: "",
-				key,
-				name: f.name,
-				fileData: base64,
-				size: f.size,
-				mimeType: f.type || undefined,
-			},
-		]);
-	};
-	const addLocalFiles = async (files: File[]) => {
-		for (const f of files) {
-			// Raster images go through the resize/encode pipeline (vision content);
-			// everything else — including SVG — is uploaded raw and attached by path.
-			if (isRasterImage(f.type)) {
-				await addImageFiles([f]);
-			} else {
-				await attachLocalFile(f);
+	const attachLocalFile = useCallback(
+		async (f: File) => {
+			if (f.size > MAX_UPLOAD_BYTES) {
+				pushNotice("warning", t("fileTooLarge", { name: f.name, size: MAX_UPLOAD_BYTES / 1024 / 1024 }));
+				return;
 			}
-		}
-	};
+			let base64: string;
+			try {
+				const dataUrl = await new Promise<string>((res, rej) => {
+					const r = new FileReader();
+					r.onload = () => res(r.result as string);
+					r.onerror = () => rej(r.error ?? new Error("read failed"));
+					r.readAsDataURL(f);
+				});
+				base64 = dataUrl.replace(/^data:[^;]*;base64,/, "");
+			} catch {
+				pushNotice("error", t("fileLoadFailed", { name: f.name }));
+				return;
+			}
+			const key = `upload-${++uploadId.current}`;
+			setAttachments((prev) => [
+				...prev,
+				{
+					path: "",
+					key,
+					name: f.name,
+					fileData: base64,
+					size: f.size,
+					mimeType: f.type || undefined,
+				},
+			]);
+		},
+		[MAX_UPLOAD_BYTES, pushNotice, t],
+	);
+	const addLocalFiles = useCallback(
+		async (files: File[]) => {
+			for (const f of files) {
+				// Raster images go through the resize/encode pipeline (vision content);
+				// everything else — including SVG — is uploaded raw and attached by path.
+				if (isRasterImage(f.type)) {
+					await addImageFiles([f]);
+				} else {
+					await attachLocalFile(f);
+				}
+			}
+		},
+		[addImageFiles, attachLocalFile],
+	);
 
 	// Edit-and-re-ask: the server forks a new session at that message and re-asks
 	// the edited text there (stable callback — Message is memoized). Attachments
@@ -1189,7 +1364,15 @@ export function App() {
 		(kind: "steer" | "followUp", text: string, index: number) => {
 			send({ type: "queue_remove", kind, text, index });
 			recallSeqRef.current += 1;
-			const item = { text, seq: recallSeqRef.current };
+			const parsed = splitQuotedPrompt(text);
+			const item = { text: parsed.text, seq: recallSeqRef.current };
+			if (parsed.quotes.length)
+				setAttachments((prev) =>
+					appendDraftAttachments(
+						prev,
+						parsed.quotes.map((quote) => ({ path: "", name: "", mode: "quote", quote, key: randomUuid() })),
+					),
+				);
 			setRecallDrafts((prev) => [...prev.slice(-9), item]);
 		},
 		[send],
@@ -1208,8 +1391,10 @@ export function App() {
 	//（两者都有单测，空 sessionId 的瞬时态不清）。
 	useComposerSessionReset(chat.state?.sessionId ?? "", clearAttachments);
 	const removeAttachmentCb = useCallback(removeAttachment, []);
-	const addImageFilesCb = useCallback(addImageFiles, [addImageFiles]);
-	const addLocalFilesCb = useCallback(addLocalFiles, [addLocalFiles]);
+	// addImageFiles/addLocalFiles 本体已是依赖正确的 useCallback（见上），引用在
+	// 流式重渲染期间稳定，直接传给 memo 化的 ChatInput，无需再包一层。
+	const addImageFilesCb = addImageFiles;
+	const addLocalFilesCb = addLocalFiles;
 	const searchFilesCb = useCallback(
 		(reqId: number, query: string) => send({ type: "search_files", reqId, query }),
 		[send],
@@ -1524,15 +1709,19 @@ export function App() {
 								<div className="boot-wait">{chat.ready ? t("loadingSession") : t("connectingServer")}</div>
 							)}
 
+							{/* 目标条宿主槽：只包 GoalBar。折叠态时槽高 0（药丸脱离文档流），
+							    展开态就是原来那一条（.goalbar 自带 margin）。 */}
 							{chat.settings?.goalModeEnabled !== false && (
-								<GoalBar
-									goal={chat.goal}
-									models={chat.models}
-									modelsLoading={chat.modelsLoading}
-									activeConversationId={chat.activeConversationId}
-									uiGoalbarActions={uiGoalbarActions}
-									onUiAction={onUiAction}
-								/>
+								<div className="goalbar-slot">
+									<GoalBar
+										goal={chat.goal}
+										models={chat.models}
+										modelsLoading={chat.modelsLoading}
+										activeConversationId={chat.activeConversationId}
+										uiGoalbarActions={uiGoalbarActions}
+										onUiAction={onUiAction}
+									/>
+								</div>
 							)}
 							{/* 扩展问卷：非模态内联面板，插在输入框上方，对话内容保持可见 */}
 							{/* 通用右键菜单（contextmenu.* 槽位）：各处的 onContextMenu 打开它。 */}
@@ -1718,142 +1907,6 @@ export function App() {
 									)}
 								</div>
 							)}
-							{pendingPermRequest && (
-								<div className="dialog-inline" data-dialog-kind="confirm">
-									<div className="dialog-head">
-										<span className="dialog-badge">{t("pluginRequest")}</span>
-										<span className="dialog-title">{t("pluginPermTitle")}</span>
-										<button
-											type="button"
-											className="dialog-dismiss"
-											title={t("cancel")}
-											onClick={() => answerPermRequest(pendingPermRequest.id, false)}
-										>
-											✕
-										</button>
-									</div>
-									<div className="dialog-body">
-										{pendingPermRequest.family === "net"
-											? t("pluginPermBodyNet")
-													.replace("{plugin}", pendingPermRequest.pluginId)
-													.replace("{hosts}", (pendingPermRequest.hosts ?? []).join(", "))
-											: t("pluginPermBodyLlm")
-													.replace("{plugin}", pendingPermRequest.pluginId)
-													.replace(
-														"{models}",
-														(pendingPermRequest.models ?? []).length > 0
-															? ` ${(pendingPermRequest.models ?? []).join(", ")}`
-															: "",
-													)}
-										{pendingPermRequest.reason && <div className="dialog-hint">{pendingPermRequest.reason}</div>}
-										<div className="dialog-actions">
-											<button
-												type="button"
-												className="btn"
-												onClick={() => answerPermRequest(pendingPermRequest.id, false)}
-											>
-												{t("pluginGrantDeny")}
-											</button>
-											<button
-												type="button"
-												className="btn"
-												onClick={() => answerPermRequest(pendingPermRequest.id, true)}
-											>
-												{t("pluginPermOnce")}
-											</button>
-											<button
-												type="button"
-												className="btn primary"
-												onClick={() => answerPermRequest(pendingPermRequest.id, true, true)}
-											>
-												{t("pluginPermAlways")}
-											</button>
-										</div>
-									</div>
-								</div>
-							)}
-							{pendingPathRequest && (
-								<div className="dialog-inline" data-dialog-kind="confirm">
-									<div className="dialog-head">
-										<span className="dialog-badge">{t("pluginRequest")}</span>
-										<span className="dialog-title">{t("pluginGrantRequestTitle")}</span>
-										<button
-											type="button"
-											className="dialog-dismiss"
-											title={t("cancel")}
-											onClick={() => answerPathRequest(pendingPathRequest.id, false)}
-										>
-											✕
-										</button>
-									</div>
-									<div className="dialog-body">
-										{t("pluginGrantRequestBody")
-											.replace("{plugin}", pendingPathRequest.pluginId)
-											.replace("{path}", pendingPathRequest.path)}
-										{pendingPathRequest.reason && <div className="dialog-hint">{pendingPathRequest.reason}</div>}
-										<div className="dialog-actions">
-											<button
-												type="button"
-												className="btn"
-												onClick={() => answerPathRequest(pendingPathRequest.id, false)}
-											>
-												{t("pluginGrantDeny")}
-											</button>
-											<button
-												type="button"
-												className="btn primary"
-												onClick={() => answerPathRequest(pendingPathRequest.id, true)}
-											>
-												{t("pluginGrantAllow")}
-											</button>
-										</div>
-									</div>
-								</div>
-							)}
-							{pluginPathConfirm && (
-								<div className="dialog-inline" data-dialog-kind="confirm">
-									<div className="dialog-head">
-										<span className="dialog-badge">{t("pluginRequest")}</span>
-										<span className="dialog-title">{t("pluginSessionGrantTitle")}</span>
-										<button
-											type="button"
-											className="dialog-dismiss"
-											title={t("cancel")}
-											onClick={() => {
-												pluginPathConfirm.resolve(false);
-												setPluginPathConfirm(null);
-											}}
-										>
-											✕
-										</button>
-									</div>
-									<div className="dialog-body">
-										{t("pluginSessionGrantBody").replace("{path}", pluginPathConfirm.path)}
-										<div className="dialog-actions">
-											<button
-												type="button"
-												className="btn"
-												onClick={() => {
-													pluginPathConfirm.resolve(false);
-													setPluginPathConfirm(null);
-												}}
-											>
-												{t("cancel")}
-											</button>
-											<button
-												type="button"
-												className="btn primary"
-												onClick={() => {
-													pluginPathConfirm.resolve(true);
-													setPluginPathConfirm(null);
-												}}
-											>
-												{t("ok")}
-											</button>
-										</div>
-									</div>
-								</div>
-							)}
 							{chat.question && (
 								<DshQuestionDialog
 									question={chat.question}
@@ -1881,6 +1934,7 @@ export function App() {
 								composerActions={uiSlots["composer.actions"]}
 								onUiAction={onUiAction}
 								streaming={chat.state?.isStreaming ?? false}
+								planMode={chat.state?.planMode ?? false}
 								messages={chat.state?.messages ?? EMPTY_MESSAGES}
 								slashCommands={chat.slashCommands}
 								modelState={modelState}
@@ -1985,7 +2039,75 @@ export function App() {
 					)}
 				</div>
 			</TemplateProvider>
-			<FooterBar chat={chat} bottombarItems={uiSlots["bottombar"]} onUiAction={onUiAction} />
+			<SideDock
+				side="left"
+				items={uiSidebarLeft}
+				chat={chat}
+				view={view}
+				onViewChange={(v: ViewName) => {
+					terminalOpenRequested.current = v === "terminal" && chat.terminals.length === 0;
+					if (terminalOpenRequested.current && createShell()) {
+						terminalOpenRequested.current = false;
+					}
+					setView(v);
+					setDrawer(null);
+				}}
+				onOpenPanel={setDrawer}
+				onOpenSettings={(sec) => {
+					setSettingsInitialSection(sec as any);
+					setSettingsOpen(true);
+				}}
+				onOpenBgTasks={() => setBgTasksOpen(true)}
+				onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
+				onUiAction={onUiAction}
+				uiContextTopbar={uiSlots["contextmenu.topbar"]}
+				onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
+				onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
+			/>
+			<SideDock
+				side="right"
+				items={uiSidebarRight}
+				chat={chat}
+				view={view}
+				onViewChange={(v: ViewName) => {
+					terminalOpenRequested.current = v === "terminal" && chat.terminals.length === 0;
+					if (terminalOpenRequested.current && createShell()) {
+						terminalOpenRequested.current = false;
+					}
+					setView(v);
+					setDrawer(null);
+				}}
+				onOpenPanel={setDrawer}
+				onOpenSettings={(sec) => {
+					setSettingsInitialSection(sec as any);
+					setSettingsOpen(true);
+				}}
+				onOpenBgTasks={() => setBgTasksOpen(true)}
+				onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
+				onUiAction={onUiAction}
+				uiContextTopbar={uiSlots["contextmenu.topbar"]}
+				onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
+				onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
+			/>
+			<FooterBar
+				chat={chat}
+				bottombarItems={uiSlots["bottombar"]}
+				onUiAction={onUiAction}
+				onOpenSettings={() => {
+					setSettingsInitialSection(undefined);
+					setSettingsOpen(true);
+				}}
+				onViewChange={(v: ViewName) => {
+					terminalOpenRequested.current = v === "terminal" && chat.terminals.length === 0;
+					if (terminalOpenRequested.current && createShell()) {
+						terminalOpenRequested.current = false;
+					}
+					setView(v);
+					setDrawer(null);
+				}}
+				onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
+				onOpenBgTasks={() => setBgTasksOpen(true)}
+			/>
 			{previewFile && (
 				<FilePreview
 					file={previewFile}
@@ -2034,6 +2156,7 @@ export function App() {
 					enrichModelsResult={chat.enrichModelsResult}
 					enrichModelsProgress={chat.enrichModelsProgress}
 					refreshBuiltinResult={chat.refreshBuiltinResult}
+					refreshProviderResult={chat.refreshProviderResult}
 					appendBuiltinResult={chat.appendBuiltinResult}
 					cloneProviderResult={chat.cloneProviderResult}
 					defaultModel={chat.defaultModel}
@@ -2047,6 +2170,10 @@ export function App() {
 					initialSection={settingsInitialSection}
 					onSwitchToTerminal={() => setView("terminal")}
 					onClose={() => setSettingsOpen(false)}
+					sound={sound}
+					onSoundChange={setSound}
+					tts={tts}
+					onTtsChange={setTts}
 				/>
 			)}
 			{bgTasksOpen && <BgTasksModal servers={chat.bgServers} onClose={() => setBgTasksOpen(false)} />}
@@ -2087,6 +2214,163 @@ export function App() {
 					openFile(path, name);
 				}}
 			/>
+			{/* 插件能力授权 / 目录访问确认顶层浮层：必须高于设置等弹窗（z-index > 300），确保安装插件或跨视图调用时无需叉掉设置页 */}
+			{(pendingPermRequest || pendingPathRequest || pluginPathConfirm) && (
+				<div className="modal-backdrop perm-modal-backdrop">
+					{pendingPermRequest && (
+						<div className="dialog-inline perm-dialog-card" data-dialog-kind="confirm">
+							<div className="dialog-head">
+								<span className="dialog-badge">{t("pluginRequest")}</span>
+								<span className="dialog-title">{t("pluginPermTitle")}</span>
+								<button
+									type="button"
+									className="dialog-dismiss"
+									title={t("cancel")}
+									onClick={() => answerPermRequest(pendingPermRequest.id, false)}
+								>
+									✕
+								</button>
+							</div>
+							<div className="dialog-body">
+								{pendingPermRequest.family === "net"
+									? t("pluginPermBodyNet")
+											.replace("{plugin}", pendingPermRequest.pluginId)
+											.replace("{hosts}", (pendingPermRequest.hosts ?? []).join(", "))
+									: t("pluginPermBodyLlm")
+											.replace("{plugin}", pendingPermRequest.pluginId)
+											.replace(
+												"{models}",
+												(pendingPermRequest.models ?? []).length > 0
+													? ` ${(pendingPermRequest.models ?? []).join(", ")}`
+													: "",
+											)}
+								{pendingPermRequest.reason && <div className="dialog-hint">{pendingPermRequest.reason}</div>}
+								<div className="dialog-actions">
+									<button type="button" className="btn" onClick={() => answerPermRequest(pendingPermRequest.id, false)}>
+										{t("pluginGrantDeny")}
+									</button>
+									<button type="button" className="btn" onClick={() => answerPermRequest(pendingPermRequest.id, true)}>
+										{t("pluginPermOnce")}
+									</button>
+									<button
+										type="button"
+										className="btn primary"
+										onClick={() => answerPermRequest(pendingPermRequest.id, true, true)}
+									>
+										{t("pluginPermAlways")}
+									</button>
+								</div>
+							</div>
+						</div>
+					)}
+					{pendingPathRequest && (
+						<div className="dialog-inline perm-dialog-card" data-dialog-kind="confirm">
+							<div className="dialog-head">
+								<span className="dialog-badge">{t("pluginRequest")}</span>
+								<span className="dialog-title">{t("pluginGrantRequestTitle")}</span>
+								<button
+									type="button"
+									className="dialog-dismiss"
+									title={t("cancel")}
+									onClick={() => answerPathRequest(pendingPathRequest.id, false)}
+								>
+									✕
+								</button>
+							</div>
+							<div className="dialog-body">
+								{t("pluginGrantRequestBody")
+									.replace("{plugin}", pendingPathRequest.pluginId)
+									.replace("{path}", pendingPathRequest.path)}
+								{pendingPathRequest.reason && <div className="dialog-hint">{pendingPathRequest.reason}</div>}
+								<div className="dialog-actions">
+									<button type="button" className="btn" onClick={() => answerPathRequest(pendingPathRequest.id, false)}>
+										{t("pluginGrantDeny")}
+									</button>
+									<button
+										type="button"
+										className="btn primary"
+										onClick={() => answerPathRequest(pendingPathRequest.id, true)}
+									>
+										{t("pluginGrantAllow")}
+									</button>
+								</div>
+							</div>
+						</div>
+					)}
+					{pluginPathConfirm && (
+						<div className="dialog-inline perm-dialog-card" data-dialog-kind="confirm">
+							<div className="dialog-head">
+								<span className="dialog-badge">{t("pluginRequest")}</span>
+								<span className="dialog-title">{t("pluginSessionGrantTitle")}</span>
+								<button
+									type="button"
+									className="dialog-dismiss"
+									title={t("cancel")}
+									onClick={() => {
+										pluginPathConfirmRef.current = null;
+										pluginPathConfirm.resolve(false);
+										setPluginPathConfirm(null);
+									}}
+								>
+									✕
+								</button>
+							</div>
+							<div className="dialog-body">
+								{t("pluginSessionGrantBody").replace("{path}", pluginPathConfirm.path)}
+								<div className="dialog-actions">
+									<button
+										type="button"
+										className="btn"
+										onClick={() => {
+											pluginPathConfirmRef.current = null;
+											pluginPathConfirm.resolve(false);
+											setPluginPathConfirm(null);
+										}}
+									>
+										{t("cancel")}
+									</button>
+									<button
+										type="button"
+										className="btn primary"
+										onClick={() => {
+											pluginPathConfirmRef.current = null;
+											pluginPathConfirm.resolve(true);
+											setPluginPathConfirm(null);
+										}}
+									>
+										{t("ok")}
+									</button>
+								</div>
+							</div>
+						</div>
+					)}
+				</div>
+			)}
+			{/* 当设置面板关闭但在后台有插件正在安装/更新/卸载时，在界面右上角提示轻量进度条，点击可重新打开设置面板 */}
+			{!settingsOpen && Object.values(chat.pluginJobs ?? {}).some((j) => j.phase !== "done") && (
+				<div
+					className="active-plugin-jobs-bar"
+					onClick={() => {
+						setSettingsInitialSection("plugins");
+						setSettingsOpen(true);
+					}}
+					title={t("pluginJobRunning")}
+				>
+					<FiRefreshCw className="spin" />
+					<span className="active-plugin-jobs-title">
+						{t("pluginJobRunning")}:{" "}
+						{Object.values(chat.pluginJobs ?? {})
+							.filter((j) => j.phase !== "done")
+							.map((j) => j.pluginId)
+							.join(", ")}
+					</span>
+					{(() => {
+						const firstRunning = Object.values(chat.pluginJobs ?? {}).find((j) => j.phase !== "done");
+						const lastLine = firstRunning?.lines[firstRunning.lines.length - 1];
+						return lastLine ? <span className="active-plugin-jobs-line">{lastLine}</span> : null;
+					})()}
+				</div>
+			)}
 			<BannerContainer />
 		</div>
 	);

@@ -71,8 +71,9 @@ export function unzipFiles(buf: Buffer, wanted: string[]): Map<string, Buffer> {
 	let totalUncomp = 0;
 	const out = new Map<string, Buffer>();
 	for (const [name, meta] of files) {
-		totalUncomp += meta.uncompSize;
-		if (totalUncomp > OFFICE_MAX_UNCOMPRESSED_BYTES) throw new Error("解包后内容过大（疑似 zip 炸弹），拒绝预览");
+		if (meta.uncompSize > OFFICE_MAX_UNCOMPRESSED_BYTES) {
+			throw new Error("解包后内容过大（疑似 zip 炸弹），拒绝预览");
+		}
 		const lp = meta.localOffset;
 		if (buf.readUInt32LE(lp) !== 0x04034b50) throw new Error(`zip 局部头损坏：${name}`);
 		const lMethod = buf.readUInt16LE(lp + 8);
@@ -82,42 +83,93 @@ export function unzipFiles(buf: Buffer, wanted: string[]): Map<string, Buffer> {
 		const raw = buf.subarray(dataStart, dataStart + meta.compSize);
 		if (meta.flag & 0x1) throw new Error(`不支持加密 zip 条目：${name}`);
 		const method = lMethod || meta.method;
-		if (method === 0) out.set(name, Buffer.from(raw));
-		else if (method === 8) out.set(name, Buffer.from(inflateRawSync(raw)));
-		else throw new Error(`不支持的压缩方式 ${method}：${name}`);
+		let decompressed: Buffer;
+		if (method === 0) {
+			decompressed = Buffer.from(raw);
+		} else if (method === 8) {
+			const remainingQuota = OFFICE_MAX_UNCOMPRESSED_BYTES - totalUncomp;
+			if (remainingQuota <= 0) throw new Error("解包后内容过大（疑似 zip 炸弹），拒绝预览");
+			try {
+				decompressed = Buffer.from(inflateRawSync(raw, { maxOutputLength: remainingQuota }));
+			} catch (err) {
+				if (
+					(err as Error).message?.includes("maxOutputLength") ||
+					(err as { code?: string }).code === "ERR_BUFFER_TOO_LARGE"
+				) {
+					throw new Error("解包后内容过大（疑似 zip 炸弹），拒绝预览");
+				}
+				throw err;
+			}
+		} else {
+			throw new Error(`不支持的压缩方式 ${method}：${name}`);
+		}
+		totalUncomp += decompressed.length;
+		if (totalUncomp > OFFICE_MAX_UNCOMPRESSED_BYTES) {
+			throw new Error("解包后内容过大（疑似 zip 炸弹），拒绝预览");
+		}
+		out.set(name, decompressed);
 	}
 	return out;
 }
 
+const NAMED_ENTITIES: Record<string, string> = { lt: "<", gt: ">", amp: "&", quot: '"', apos: "'" };
+
+/**
+ * 单轮解码命名实体与十/十六进制数字实体（一次扫描同时匹配三类）。
+ *
+ * 旧实现分三段 replace：`&amp;#60;` 会先被命名段解码成 `&#60;`、再被数字段
+ * 解码成 `<`——双重解码让转义文本"逃出"字面量（可注入标签）。单轮扫描把
+ * `&…;` 整体消费、解码产物不参与后续匹配：`&amp;#60;` 正确地得到 `&#60;`。
+ */
 function decodeEntities(s: string): string {
-	return String(s ?? "")
-		.replace(
-			/&(lt|gt|amp|quot|apos);/g,
-			(_, e: string) => ({ lt: "<", gt: ">", amp: "&", quot: '"', apos: "'" })[e] as string,
-		)
-		.replace(/&#(\d+);/g, (_, n: string) => {
-			try {
-				return String.fromCodePoint(Number(n));
-			} catch {
-				return "";
+	return String(s ?? "").replace(
+		/&(?:#([0-9]+);|#x([0-9a-fA-F]+);|([a-zA-Z]+);)/g,
+		(_whole, dec: string | undefined, hex: string | undefined, name: string | undefined) => {
+			if (dec !== undefined) {
+				try {
+					return String.fromCodePoint(Number(dec));
+				} catch {
+					return "";
+				}
 			}
-		})
-		.replace(/&#x([0-9a-fA-F]+);/g, (_, h: string) => {
-			try {
-				return String.fromCodePoint(Number.parseInt(h, 16));
-			} catch {
-				return "";
+			if (hex !== undefined) {
+				try {
+					return String.fromCodePoint(Number.parseInt(hex, 16));
+				} catch {
+					return "";
+				}
 			}
-		});
+			// 未知的命名实体保留原文（与旧实现一致，不臆造映射）
+			return NAMED_ENTITIES[name ?? ""] ?? _whole;
+		},
+	);
 }
 
 const stripTags = (s: string): string => decodeEntities(String(s ?? "").replace(/<[^>]+>/g, ""));
+
+/** document.xml 解压后的字节上限：超大 XML 会让段落正则扫描退化成秒级卡顿（同步事件循环被挂死）。 */
+const DOCX_MAX_XML_BYTES = 20 * 1024 * 1024;
 
 /** docx → 段落数组。 */
 export function parseDocxParagraphs(buf: Buffer): string[] {
 	const files = unzipFiles(buf, ["word/document.xml"]);
 	const xml = files.get("word/document.xml")?.toString("utf8");
 	if (!xml) throw new Error("docx 里找不到 word/document.xml");
+	// 预检 1：解压后过大的 document.xml 在下面的正则扫描里代价爆炸（一次性物化
+	// 全部段落、非贪婪匹配最坏回溯到文本末尾），直接友好报错而不是挂住进程。
+	if (xml.length > DOCX_MAX_XML_BYTES) {
+		throw new Error(
+			`文档内容过大（document.xml 解压后 ${(xml.length / 1048576).toFixed(1)} MB，上限 20 MB），拒绝预览`,
+		);
+	}
+	// 预检 2：正常文档的段落闭合标签与开标签同量级。"只有开标签、没有闭标签"
+	// 的恶意结构会让非贪婪正则在每个候选起点都回溯扫描到文本末尾（O(n²)），
+	// 同步挂死事件循环——开标签远多于闭标签（>2 倍）且闭标签为 0 时直接报错。
+	const opens = xml.match(/<w:p[\s>]/g)?.length ?? 0;
+	const closes = xml.match(/<\/w:p>/g)?.length ?? 0;
+	if (opens > 0 && closes === 0) {
+		throw new Error("文档结构异常（段落标签大量未闭合），疑似恶意文档，拒绝预览");
+	}
 	const paragraphs: string[] = [];
 	for (const m of xml.matchAll(/<w:p[\s>][\s\S]*?<\/w:p>/g)) {
 		const pXml = m[0];
@@ -170,11 +222,23 @@ export interface XlsxSheet {
 	truncated: boolean;
 }
 
-function parseSheet(xml: string, shared: string[]): string[][] {
+const MAX_PARSE_ROWS = 1000;
+const MAX_PARSE_COLS = 100;
+
+function parseSheet(xml: string, shared: string[]): { rows: string[][]; nRows: number; nCols: number } {
 	const rows: string[][] = [];
+	let maxRowSeen = 0;
+	let maxColSeen = 0;
 	for (const m of xml.matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)) {
 		const rowAttr = m[0].slice(0, m[0].indexOf(">"));
-		const rNum = Number(/r="(\d+)"/.exec(rowAttr)?.[1] ?? rows.length + 1) - 1;
+		const rawRNum = /r="(\d+)"/.exec(rowAttr)?.[1];
+		const rNum = rawRNum ? Number(rawRNum) - 1 : rows.length;
+		if (!Number.isFinite(rNum) || rNum < 0) continue;
+		maxRowSeen = Math.max(maxRowSeen, rNum + 1);
+
+		// 防 OOM：巨大行号不进行无边界预分配，仅计入总量
+		if (rNum >= MAX_PARSE_ROWS) continue;
+
 		while (rows.length <= rNum) rows.push([]);
 		const row = rows[rNum];
 		for (const c of m[1].matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/g)) {
@@ -182,7 +246,12 @@ function parseSheet(xml: string, shared: string[]): string[][] {
 			const ref = /r="([^"]+)"/.exec(attrs)?.[1];
 			const t = /t="([^"]+)"/.exec(attrs)?.[1];
 			const pos = splitCellRef(ref ?? "");
-			if (!pos) continue;
+			if (!pos || pos.col < 0) continue;
+			maxColSeen = Math.max(maxColSeen, pos.col + 1);
+
+			// 防 OOM：巨大列号不进行无边界空字符串 push
+			if (pos.col >= MAX_PARSE_COLS) continue;
+
 			const inner = c[2];
 			let val = "";
 			if (t === "inlineStr") {
@@ -200,7 +269,11 @@ function parseSheet(xml: string, shared: string[]): string[][] {
 			row[pos.col] = val;
 		}
 	}
-	return rows;
+	return {
+		rows,
+		nRows: Math.max(rows.length, maxRowSeen),
+		nCols: Math.max(Math.max(0, ...rows.map((r) => r.length)), maxColSeen),
+	};
 }
 
 /** xlsx/xlsm → sheet 数组（名按 workbook 还原，取不到时回落 sheetN）。 */
@@ -230,20 +303,21 @@ export function parseXlsxSheets(buf: Buffer): XlsxSheet[] {
 	const shared = parseSharedStrings(files.get("xl/sharedStrings.xml")?.toString("utf8"));
 	return targets.map((t) => {
 		const xml = files.get(t.file)?.toString("utf8");
-		const all = xml ? parseSheet(xml, shared) : [];
-		const fullCols = Math.max(0, ...all.map((r) => r.length));
+		const parsed = xml ? parseSheet(xml, shared) : { rows: [], nRows: 0, nCols: 0 };
+		const fullCols = parsed.nCols;
+		const fullRows = parsed.nRows;
 		const nCols = Math.min(MAX_COLS, fullCols);
-		const cut = all.slice(0, MAX_ROWS).map((r) => {
+		const cut = parsed.rows.slice(0, MAX_ROWS).map((r) => {
 			const row = r.slice(0, MAX_COLS);
 			while (row.length < nCols) row.push("");
 			return row;
 		});
 		return {
 			name: t.name,
-			nRows: all.length,
+			nRows: fullRows,
 			nCols: fullCols,
 			rows: cut,
-			truncated: all.length > MAX_ROWS || fullCols > MAX_COLS,
+			truncated: fullRows > MAX_ROWS || fullCols > MAX_COLS,
 		};
 	});
 }

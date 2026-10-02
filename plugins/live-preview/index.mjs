@@ -90,13 +90,21 @@ export function renderMarkdown(src, title) {
 			listTag = "";
 		}
 	};
+	// #501：href/src 的 scheme 白名单——预览页与主应用同源，`javascript:` 链接一旦
+	// 可点击即等同主应用执行面。http/https/mailto 与相对路径放行，其余 scheme
+	// （javascript:、data:、vbscript: 等）一律置为失效锚点。与主应用 MdLink 对齐。
+	const safeUrl = (u) => {
+		const t = String(u).trim();
+		if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(t)) return t; // 无 scheme = 相对路径
+		return /^(https?:|mailto:)/i.test(t) ? t : "#";
+	};
 	const inline = (t) => {
 		let s = escHtml(t);
 		const codes = [];
 		s = s.replace(/`([^`]+)`/g, (_, c) => `@@CODE${codes.push(c) - 1}@@`);
 		s = s
-			.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img alt="$1" src="$2">')
-			.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+			.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, src) => `<img alt="${alt}" src="${safeUrl(src)}">`)
+			.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, href) => `<a href="${safeUrl(href)}">${text}</a>`)
 			.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
 			.replace(/(^|\W)\*([^*\n]+)\*/g, "$1<em>$2</em>")
 			.replace(/@@CODE(\d+)@@/g, (_, n) => `<code>${codes[Number(n)]}</code>`);
@@ -413,17 +421,17 @@ export default {
 			host.registerAgentTool({
 				name: "live_preview",
 				description:
-					"打开工作区文件/文件夹的 Live Server 式预览：HTML（含相对资源与自动刷新）走 /liveserver/，Markdown 渲染走 /md/。path 可给文件或目录（缺省根目录）。返回同源预览地址；浏览器会自动在新标签打开（被拦截时点结果里的链接）。",
+					"Open a Live Server-style preview of a workspace file or folder: HTML (relative assets, auto-refresh) is served under /liveserver/, Markdown rendering under /md/. path may be a file or a directory (defaults to the workspace root). Returns a same-origin preview URL; the browser opens it in a new tab automatically (click the link in the result if the popup was blocked).",
 				parameters: {
 					type: "object",
 					properties: {
 						path: {
 							type: "string",
-							description: "工作区相对路径，如 index.html、docs/a.md；缺省列出根目录。",
+							description: "Workspace-relative path, e.g. index.html or docs/a.md; omit to preview the root.",
 						},
 						open: {
 							type: "boolean",
-							description: "为 false 时只返回地址、不自动打开新标签（默认自动打开）。",
+							description: "When false, only return the URL without opening a new tab (default: open automatically).",
 						},
 					},
 				},

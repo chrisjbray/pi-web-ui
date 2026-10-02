@@ -63,7 +63,6 @@ export function describeTodos(state: TodoState, includeDeleted = false, lang: Se
 }
 
 const TODO_GUIDANCE_ZH: string[] = [
-	"# 内联标记工具（状态类操作请写在回答正文，不要调用工具）",
 	"- 标记语法：[[todo:new:<主题>]] 新建；[[todo:set:<id>,completed|in_progress|pending]] 状态；[[todo:remove:<id>]] 删除；[[todo:dep:<id>,blocks=<依赖id,逗号分隔>]] 设依赖。",
 	"- 状态变化全部用上面的 [[todo:...]] 内联标记表达，不会中断回答，无需等待返回。",
 	"- 想查看/list 当前任务列表时，才用 `todo_list` 工具（读操作走工具）。",
@@ -71,7 +70,6 @@ const TODO_GUIDANCE_ZH: string[] = [
 ];
 
 const TODO_GUIDANCE_EN: string[] = [
-	"# Inline marker tools (express state changes inline in your reply text — never call a tool for them)",
 	"- Marker syntax: [[todo:new:<subject>]] to create; [[todo:set:<id>,completed|in_progress|pending]] for status; [[todo:remove:<id>]] to delete; [[todo:dep:<id>,blocks=<dep ids, comma-separated>]] to set dependencies.",
 	"- Express all status changes with the [[todo:...]] inline markers above; they never interrupt your reply and need no waiting for a result.",
 	"- Only use the `todo_list` tool (the read path goes through the tool) when you want to list the current tasks.",
@@ -98,7 +96,9 @@ export const todoMarker: MarkerTool<TodoState> = {
 		const op = token.op;
 		switch (op) {
 			case "new": {
-				const subject = token.args[0]?.trim();
+				// #499：subject 是唯一「整段自由文本」参数——args.join 还原含逗号的主题，
+				// 否则 `[[todo:new:修复登录页,同步改注册页]]` 的后半段被静默丢弃。
+				const subject = token.args.join(",").trim();
 				if (!subject)
 					return {
 						applied: false,
@@ -292,7 +292,8 @@ export const todoMarker: MarkerTool<TodoState> = {
 					feedback: pick(
 						lang,
 						`#${id} 依赖：${depsText}`,
-						`#${id} blocks: ${depsText}`,
+						// #499：实现是 blockedBy（deps 先完成）——原英文 "blocks" 把依赖方向说反了。
+						`#${id} is blocked by: ${depsText}`,
 						"markers.todo.dep.blocks.updated",
 						{ id: id, depsText: depsText },
 					),

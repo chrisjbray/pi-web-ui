@@ -11,8 +11,9 @@
  * - 与 per-client 的 client-state.json 不同：按 sessionId 全局存，跨标签页可见。
  * - 文件 I/O 一律 best-effort：持久化故障绝不能弄崩 server（同 subagent-templates）。
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { readFileSync, renameSync } from "node:fs";
+import { basename } from "node:path";
+import { writeJsonAtomicSync } from "./atomic-file.js";
 
 /** 单条草稿上限字符数：超出截断再存（快照全量下发时携带，太大浪费流量）。 */
 export const DRAFT_TEXT_MAX = 20_000;
@@ -68,6 +69,14 @@ export class ComposerDraftsStore {
 		try {
 			raw = JSON.parse(readFileSync(this.filePath, "utf8")) as Record<string, unknown>;
 		} catch {
+			// 坏文件改名留存而非直接覆盖：先有留存，后续 save 落盘的才是新数据
+			//（否则一次解析失败 → 空表 → 下次 save 把全部草稿的原始记录抹掉）。
+			try {
+				renameSync(this.filePath, `${this.filePath}.corrupt-${Date.now()}`);
+				console.warn(`[composer-drafts] 草稿文件解析失败，已改名留存：${this.filePath}（丢草稿可重打，不留坏副本）`);
+			} catch {
+				// 改名失败（占用等）也无妨：空表继续，save 时照常覆盖
+			}
 			raw = {};
 		}
 		const now = Date.now();
@@ -93,10 +102,7 @@ export class ComposerDraftsStore {
 	private persist(): void {
 		if (!this.cache) return;
 		try {
-			mkdirSync(dirname(this.filePath), { recursive: true });
-			const tmp = `${this.filePath}.tmp-${process.pid}`;
-			writeFileSync(tmp, JSON.stringify(this.cache, null, 2) + "\n");
-			renameSync(tmp, this.filePath);
+			writeJsonAtomicSync(this.filePath, this.cache);
 		} catch {
 			// best-effort：草稿丢了可以重打，server 绝不能因此崩。
 		}

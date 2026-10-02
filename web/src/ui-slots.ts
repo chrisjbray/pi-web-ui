@@ -34,6 +34,19 @@ import type {
 	UiSlotId,
 } from "./types";
 
+export type {
+	UiAlign,
+	UiArrangeOp,
+	UiSlotCardinality,
+	UiSlotSpec,
+	UiContribution,
+	UiItemKind,
+	UiLayoutPrefs,
+	UiPluginInfo,
+	UiSelectOption,
+	UiSlotId,
+};
+
 /**
  * 合并过程中的一条**诊断**（P0-1：失败不许静默）。与「静默丢弃」相对：未知 slot /
  * 未知 kind / 非法 when / arrange 目标不存在 / 重复 id 覆盖 / 插件被禁用或激活失败，
@@ -141,6 +154,8 @@ const SLOT_IDS: UiSlotId[] = [
 	"contextmenu.toolcall",
 	"settings.pages",
 	"modal.dialog",
+	"sidebar.left",
+	"sidebar.right",
 ];
 
 /**
@@ -215,7 +230,8 @@ export function applyUiSlotCardinality<T extends { id: string; hidden: boolean }
  *                    （align=start，发送簇 align=end），与插件贡献的动作按同一顺序统一渲染。
  *                    隐藏只藏按钮（回车仍可发送）；发送簇藏掉后运行中的停止键一起消失，
  *                    需要停止时从布局页恢复。composer.leading 仍是纯插件位（无内置条目），
- *                    渲染在上传按钮左侧。
+ *                    渲染在上传按钮左侧。**计划模式不在这一槽**（已搬到 goalbar.actions
+ *                    的 host:goal-plan）。
  *   settings.pages   不列内置（按契约：这一槽位是插件专属）。
  *   v8 新增槽位：file.preview.toolbar / leftpanel.sessions / terminal.toolbar /
  *                    scm.toolbar / goalbar.actions 均已登记宿主条目（见下表），与插件贡献
@@ -292,7 +308,7 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		id: "host:new-ephemeral-chat",
 		slot: "topbar.primary",
 		labelKey: "newChatEphemeral",
-		icon: "plus",
+		icon: "chat",
 		kind: "action",
 		order: 96.5,
 		group: "primary",
@@ -523,6 +539,16 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		order: 15,
 		group: "status",
 	},
+	// 审查者模式标识：开启时才画（渲染层看 state.delegateMode），点开执行对话。
+	{
+		id: "host:status-delegate",
+		slot: "bottombar",
+		labelKey: "delegateModeBadge",
+		icon: "eye",
+		kind: "badge",
+		order: 16,
+		group: "status",
+	},
 	{
 		id: "host:host-metrics",
 		slot: "bottombar",
@@ -547,6 +573,14 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 	},
 
 	// ---- 消息 hover 工具条（Message.tsx 的 .msg-actions / 卡片复制按钮） ----
+	{
+		id: "host:msg-reask",
+		slot: "message.actions",
+		labelKey: "reaskDirectly",
+		icon: "refresh",
+		kind: "action",
+		order: 9,
+	},
 	{
 		id: "host:msg-edit-reask",
 		slot: "message.actions",
@@ -590,6 +624,14 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		icon: "image",
 		kind: "action",
 		order: 23,
+	},
+	{
+		id: "host:msg-speak",
+		slot: "message.actions",
+		labelKey: "speakMsg",
+		icon: "volume",
+		kind: "action",
+		order: 24,
 	},
 
 	// ---- 输入框动作区（ChatInput.tsx 的 .composer-tools；顺序与可见性全部数据驱动） ----
@@ -711,6 +753,11 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		order: 20,
 	},
 	{ id: "host:goal-lock", slot: "goalbar.actions", labelKey: "goalBarLocked", icon: "lock", kind: "action", order: 30 },
+	// 计划模式（会话级「只规划不实施」）：从输入框工具条搬进目标条 —— 它是
+	// 「拿用户输入去规划」的前置开关，与目标同属一条语义线，所以只挂在**展开行**
+	// （编辑行），不进折叠药丸。目标模式被关掉（goalModeEnabled=false）时整条
+	// 目标区不渲染，它也跟着一起隐藏。
+	{ id: "host:goal-plan", slot: "goalbar.actions", labelKey: "planMode", icon: "list", kind: "action", order: 25 },
 	{
 		id: "host:goal-collapse",
 		slot: "goalbar.actions",
@@ -734,6 +781,23 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		icon: "hash",
 		kind: "action",
 		order: 60,
+	},
+	// 目标模式 2.0：执行者模型 + 打开执行对话。
+	{
+		id: "host:goal-execmodel",
+		slot: "goalbar.actions",
+		labelKey: "goalBarExecModel",
+		icon: "cpu",
+		kind: "action",
+		order: 55,
+	},
+	{
+		id: "host:goal-openrole",
+		slot: "goalbar.actions",
+		labelKey: "goalBarOpenExec",
+		icon: "search",
+		kind: "action",
+		order: 65,
 	},
 	{ id: "host:goal-clear", slot: "goalbar.actions", labelKey: "goalBarClear", icon: "x", kind: "action", order: 70 },
 
@@ -847,6 +911,17 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		kind: "action",
 		context: "session",
 		order: 1,
+	},
+	// 钉住 / 取消钉住：运行中的主对话行才有（子代理本来就永久保留，无意义）。
+	// 点后由 LeftPanel 按当前钉住状态翻转，文案在 showSessionMenu 里换。
+	{
+		id: "host:conv-pin",
+		slot: "contextmenu.session",
+		labelKey: "pinConversation",
+		icon: "pin",
+		kind: "action",
+		context: "session",
+		order: 2,
 	},
 	// 过户：只在“另一处”行出现（owner/convId 标识目标），点后整段对话（含等答复问卷）搬到本页。
 	{
@@ -1186,6 +1261,88 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		group: "danger",
 	},
 
+	// ---- 消息右键菜单（contextmenu.message，渲染与分派见 Message.tsx）----
+	{
+		id: "host:msg-ctx-copy-markdown",
+		slot: "contextmenu.message",
+		labelKey: "copyMarkdown",
+		icon: "markdown",
+		kind: "action",
+		context: "message",
+		order: 10,
+		group: "copy",
+	},
+	{
+		id: "host:msg-ctx-copy-text",
+		slot: "contextmenu.message",
+		labelKey: "copyText",
+		icon: "text",
+		kind: "action",
+		context: "message",
+		order: 11,
+		group: "copy",
+	},
+	{
+		id: "host:msg-ctx-copy-image",
+		slot: "contextmenu.message",
+		labelKey: "copyImage",
+		icon: "image",
+		kind: "action",
+		context: "message",
+		order: 12,
+		group: "copy",
+	},
+	{
+		id: "host:msg-ctx-reask",
+		slot: "contextmenu.message",
+		labelKey: "reaskDirectly",
+		icon: "refresh",
+		kind: "action",
+		context: "message",
+		order: 19,
+		group: "action",
+	},
+	{
+		id: "host:msg-ctx-edit-reask",
+		slot: "contextmenu.message",
+		labelKey: "editReask",
+		icon: "edit",
+		kind: "action",
+		context: "message",
+		order: 20,
+		group: "action",
+	},
+	{
+		id: "host:msg-ctx-fork",
+		slot: "contextmenu.message",
+		labelKey: "forkSession",
+		icon: "branch",
+		kind: "action",
+		context: "message",
+		order: 21,
+		group: "action",
+	},
+	{
+		id: "host:msg-ctx-rollback",
+		slot: "contextmenu.message",
+		labelKey: "rollbackSession",
+		icon: "undo",
+		kind: "action",
+		context: "message",
+		order: 22,
+		group: "action",
+	},
+	{
+		id: "host:msg-ctx-speak",
+		slot: "contextmenu.message",
+		labelKey: "speakMsg",
+		icon: "volume",
+		kind: "action",
+		context: "message",
+		order: 23,
+		group: "action",
+	},
+
 	// ---- 工具调用卡片的工具名右键菜单（contextmenu.toolcall，渲染与分派见 ToolCallBlock.tsx）----
 	// 今天只有一条：显示工具的定义说明（描述 + 参数 schema）。弹窗内容走 get_tool_info
 	// 按需取（定义不进快照）。插件可往本槽位加自己的条目（如「复制为 curl」），
@@ -1220,8 +1377,13 @@ export const LP_SECTION_ENTRY_IDS: ReadonlySet<string> = new Set([
 /** 插件视图 tab 的合成条目 id（`<pluginId>:__view`，`__view` 为保留字）。 */
 export const PLUGIN_VIEW_ITEM_ID = "__view";
 
-/** 宿主必须常驻顶栏的入口：不能被插件 arrange 或用户布局偏好隐藏。 */
-export const REQUIRED_TOPBAR_ITEM_IDS: ReadonlySet<string> = new Set(["host:settings"]);
+/** 宿主必须常驻顶栏的入口：不能被插件 arrange 或用户布局偏好隐藏。
+ *  - host:settings：用户找回其它入口与布局的最后通道；
+ *  - host:history / host:files：手机端左侧历史与右侧文件抽屉的唯一入口，不能被隐藏。 */
+export const REQUIRED_TOPBAR_ITEM_IDS: ReadonlySet<string> = new Set(["host:settings", "host:history", "host:files"]);
+
+/** 不在设置「界面布局」页中供用户管理的顶栏入口（手机端两侧列表唯一入口，直接去掉其设置）。 */
+export const HIDDEN_FROM_LAYOUT_ITEM_IDS: ReadonlySet<string> = new Set(["host:history", "host:files"]);
 
 /** 某个插件的视图条目全局 id（`<pluginId>:__view`）—— 顶栏与布局偏好的 key。 */
 export function pluginViewItemId(pluginId: string): string {
@@ -1284,7 +1446,8 @@ export function migrateBrandLayout<T extends UiLayoutPrefs>(src: T): T {
 		(src.order ?? []).some((id) => BRAND_OLD_IDS.includes(id)) ||
 		BRAND_OLD_IDS.some((id) => src.align?.[id] !== undefined) ||
 		BRAND_OLD_IDS.some((id) => src.groups?.[id] !== undefined) ||
-		BRAND_OLD_IDS.some((id) => src.labels?.[id] !== undefined);
+		BRAND_OLD_IDS.some((id) => src.labels?.[id] !== undefined) ||
+		BRAND_OLD_IDS.some((id) => src.slots?.[id] !== undefined);
 	if (!hasOld) return src;
 	const mapList = (list: string[] | undefined): string[] | undefined => {
 		if (!list) return undefined;
@@ -1326,6 +1489,19 @@ export function migrateBrandLayout<T extends UiLayoutPrefs>(src: T): T {
 		}
 		return out;
 	};
+	const foldSlots = (dict: Record<string, UiSlotId> | undefined): Record<string, UiSlotId> | undefined => {
+		if (!dict) return undefined;
+		const out: Record<string, UiSlotId> = {};
+		for (const [k, v] of Object.entries(dict)) {
+			if (BRAND_OLD_IDS.includes(k)) continue;
+			out[k] = v;
+		}
+		if (out[BRAND_ITEM_ID] === undefined) {
+			const picked = dict[BRAND_OLD_IDS[0]!] ?? dict[BRAND_OLD_IDS[1]!];
+			if (picked !== undefined) out[BRAND_ITEM_ID] = picked;
+		}
+		return out;
+	};
 	return {
 		...src,
 		...(src.hidden ? { hidden: mapList(src.hidden) } : {}),
@@ -1334,6 +1510,7 @@ export function migrateBrandLayout<T extends UiLayoutPrefs>(src: T): T {
 		...(src.groups ? { groups: foldDict(src.groups, true) } : {}),
 		...(src.labels ? { labels: foldDict(src.labels, false) } : {}),
 		...(src.align ? { align: foldAlign(src.align) } : {}),
+		...(src.slots ? { slots: foldSlots(src.slots) } : {}),
 	};
 }
 
@@ -1787,11 +1964,23 @@ export function buildUiSlots(
 		entry.label = label;
 		mark(id, "label");
 	}
-	// 设置是用户找回其它入口与布局的最后通道，必须留在顶栏。
+	for (const [id, targetSlot] of Object.entries(layout.slots ?? {})) {
+		const entry = byId.get(id);
+		if (!entry || !isSlotId(targetSlot)) continue;
+		if (entry.slot !== targetSlot) {
+			entry.movedFrom = entry.movedFrom ?? entry.slot;
+			entry.slot = targetSlot;
+			mark(id, "slot");
+		}
+	}
+	// 设置是用户找回其它入口与布局的最后通道，必须保证可见。
+	// 手机端历史对话与文件抽屉是两侧列表的唯一入口，必须常驻，不能被隐藏。
 	for (const id of REQUIRED_TOPBAR_ITEM_IDS) {
 		const entry = byId.get(id);
 		if (entry) {
-			entry.slot = "topbar.primary";
+			if (!layout.slots?.[id]) {
+				entry.slot = "topbar.primary";
+			}
 			entry.hidden = false;
 		}
 	}
@@ -1939,16 +2128,19 @@ export function restoreUiItem(layout: UiLayoutPrefs | undefined, id: string): Ui
 	let groups = omitKey(src.groups, id);
 	let labels = omitKey(src.labels, id);
 	let align = omitKey(src.align, id);
+	let slots = omitKey(src.slots, id);
 	if (id === BRAND_ITEM_ID) {
 		for (const old of BRAND_OLD_IDS) {
 			groups = omitKey(groups, old);
 			labels = omitKey(labels, old);
 			align = omitKey(align, old);
+			slots = omitKey(slots, old);
 		}
 	}
 	if (groups) next.groups = groups;
 	if (labels) next.labels = labels;
 	if (align) next.align = align;
+	if (slots) next.slots = slots;
 	// 非布局字段（顶栏文字开关等）原样保留 —— 单条恢复只动该条目。
 	if (src.topbarText !== undefined) next.topbarText = src.topbarText;
 	return next;

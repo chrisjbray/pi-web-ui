@@ -20,8 +20,9 @@
 // 模糊匹配继续禁用（假阳性比漏报更糟，见 conversation-touches 文件头）。
 // ---------------------------------------------------------------------------
 
-import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, resolve, sep } from "node:path";
+import { readFileSync, statSync, unlinkSync } from "node:fs";
+import { resolve, sep } from "node:path";
+import { writeJsonAtomicSync } from "./atomic-file.js";
 import { normalizeTouchPath, unionTouchLists, type TouchedFile } from "./conversation-touches.js";
 
 /** 认领默认 TTL：30 分钟（每次发 prompt 心跳续期，对话关闭时释放）。 */
@@ -238,10 +239,7 @@ export class ClaimStore {
 
 	private save(): void {
 		try {
-			mkdirSync(dirname(this.file), { recursive: true });
-			const tmp = `${this.file}.tmp`;
-			writeFileSync(tmp, JSON.stringify({ version: CLAIMS_FILE_VERSION, tables: Object.fromEntries(this.tables) }));
-			renameSync(tmp, this.file);
+			writeJsonAtomicSync(this.file, { version: CLAIMS_FILE_VERSION, tables: Object.fromEntries(this.tables) });
 		} catch {
 			// 持久化故障绝不能弄崩 server（内存表照常用）
 		}
@@ -306,9 +304,7 @@ export async function mergeTouchSidecar(sessionFile: string | undefined, fresh: 
 	if (!Array.isArray(fresh) || fresh.length === 0) return;
 	try {
 		const merged = unionTouchLists(readTouchSidecar(sessionFile) ?? [], fresh).slice(0, SIDECAR_MAX_ENTRIES);
-		const tmp = `${sidecarPath(sessionFile)}.tmp`;
-		writeFileSync(tmp, JSON.stringify({ version: 1, updatedAt: Date.now(), files: merged }));
-		renameSync(tmp, sidecarPath(sessionFile));
+		writeJsonAtomicSync(sidecarPath(sessionFile), { version: 1, updatedAt: Date.now(), files: merged });
 	} catch {
 		// sidecar 只是加速+防压缩丢失，写坏了下次重算
 	}

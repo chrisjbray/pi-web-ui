@@ -14,13 +14,16 @@
 // provider so built-in model lists follow the official pi.dev catalog
 // wholesale (no union merge / no stale built-in leftovers).
 import "./patch-remote-catalog.js";
+import "./patch-turn-end-boundary.js";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
+import * as fsPromises from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, rmSync, statSync, mkdirSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeAtomicSync } from "./atomic-file.js";
 import {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
@@ -51,6 +54,7 @@ import {
 	sortUpdateItems,
 	type UpdateItem,
 } from "./update-check.js";
+import { checkPluginUpdates } from "./plugin-updater.js";
 import { isBundledInUse, sdkCopies } from "./sdk-origin.js";
 import { hasActiveSubagentRun, hasPendingWaitSubscription, shouldRetainActive } from "./wait-subscription-scan.js";
 import {
@@ -85,7 +89,14 @@ import {
 	type ToolPreRequest,
 } from "./plugin-tool-guard.js";
 import { SettingsService } from "./settings-service.js";
-import { GoalService } from "./goal-service.js";
+import {
+	GoalService,
+	buildDiffFingerprint,
+	extractErrorSnippetFromSession,
+	lastToolNameOfSession,
+	type GoalConversation,
+	type RoleWaitOutcome,
+} from "./goal-service.js";
 import { MarkerService } from "./marker-service.js";
 import { SlashCommandsService, parseSlash } from "./slash-commands.js";
 import { ModelAdminService } from "./model-admin.js";
@@ -99,15 +110,17 @@ import {
 	normalizePathKey,
 	normalizeRetryMaxAttempts,
 	normalizeSkillList,
+	type ClientSettings,
 	type PromptMode,
 	ClientStateStore,
 } from "./client-state.js";
-import { bilingual, pick, resolveServerLang, type ServerLang } from "./i18n.js";
+import { pick, resolveServerLang, type ServerLang } from "./i18n.js";
 import { SubagentTemplatesStore, pickTemplatePrompt, type SubagentTemplate } from "./subagent-templates.js";
-import { ApprovalRulesStore, type ApprovalRule } from "./approval-rules.js";
+import { ApprovalRulesStore, extractTargetPath, type ApprovalRule } from "./approval-rules.js";
 import { ComposerDraftsStore } from "./composer-drafts.js";
 import { readPermissionFromSession } from "./permission-preset.js";
 import { createWorkspaceSnapshot, restoreWorkspaceSnapshot } from "./workspace-snapshot.js";
+import { isPathInsideRoot } from "./approval-rules.js";
 import {
 	approvalSuppressionReason,
 	checkDangerousToolCall,
@@ -118,6 +131,11 @@ import {
 	type ToolApprovalResolution,
 } from "./tool-approval.js";
 import { PlanManager } from "./plan-manager.js";
+import { buildPlanModePrompt, planModeDenial, planModeNoticeText, PLAN_MODE_BLOCKED_TOOL_NAMES } from "./plan-mode.js";
+import { DELEGATION_SYSTEM_PROMPT, delegationDenial, delegateNoticeText } from "./delegate-mode.js";
+import { goalReviewDenial, shouldDeferPromptForReview } from "./goal-review-gate.js";
+import { readPlanModeFromSession } from "./permission-preset.js";
+import { readDelegateModeFromSession } from "./permission-preset.js";
 
 import {
 	applyHeadTail,
@@ -133,6 +151,7 @@ import {
 	effectiveDisabledAgentTools,
 	isAgentToolEnabled,
 	isTerminalGuidanceOn,
+	localizedName,
 	MARKERS_LIST_TOOL_NAME,
 	PI_AGENT_PRESETS,
 	PI_PERMISSION_OPTIONS,
@@ -148,7 +167,15 @@ import { pruneContextHierarchically } from "./context-budget.js";
 import { decodeText } from "./text-sniff.js";
 import { makeEditSoftTool } from "./edit-soft-tool.js";
 // 覆盖 SDK 内置 read：路径是目录时列出目录条目（行为开关 readDirEnabled，默认开）。
-import { makeReadDirTool } from "./read-tool.js";
+// 覆盖定义与「与扩展同名工具共存」的注入辅助分在两个文件（后者的依据见 tool-overrides.ts）。
+import { makeReadDirTool, withReadDirSupport, type ReadDirToolOptions } from "./read-tool.js";
+import {
+	installToolOverrides,
+	syncSubagentOverride,
+	type AnyToolDefinition,
+	type OverrideSessionLike,
+	type ToolOverrideSpec,
+} from "./tool-overrides.js";
 // 展示文件给用户（present_files）：图片/视频内联、文本开预览弹窗、本地打开按钮。
 import { makePresentFilesTool } from "./present-files-tool.js";
 // 主动压缩上下文工具（compact_context）：AI 主动根据当前问题精简上下文并自主控制范围。
@@ -184,11 +211,13 @@ import { extractTouches, formatTouchesCompact, intersectTouches } from "./conver
 import { ClaimStore, matchClaims, mergeTouchSidecar, readTouchSidecar, removeTouchSidecar } from "./claim-store.js";
 import { makeClaimFilesTool, type ClaimFilesHost } from "./claim-files-tool.js";
 import { makeSkillTool, type SkillToolHost } from "./skill-tool.js";
+import { getCompactedMessages, type SessionManagerLike } from "./compacted-history.js";
 import { makeScheduleTools, type ScheduleToolHost } from "./schedule-agent-tool.js";
 import { makePatchTool } from "./patch-tool.js";
 import { makeLspTool } from "./lsp-tool.js";
 import { sameSessionFile, type SchedulerStore } from "./scheduler-tasks.js";
 import { buildAttachmentMessages, parseModelSpec } from "./attachments.js";
+import { formatQuotedPrompt, readTextQuote } from "./text-quote.js";
 import { buildVisionBridgePrompt, findVisionModels, transcribeImages } from "./vision-bridge.js";
 import { isNotRepoError, scmCommitContext } from "./scm.js";
 import { buildCommitMsgInput, buildCommitMsgPrompt, sanitizeCommitMessage } from "./scm-commitmsg.js";
@@ -196,8 +225,10 @@ import {
 	BUILTIN_SOUL,
 	DEFAULT_PROMPT_TEMPLATE,
 	buildToolsSchemaText,
+	estimatePromptTokens,
 	renderPromptTemplate,
 	resolveSectionTexts,
+	splitExtensionWrap,
 	type PromptComposerInputs,
 } from "./prompt-composer.js";
 import type {
@@ -215,6 +246,8 @@ import type {
 	UiApprovalPolicyState,
 	UiApprovalRule,
 	UiMessage,
+	UiPluginUpdateInfo,
+	PromptAttachment,
 	UiQuestion,
 	UiServiceInfo,
 	UiState,
@@ -222,10 +255,12 @@ import type {
 } from "./protocol.js";
 import { launchOrigin, toServiceInfo } from "./launch-origin.js";
 import {
+	findEntryByUiId,
 	serializeMessage,
 	serializeStreamingMessage,
 	stripTransientRetryErrors,
 	type AgentMessage,
+	type UiIdEntryLike,
 } from "./serialize.js";
 import { loadCommands, saveCommandsFile, TerminalManager } from "./terminals.js";
 
@@ -297,6 +332,27 @@ export class QuiesceRejectedError extends Error {
  *  "<inline:<name>>" 作为 path；扩展白名单/禁用过滤必须放行它。 */
 const INLINE_PERSONA_EXT = "<inline:pi-webui-persona>";
 
+/** 本次 run 的 SDK 原始提示词 + 早前扩展的首尾增补（见 splitExtensionWrap）。
+ *  导出仅为单测（tests/unit/persona-prompt-chain.test.ts）可达。
+ *  systemPromptOptions 就是 runner 里那个共享可变对象，forceSystemPrompt 有值即
+ *  说明前面有扩展替换过提示词；临时清掉再读 event.systemPrompt 就拿到原始基线
+ *  （公开字段，不碰 SDK 内部）。没人动过时零开销，直接返回当前文本。 */
+export function splitAgentStartPrompt(event: {
+	readonly systemPrompt: string;
+	systemPromptOptions?: { forceSystemPrompt?: string };
+}): { pre: string; core: string; post: string } {
+	const current = event.systemPrompt;
+	const opts = event.systemPromptOptions;
+	const forced = opts?.forceSystemPrompt;
+	if (!opts || typeof forced !== "string") return { pre: "", core: current, post: "" };
+	try {
+		opts.forceSystemPrompt = undefined;
+		return splitExtensionWrap(event.systemPrompt, current);
+	} finally {
+		opts.forceSystemPrompt = forced;
+	}
+}
+
 /** Pi 包文档路径（composer 的 {{pi_docs}} 自动内容用）。随安装位置解析一次。 */
 const PI_DOC_PATHS = (() => {
 	try {
@@ -336,7 +392,7 @@ Many legacy Chinese text files (.html/.txt/.md/.log, exported documents) are GBK
 export function makeKillableBashTool(
 	cwd: string,
 	kills: Set<AbortController>,
-	/** per-call 返回文本的服务端语言（默认英文）；工具 definition 走 bilingual 内联双语。 */
+	/** per-call 返回文本的服务端语言（默认英文）；工具 definition 为纯英文。 */
 	lang: () => ServerLang = () => "en",
 ): ToolDefinition {
 	const base = createLocalBashOperations();
@@ -362,7 +418,7 @@ export function makeKillableBashTool(
 		name: tool.name,
 		label: tool.label,
 		description:
-			"Run a shell command natively (process spawn, no terminal) and return its full output plus exit code — the SDK's plain bash tool. persist is ignored here (no terminal); use head/tail to trim the returned output.",
+			"Run a shell command natively (process spawn, no terminal); returns full output plus exit code. persist is ignored here; use head/tail to trim returned output.",
 		parameters: Type.Object({
 			command: Type.String({ description: "The shell command to run" }),
 			timeout: Type.Optional(Type.Number({ description: "Optional timeout in seconds" })),
@@ -420,9 +476,9 @@ export function makeAdaptiveBashTool(
 		...killable,
 		description:
 			"Run a shell command and return its full output plus exit code. Behavior depends on the「default bash override」setting (terminalBash):\n" +
-			"Setting OFF → runs natively (process spawn, no terminal) — the SDK's plain bash tool. persist has no effect.\n" +
-			"Setting ON → runs in a visible terminal. persist=true keeps that terminal alive ('ai-bash': shell state such as cd/venv/ssh retained across calls, silent commands move to the background and notify when done); persist=false (default in terminal mode) creates a one-shot terminal that exits when the command finishes while its output stays for review.\n" +
-			"Run the bare command — do NOT pipe through head/tail/more/less (use the head/tail parameters to trim the returned output instead; piping also hides live progress in the visible terminal). For interactive commands (REPLs, prompts, installers asking y/n) set persist=true (terminal mode) and drive them with terminal_input / terminal_key.",
+			"OFF → runs natively (process spawn, no terminal); persist has no effect.\n" +
+			"ON → runs in a visible terminal. persist=true keeps the 'ai-bash' terminal alive (shell state cd/venv/ssh retained across calls); persist=false (default) is a one-shot terminal whose output stays viewable.\n" +
+			"Run the bare command — never pipe through head/tail/more/less (use the head/tail params; pipes hide live progress). For interactive commands (REPLs, y/n prompts) set persist=true and drive them with terminal_input / terminal_key.",
 		promptSnippet: "run shell commands",
 		execute: (id, params, signal, onUpdate, ctx) => {
 			const p = params as { persist?: boolean };
@@ -466,6 +522,100 @@ export type AskApprovalFn = (
 	conversationId?: string,
 	category?: UiApprovalCategory,
 ) => Promise<ToolApprovalResolution>;
+
+/**
+ * 计划模式闸门装饰（通用）：套在任何工具定义外层，只在**执行前**判定一次。
+ * 与权限沙箱/插件守卫平行且更靠外 —— 计划模式是会话级硬约束，不给任何
+ * 「记住同类/全部允许」的口子（允许了就等于放开了实施）。
+ * 关闭时零开销（返回原定义，不包 execute）。
+ */
+export function withPlanModeGate(
+	def: ToolDefinition,
+	planMode: () => boolean,
+	getLang: () => ServerLang,
+): ToolDefinition {
+	return {
+		...def,
+		execute: (async (...args: unknown[]) => {
+			if (planMode()) {
+				const params = args[1];
+				const denied = planModeDenial(def.name, params);
+				if (denied) {
+					const reason = pick(getLang(), denied.reason, denied.reasonEn);
+					const err = new Error(reason);
+					(err as unknown as Record<string, unknown>).details = {
+						guardDenied: true,
+						planModeDenied: true,
+						kind: denied.kind,
+					};
+					throw err;
+				}
+			}
+			return (def.execute as (...a: unknown[]) => unknown)(...args);
+		}) as ToolDefinition["execute"],
+	};
+}
+
+/**
+ * 目标审查回合闸门（server/goal-review-gate.ts）：主对话在 `awaitingVerdict`
+ * 置位期间是审查者 —— 写类工具、非常规 bash、派发类工具、向用户提问一律拒。
+ * 形状与 withPlanModeGate / withDelegationGate 同构，串在最外层（理由最贴合
+ * 此刻：跟模型说「这是审查回合」比「这是计划/审查者模式」更有用）。闸门无状态
+ * （每次执行只读 `awaitingVerdict`），verdict 落定即自动恢复，不存在钉死。
+ */
+export function withGoalReviewGate(
+	def: ToolDefinition,
+	reviewTurn: () => boolean,
+	getLang: () => ServerLang,
+): ToolDefinition {
+	return {
+		...def,
+		execute: (async (...args: unknown[]) => {
+			if (reviewTurn()) {
+				const params = args[1];
+				const denied = goalReviewDenial(def.name, params);
+				if (denied) {
+					return {
+						content: [{ type: "text", text: pick(getLang(), denied.reason, denied.reasonEn) }],
+						details: { guardDenied: true, goalReviewDenied: true, kind: denied.kind },
+						isError: true,
+					} as never;
+				}
+			}
+			return (def.execute as (...a: unknown[]) => unknown)(...args);
+		}) as ToolDefinition["execute"],
+	};
+}
+
+/**
+ * 审查者模式闸门（server/delegate-mode.ts）：主对话只审阅不施工 ——
+ * 写类工具、非常规 bash、派发类工具一律拒。形状与 withPlanModeGate 同构，
+ * 串在它**外层**（两者都开时，先问计划模式还是审查者模式都不影响结果：
+ * 都是拒，只是理由不同）。
+ */
+export function withDelegationGate(
+	def: ToolDefinition,
+	delegateMode: () => boolean,
+	getLang: () => ServerLang,
+): ToolDefinition {
+	return {
+		...def,
+		execute: (async (...args: unknown[]) => {
+			if (delegateMode()) {
+				const params = args[1];
+				const denied = delegationDenial(def.name, params);
+				if (denied) {
+					return {
+						content: [{ type: "text", text: pick(getLang(), denied.reason, denied.reasonEn) }],
+						details: { guardDenied: true, delegateDenied: true, kind: denied.kind },
+						isError: true,
+					} as never;
+				}
+			}
+			return (def.execute as (...a: unknown[]) => unknown)(...args);
+		}) as ToolDefinition["execute"],
+	};
+}
 
 /**
  * 给已接管工具（bash/read）包上拦截守卫与人机协同审批：
@@ -514,23 +664,10 @@ export function withToolGuard(
 			let approvalReasonEn: string | undefined;
 			let approvalCategory: UiApprovalCategory | undefined;
 
-			if (pre?.verdict.decision === "deny") {
-				const text = denialText(pre.verdict, pre.pluginId ?? "plugin", lang);
-				return {
-					content: [{ type: "text", text }],
-					details: { guardDenied: true, decision: pre.verdict.decision, pluginId: pre.pluginId },
-				} as never;
-			} else if (pre?.verdict.decision === "ask") {
-				needApproval = true;
-				approvalReason = pre.verdict.reason ?? "插件要求确认本次操作";
-				approvalReasonEn = pre.verdict.reasonEn ?? "Plugin requested confirmation for this operation";
-				// 插件档位按插件 id 分：用户可以「允许同类」= 该插件的确认以后不再问。
-				approvalCategory = pluginApprovalCategory(pre.pluginId ?? "plugin");
-			}
-
-			// 内置高危操作检测（如 bash 破坏性命令等）与自定义审批规则
-			if (!needApproval && opts.cwd && opts.askApproval) {
-				const danger = checkDangerousToolCall(toolName, params, opts.cwd, opts.getRoots?.() ?? [], opts.getRules?.());
+			// 1. 系统核心安全：内置高危操作检测与自定义审批规则先行（优先级最高，防短路）
+			let danger: ReturnType<typeof checkDangerousToolCall> | undefined;
+			if (opts.cwd && opts.askApproval) {
+				danger = checkDangerousToolCall(toolName, params, opts.cwd, opts.getRoots?.() ?? [], opts.getRules?.());
 				if (danger.denied) {
 					const reasonText = danger.reason ? ` 原因：${danger.reason}` : "";
 					const reasonTextEn = danger.reasonEn ? ` Reason: ${danger.reasonEn}` : "";
@@ -545,12 +682,30 @@ export function withToolGuard(
 						isError: true,
 					} as never;
 				}
-				if (danger.dangerous) {
-					needApproval = true;
-					approvalReason = danger.reason;
-					approvalReasonEn = danger.reasonEn;
-					approvalCategory = danger.category;
-				}
+			}
+
+			// 2. 插件前置守卫 deny 拦截（带 isError 标记）
+			if (pre?.verdict.decision === "deny") {
+				const text = denialText(pre.verdict, pre.pluginId ?? "plugin", lang);
+				return {
+					content: [{ type: "text", text }],
+					details: { guardDenied: true, decision: pre.verdict.decision, pluginId: pre.pluginId },
+					isError: true,
+				} as never;
+			}
+
+			// 3. 决定是否需要弹窗审批（系统高危 ask 优先于插件通用 ask，防止恶意或低危插件掩盖高危告警）
+			if (danger?.dangerous) {
+				needApproval = true;
+				approvalReason = danger.reason;
+				approvalReasonEn = danger.reasonEn;
+				approvalCategory = danger.category;
+			} else if (pre?.verdict.decision === "ask") {
+				needApproval = true;
+				approvalReason = pre.verdict.reason ?? "插件要求确认本次操作";
+				approvalReasonEn = pre.verdict.reasonEn ?? "Plugin requested confirmation for this operation";
+				// 插件档位按插件 id 分：用户可以「允许同类」= 该插件的确认以后不再问。
+				approvalCategory = pluginApprovalCategory(pre.pluginId ?? "plugin");
 			}
 
 			let effectiveParams = params;
@@ -605,7 +760,7 @@ export function withToolGuard(
 
 			if (userEdited && result && typeof result === "object") {
 				result.details = {
-					...(result.details ?? {}),
+					...result.details,
 					userEdited: true,
 					originalParams: params,
 					executedParams: effectiveParams,
@@ -626,14 +781,18 @@ export function withToolGuard(
 	} as ToolDefinition;
 }
 
-/** 校验目标路径是否在工作区（或多根工作区）内。 */
+/** 校验目标路径是否在工作区（或多根工作区）内。严格规范化防止 ".." 逃逸与 Windows 盘符大小写不一致。 */
 function isInsideWorkspaceRoots(targetPath: string, cwd: string, roots: string[] = []): boolean {
-	const abs = isAbsolute(targetPath) ? targetPath : resolve(cwd, targetPath);
+	const abs = resolve(cwd, targetPath);
 	const allRoots = [resolve(cwd), ...roots.map((r) => resolve(r))];
-	return allRoots.some((r) => abs === r || abs.startsWith(r + sep));
+	return allRoots.some((r) => isPathInsideRoot(abs, r));
 }
 
-/** 为 write 工具包装会话级权限沙箱与人机协同审批。 */
+/**
+ * 为 write 工具包装会话级权限沙箱与人机协同审批。
+ * `base` = 覆盖基底：第三方扩展注册的同名 write 优先（见 tool-overrides.ts），
+ * 省略则是 SDK 内置实现 —— 于是权限门禁叠在扩展实现之上，而不是把它顶掉。
+ */
 function wrapWriteToolWithPermission(
 	cwd: string,
 	getPermission: () => string,
@@ -642,8 +801,8 @@ function wrapWriteToolWithPermission(
 	askApproval?: AskApprovalFn,
 	getConversationId?: () => string | undefined,
 	getRules?: () => ApprovalRule[],
+	base: AnyToolDefinition = createWriteToolDefinition(cwd),
 ): ToolDefinition {
-	const base = createWriteToolDefinition(cwd);
 	return {
 		...base,
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
@@ -664,7 +823,7 @@ function wrapWriteToolWithPermission(
 				} as never;
 			}
 			if (perm === "workspace-write-never") {
-				const p = (params as { path?: string })?.path ?? "";
+				const p = extractTargetPath(params);
 				if (!isInsideWorkspaceRoots(p, cwd, getRoots())) {
 					return {
 						content: [
@@ -741,7 +900,7 @@ function wrapWriteToolWithPermission(
 			};
 			if (userEdited && result && typeof result === "object") {
 				result.details = {
-					...(result.details ?? {}),
+					...result.details,
 					userEdited: true,
 					originalParams: params,
 					executedParams: effectiveParams,
@@ -752,7 +911,9 @@ function wrapWriteToolWithPermission(
 	} as ToolDefinition;
 }
 
-/** 为 edit 工具包装会话级权限沙箱与人机协同审批。 */
+/**
+ * 为 edit 工具包装会话级权限沙箱与人机协同审批（基底语义同 write）。
+ */
 function wrapEditToolWithPermission(
 	cwd: string,
 	getPermission: () => string,
@@ -761,8 +922,8 @@ function wrapEditToolWithPermission(
 	askApproval?: AskApprovalFn,
 	getConversationId?: () => string | undefined,
 	getRules?: () => ApprovalRule[],
+	base: AnyToolDefinition = createEditToolDefinition(cwd),
 ): ToolDefinition {
-	const base = createEditToolDefinition(cwd);
 	return {
 		...base,
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
@@ -783,7 +944,7 @@ function wrapEditToolWithPermission(
 				} as never;
 			}
 			if (perm === "workspace-write-never") {
-				const p = (params as { path?: string })?.path ?? "";
+				const p = extractTargetPath(params);
 				if (!isInsideWorkspaceRoots(p, cwd, getRoots())) {
 					return {
 						content: [
@@ -860,7 +1021,7 @@ function wrapEditToolWithPermission(
 			};
 			if (userEdited && result && typeof result === "object") {
 				result.details = {
-					...(result.details ?? {}),
+					...result.details,
 					userEdited: true,
 					originalParams: params,
 					executedParams: effectiveParams,
@@ -979,7 +1140,7 @@ function wrapEditSoftToolWithPermission(
 			};
 			if (userEdited && result && typeof result === "object") {
 				result.details = {
-					...(result.details ?? {}),
+					...result.details,
 					userEdited: true,
 					originalParams: params,
 					executedParams: effectiveParams,
@@ -993,7 +1154,7 @@ function wrapEditSoftToolWithPermission(
 /**
  * 结构化任务执行计划更新工具（plan_update）— Plan Mode / Step State Machine。
  */
-function makePlanUpdateTool(
+export function makePlanUpdateTool(
 	planManager: PlanManager,
 	getActiveConvId: () => string,
 	emit: (msg: ServerMessage) => void,
@@ -1003,20 +1164,29 @@ function makePlanUpdateTool(
 		name: PLAN_UPDATE_TOOL_NAME,
 		label: "plan_update",
 		description:
-			"Update the structured task execution plan / step state machine (Plan Mode). Use it for non-trivial tasks to break down work into steps, track live progress, and update status (pending -> in_progress -> done/failed).\n更新结构化任务执行计划（步骤状态机）。用于复杂工程任务拆解与实时进度推进。",
+			"Update the structured task plan / step state machine (Plan Mode): break non-trivial work into decision-ready steps and track progress (pending -> in_progress -> done/failed). Prefer steps that note discovery conclusions, files to be touched, and a rollback strategy.",
+		promptSnippet: "update structured task plan with decision-ready steps, file touch list, and live status",
+		promptGuidelines: [
+			"When executing non-trivial tasks, use plan_update early to outline decision-ready steps before coding: " +
+				"specify discovery conclusions, explicitly list files to be touched (File Touch List), and note potential rollback strategies",
+			"Keep step status updated as work progresses (pending -> in_progress -> done/failed) so the user has real-time visibility",
+		],
 		parameters: Type.Object({
 			steps: Type.Array(
 				Type.Object({
 					id: Type.String({ description: "Unique step ID, e.g. '1', 'step-1'" }),
 					title: Type.String({ description: "Short step title" }),
 					status: Type.Optional(
-						Type.Union(
-							[Type.Literal("pending"), Type.Literal("in_progress"), Type.Literal("done"), Type.Literal("failed")],
-							{ description: "Step status: pending | in_progress | done | failed (default: pending)" },
-						),
+						Type.Unsafe<"pending" | "in_progress" | "done" | "failed">({
+							type: "string",
+							enum: ["pending", "in_progress", "done", "failed"],
+							description: "Step status: pending | in_progress | done | failed (default: pending)",
+						}),
 					),
 					description: Type.Optional(
-						Type.String({ description: "Optional detailed description or acceptance criteria" }),
+						Type.String({
+							description: "Optional detailed description, acceptance criteria, file touch list, or rollback note.",
+						}),
 					),
 				}),
 				{ description: "List of plan steps" },
@@ -1084,16 +1254,16 @@ function makeMarkersListTool(
 ): ToolDefinition {
 	return {
 		name: MARKERS_LIST_TOOL_NAME,
+		promptSnippet: "list current inline-marker tasks (read-only — writes go through [[todo:...]] inline markers)",
 		label: "List marker state",
 		description:
-			"Read-only query of inline marker state. All WRITE operations must use inline markers ([[todo:new:...]] etc.) in the reply body — never use this tool for writes.\n只读查询内联标记状态。状态【写】操作请一律用内联标记（[[todo:new:...]] 等）写在回答正文里，不要调用本工具做写操作。",
+			"Read-only query of inline marker state. All WRITE operations must use inline markers ([[todo:new:...]] etc.) in the reply body — never this tool.",
 		parameters: Type.Object({
 			action: Type.Unsafe<string>({ enum: ["list"] }),
 			tool: Type.Optional(Type.Literal("todo")),
 			includeDeleted: Type.Optional(
 				Type.Boolean({
-					description:
-						"Whether to include deleted tasks (tombstones, todo only).\n是否包含已删除任务（tombstone，仅 todo）。",
+					description: "Include deleted tasks (tombstones, todo only).",
 				}),
 			),
 		}),
@@ -1134,37 +1304,44 @@ export function makeAskUserQuestionTool(
 	ownerId?: string,
 ): ToolDefinition {
 	const QuestionOptionSchema = Type.Object({
-		label: Type.String({ description: "Display label for the option" }),
-		description: Type.Optional(Type.String({ description: "Optional description shown below label" })),
+		label: Type.String({ description: "Display label (1-5 words)" }),
+		description: Type.Optional(
+			Type.String({
+				description: "Short explanation of impact/tradeoff",
+			}),
+		),
 		preview: Type.Optional(
 			Type.String({
-				description:
-					"Optional preview rendered below when this option is selected (markdown or HTML — use for mockups/code/config).",
+				description: "Optional preview (markdown/HTML/code)",
 			}),
 		),
 	});
 	const QuestionSchema = Type.Object({
-		id: Type.String({ description: "Unique identifier for this question" }),
-		question: Type.String({ description: "The full question text to display (markdown/HTML ok)" }),
-		detail: Type.Optional(Type.String({ description: "Optional detail/context shown under the question" })),
-		header: Type.Optional(Type.String({ description: "Optional short header for this question" })),
-		options: Type.Optional(Type.Array(QuestionOptionSchema, { description: "Available options to choose from" })),
-		multiSelect: Type.Optional(Type.Boolean({ description: "Allow selecting multiple options (default: false)" })),
+		id: Type.String({ description: "Unique identifier (snake_case)" }),
+		question: Type.String({ description: "Question text (markdown/HTML ok)" }),
+		detail: Type.Optional(Type.String({ description: "Optional context under question" })),
+		header: Type.Optional(Type.String({ description: "Optional short header" })),
+		options: Type.Optional(
+			Type.Array(QuestionOptionSchema, {
+				description: "2-4 choices (recommended option first)",
+				minItems: 2,
+				maxItems: 4,
+			}),
+		),
+		multiSelect: Type.Optional(Type.Boolean({ description: "Allow multiple choices (default: false)" })),
 		dependsOn: Type.Optional(
 			Type.Object({
-				questionId: Type.String({ description: "ID of the prior question this question depends on" }),
+				questionId: Type.String({ description: "Prior question ID" }),
 				value: Type.Optional(
 					Type.Union([Type.String(), Type.Array(Type.String())], {
-						description:
-							"Show this question only when the prior question's answer matches this value (or any in the array). Omit to show whenever answered.",
+						description: "Show when prior answer matches",
 					}),
 				),
 			}),
 		),
 		optionsMap: Type.Optional(
 			Type.Record(Type.String(), Type.Array(QuestionOptionSchema), {
-				description:
-					"Dynamic options based on prior question's chosen value: e.g. { 'React': [opts...], 'Vue': [opts...] }",
+				description: "Dynamic options keyed by prior answer",
 			}),
 		),
 	});
@@ -1172,28 +1349,31 @@ export function makeAskUserQuestionTool(
 		name: "ask_user_question",
 		label: "Ask the user",
 		description:
-			"Ask the user focused questions to pin down ambiguous requirements. Use for clarifying the task, confirming decisions, or getting preferences. Each question renders a browser dialog with markdown/HTML rich text; options may carry a `preview`. Submit or cancel to resume.",
-		promptSnippet: bilingual(
-			"ask the user focused questions to clarify ambiguous requirements (browser dialog with options/preview)",
-			"向用户提问以澄清含糊的需求（浏览器对话框，支持选项/预览）",
-		),
+			"Ask the user 1-3 focused questions to clarify requirements, confirm decisions, or choose options. " +
+			"Provide 2-4 choices (recommended first) with concise tradeoffs. " +
+			"Renders a rich browser dialog; resumes on submit or cancel.",
+		promptSnippet: "ask the user 1-3 focused questions with recommended options and tradeoffs to clarify requirements",
 		promptGuidelines: [
-			bilingual(
-				"When requirements are ambiguous, use ask_user_question to ask the user instead of guessing; prefer multiple-choice options, each option may carry a preview",
-				"需求含糊时用 ask_user_question 向用户提问而不是猜测；优先给多选选项，选项可带 preview 预览",
-			),
-			bilingual(
-				"A cancelled question comes back as a tool error — respect it and continue without re-asking immediately",
-				"用户取消提问会以工具错误返回——尊重取消决定，不要马上重复追问",
-			),
+			"When requirements are ambiguous, use ask_user_question to clarify: " +
+				"strictly 1 to 3 focused questions (prefer 1), 2-4 choices with recommended option first, and explain impact/tradeoff concisely",
+			"A cancelled question comes back as a tool error — respect it without immediately re-asking",
 		],
 		parameters: Type.Object({
-			questions: Type.Array(QuestionSchema, { description: "Questions to ask the user" }),
+			questions: Type.Array(QuestionSchema, {
+				description: "1-3 questions to ask (prefer 1)",
+				minItems: 1,
+				maxItems: 3,
+			}),
 		}),
 		execute: async (_id: string, params: unknown, signal: AbortSignal | undefined): Promise<unknown> => {
 			const qs = (params as { questions: UiQuestion[] }).questions;
 			if (!Array.isArray(qs) || qs.length === 0) {
 				throw new Error("ask_user_question requires at least one question");
+			}
+			if (qs.length > 3) {
+				throw new Error(
+					"ask_user_question allows at most 3 questions per call to prevent question fatigue (单次提问最多不得超过 3 个问题)",
+				);
 			}
 			const answers = await clientSession.askUser(
 				qs,
@@ -1326,8 +1506,8 @@ export function makeBrowserPageTool(
 		name: BROWSER_PAGE_TOOL_NAME,
 		label: "Browser page",
 		description: [
-			'Read or act on a page in the USER\'S OWN browser through the pi-web-ui page-picker extension (the extension talks to this page; the server only forwards the request). Only pages the user has explicitly allowed/paired in that extension can be touched. Call it with op:"pages" first to see which pages are currently available, and use it ONLY when the user asked you to read or operate a web page — never click/type on their pages on your own initiative.',
-			"ops (forwarded to the extension as-is, the server does not interpret them):",
+			'Read or act on a page in the USER\'S OWN browser via the pi-web-ui page-picker extension (the server only forwards). Only pages the user explicitly allowed/paired can be touched. Start with op:"pages" to list available pages, and use ONLY when the user asked you to read or operate a page — never click/type on their pages unprompted.',
+			"ops (forwarded to the extension as-is):",
 			"  pages  — no args; lists the pages you may act on",
 			'  read   — { what?: "text" | "html" | "title" | "url" | "query", selector?, all? }',
 			"  click  — { selector, index? }",
@@ -1338,19 +1518,12 @@ export function makeBrowserPageTool(
 			"  eval   — { code } runs JS inside the page (extension-side switch, off by default)",
 			"Op options that are not fields of this tool (e.g. read's `limit`) fall back to the extension's defaults. `target` selects the page by origin when more than one is allowed; `timeoutMs` is how long the SERVER waits for the browser (1000-120000, default 30000) before failing the call.",
 		].join("\n"),
-		promptSnippet: bilingual(
-			"read or operate a page in the user's browser (page-picker extension; allowed pages only)",
-			"读取/操作用户浏览器里已授权的页面（page-picker 扩展，仅限已授权页面）",
-		),
+		promptSnippet: "read or operate a page in the user's browser (page-picker extension; allowed pages only)",
 		promptGuidelines: [
-			bilingual(
-				"Only use browser_page when the user asked you to read or act on a page in their browser; never click or type on their pages on your own initiative",
-				"只在用户明确要求读取/操作浏览器页面时才用 browser_page；不要自作主张去点用户的页面",
-			),
-			bilingual(
-				'Start with op:"pages" to see which pages are available; the target page must already be allowed in the page-picker extension — when it fails, tell the user what to enable instead of retrying blindly',
-				'先用 op:"pages" 看有哪些可操作页面；目标页面必须已在 page-picker 扩展里授权——失败时把需要开什么告诉用户，不要盲目重试',
-			),
+			"Only use browser_page when the user asked you to read or act on a page in their browser; " +
+				"never click or type on their pages on your own initiative",
+			'Start with op:"pages" to see which pages are available; ' +
+				"the target page must already be allowed in the page-picker extension — when it fails, tell the user what to enable instead of retrying blindly",
 		],
 		parameters: Type.Object({
 			op: Type.String({
@@ -1554,6 +1727,14 @@ function pluginToolToDefinition(tool: PluginAgentTool): ToolDefinition {
  * unlikely to matter).
  */
 function contentFingerprint(m: AgentMessage): string {
+	const summary = (m as unknown as { summary?: string }).summary;
+	if (typeof summary === "string" && summary.length > 0) {
+		let h = 5381;
+		for (let i = 0; i < summary.length && i < 512; i++) {
+			h = ((h << 5) + h + summary.charCodeAt(i)) >>> 0;
+		}
+		return `sum:${h.toString(36)}:${summary.length}`;
+	}
 	const content = (m as unknown as { content?: unknown }).content;
 	if (!Array.isArray(content) || content.length === 0) return "empty";
 	const first = content[0] as { type?: string; text?: string; data?: string };
@@ -1627,6 +1808,10 @@ export interface Conversation {
 	/** 子代理模板带非空扩展白名单时为 true：插件/MCP 工具不进该会话（工厂期不注
 	 *  册、refreshPluginTools 不补），与 skills/extensionsOverride 的白名单语义对齐。 */
 	subagentBarsPluginTools?: boolean;
+	/** 子代理派发时套用的模板快照（runtime factory 的 apply 参数）。forceReset
+	 *  重建 runtime 时必须原样复用 —— 否则被看门狗强杀的子代理重建后会回落主
+	 *  会话的 system prompt/技能/扩展白名单（模板形同虚设）。 */
+	subagentTemplate?: SubagentTemplate;
 	/** 子代理最近一次运行报错的文本（快照 error 字段的只读缓存位），消息内容不变 /
 	 *  会话重建时保留，避免重复向主对话发 notice（subagentErrorNotified 是去重键）。 */
 	subagentError?: string;
@@ -1647,6 +1832,10 @@ export interface Conversation {
 	 *  它在左栏「运行的对话」里的可见性还额外包括「当前对话 + 已经有内容」——
 	 *  见 shownInRunningList（#140），那是纯展示口径，不改这个标记的语义。 */
 	listed: boolean;
+	/** 用户显式钉住（常驻运行列表）：置换决策无条件保留（见 shouldRetainActive
+	 *  的 pinned 判据），空闲无终端也不随切换释放；显式 dismiss / 强行关闭才移出。
+	 *  本会话进程内有效，不落盘（重启后按历史重开时不再钉）。 */
+	pinned?: boolean;
 	/** A prompt was sent while this conversation was active (cleared whenever
 	 *  it becomes active). A listed conversation that is displaced while idle
 	 *  with this still false counts as "opened but not continued" and is
@@ -1659,12 +1848,27 @@ export interface Conversation {
 	 *  model-stall watchdog (#7): a run that produces no events at all for
 	 *  STALL_NOTIFY_MS is probably a half-open API connection. */
 	lastSdkEventAt: number;
+	/** 上次重放软上限覆盖时的会话模型 key（"provider/id"）——软上限 reserve
+	 *  按注入那一刻的模型窗口换算，模型在 pi-web-ui 之外被换（SDK 从会话
+	 *  历史恢复、/model 命令）时必须重算，否则大窗口算出的 reserve 泄漏到
+	 *  小窗口模型上，压缩触发点被压成负数。undefined = 还没见过任何事件。 */
+	lastModelKey?: string | null;
 	/** Agent 预设 id（standard/minimal/code/reader/ask；默认 standard）。 */
 	agentPreset?: string;
 	/** 预设已锁定（首轮用户发言后；空白会话可切换）。 */
 	presetLocked?: boolean;
 	/** 权限预设值（read-only/workspace-write-never/danger-full-access）。 */
 	permissionPreset?: string;
+	/** 计划模式（只规划不实施）：写类工具与非常规 bash 被服务端拒，提示词追加
+	 *  计划模式约束。随会话转录落盘（切会话/重载恢复），过户随对话本体搬走。 */
+	planMode?: boolean;
+	/** 审查者模式（自动委派，默认关）：主对话只审阅，用户每条 prompt 由服务端
+	 *  转给 `delegateConvId` 那个常驻落盘执行对话执行；写类/派发类工具被拒。
+	 *  布尔随会话转录落盘（delegate/mode，回放同 planMode）；执行对话 id 只在
+	 *  本进程内有效（重启后首条请求重建），不落盘。 */
+	delegateMode?: boolean;
+	/** 常驻执行对话 id（仅本进程；null/缺省 = 还没建）。 */
+	delegateConvId?: string | null;
 	/** 临时会话（inMemory，不落盘、不进历史、不占持久会话名额）。 */
 	isEphemeral?: boolean;
 	/** 本对话的审批放行策略（仅内存，不落盘）：allowAll = 「本对话全部允许」，
@@ -1683,7 +1887,6 @@ export interface Conversation {
 	/** Independent goal/review state for this conversation. */
 	goal: GoalStatus;
 	goalGeneration: number;
-	goalReviewGeneration: number;
 	/** Wizard execution is per conversation; dialog transport itself remains
 	 * client-wide because the browser can display one dialog at a time. */
 	wizardRunning: boolean;
@@ -1724,11 +1927,14 @@ export interface Conversation {
 	compactionState?: { reason: string; startedAt: number } | null;
 	/** 最近一次压缩成功的 estimatedTokensAfter（SDK 自算的压缩后上下文大小）。
 	 *  压缩后 SDK getContextUsage() 故意报 null（压缩前的 usage 不可信），
-	 *  下轮模型响应前快照用此值回填并标 estimated；开始下一次压缩时清掉。 */
+	 *  下轮模型响应前快照用此值回填；开始下一次压缩时清掉。 */
 	lastCompactionTokens?: number | null;
 	/** 下一轮 agent_start 消费的用户任务文本（prompt() 暂存，轨迹插件的 run_start 用；
 	 *  steer/内部续跑无暂存时为空，由插件回退为「继续执行」）。 */
 	pendingTask?: string;
+	/** 子代理首回合的投递 Promise（spawn 里 fire-and-forget 的 sendUserMessage）。
+	 *  目标模式「等本回合结束」必须先等它落定，否则会把「还没开跑」误判成「已跑完」。 */
+	kickoff?: Promise<unknown>;
 	/** tool_call watchdog timers keyed by toolCallId — a tool that runs past
 	 *  TOOL_WATCHDOG_TIMEOUT_MS gets the session aborted instead of hanging
 	 *  the conversation forever (the SDK bash tool has no default timeout). */
@@ -1740,6 +1946,13 @@ export interface Conversation {
 	workspaceSnapshots: Array<{ entryId?: string; timestamp: number; snapshotRef: string }>;
 	/** 当前正在启动中（读取附件、视觉桥、快照准备等）的 prompt 取消控制器 */
 	activePromptAc?: AbortController;
+	/** prompt() 已进门、尚未进入流式：前置附件构建 / 工作区影子快照是异步的，
+	 *  此窗口内对话还不算 streaming，置换判定必须把它当作「有活干」保留，
+	 *  否则新建/切换对话会销毁其 runtime，正在投递的消息被静默丢弃。 */
+	promptInFlight?: boolean;
+	/** 最近一次 LLM 响应定稿时的 Base Tokens（生效提示词 + 工具 Schema 占用）。
+	 *  用于在对话中途切换预设或开关工具时计算上下文增量补偿。 */
+	lastTurnBaseTokens?: number;
 }
 
 /** 轨迹事件 payload 封顶（可直接广播/持久化，不撑爆 storage.json）。 */
@@ -1771,6 +1984,13 @@ function previewToolResult(result: unknown): string {
 	} catch {
 		return "[unserializable result]";
 	}
+}
+
+/**
+ * 转录整文件重写的原子落盘：先写同目录临时文件再 rename。
+ */
+function atomicWriteFileSync(file: string, data: string): void {
+	writeAtomicSync(file, data);
 }
 
 /** Cap on simultaneously open NON-subagent conversations of ONE project (each keeps a full
@@ -1825,14 +2045,14 @@ function conversationTitle(session: AgentSession): string {
 	return DEFAULT_CONV_TITLE;
 }
 
-/** 全局搜索的会话匹配：大小写不敏感，命中任一项即算 ——
- *  显示名、当前项目内的文件名片段、首条消息，以及完整转录文本
- *  （SDK 的 allMessagesText 包含每一段 user 与 assistant 消息，AI 输出也在内）。 */
-function sessionMatchesSearch(q: string, s: SessionInfo): boolean {
+/** 全局搜索的会话元信息匹配：大小写不敏感，命中任一项即算 ——
+ *  显示名、当前项目内的文件名片段、首条消息。
+ *  转录全文匹配不在这里：全文单条可达 MB 级，不再随列表缓存常驻（issue #440），
+ *  由 filterSessionsForSearch 按需加载后判定（口径不变：user 与 assistant 消息文本）。 */
+function sessionMatchesMetadata(q: string, s: SessionInfo): boolean {
 	if (s.name && s.name.toLowerCase().includes(q)) return true;
 	if (basename(s.path).toLowerCase().includes(q)) return true;
 	if (s.firstMessage.toLowerCase().includes(q)) return true;
-	if (s.allMessagesText.toLowerCase().includes(q)) return true;
 	return false;
 }
 
@@ -1851,12 +2071,26 @@ function messageSearchText(m: { content?: unknown }): string {
 	return parts.join("\n");
 }
 
+/** 转录全文扫描/整读的大小上限（16MB，与 readHistorySession 一致）：
+ *  超限文件同步 readFileSync 会卡事件循环数百毫秒起，搜索不值得。 */
+const MAX_TRANSCRIPT_SCAN_BYTES = 16 * 1024 * 1024;
+
+/** 转录全文进入内存/缓存的字符上限（256K 字符）：全文只服务搜索的命中判定
+ *  （issue #440 拆分后按需加载），封顶保证单条 worst case 内存可控（缓存 256 条
+ *  × 256K 字符 ≈ 64MB 上界，且只在搜索活动期间存在）。
+ *  影响面：超长转录在截断点之后的内容不参与「是否命中」判定；命中后的消息级
+ *  定位（collectSessionAnchors）仍扫全文件，不受此上限影响。 */
+const MAX_SEARCH_TEXT_CHARS = 256 * 1024;
+
 /** 扫描一个会话转录文件，收集文本命中查询的消息锚点（role + timestamp，
- *  按转录顺序，最多 cap 个）。仅 user/assistant 消息参与，与搜索范围一致。 */
+ *  按转录顺序，最多 cap 个）。仅 user/assistant 消息参与，与搜索范围一致。
+ *  超过大小上限的转录直接跳过（stat 先行，不整读）—— 全局搜索逐会话同步
+ *  扫描，无上限时一个大转录就能冻住整个事件循环。 */
 function collectSessionAnchors(filePath: string, q: string, cap = 10): MessageAnchor[] {
 	const anchors: MessageAnchor[] = [];
 	if (!q) return anchors;
 	try {
+		if (statSync(filePath).size > MAX_TRANSCRIPT_SCAN_BYTES) return anchors;
 		const lines = readFileSync(filePath, "utf8").split("\n");
 		for (const line of lines) {
 			if (!line.trim()) continue;
@@ -1918,6 +2152,240 @@ export function isInsideSessionsDir(agentDir: string, targetPath: string): boole
 	const extra = piSessionsRoot();
 	if (extra) roots.push(resolve(extra));
 	return roots.some((root) => abs.startsWith(root + sep));
+}
+
+/**
+ * 从会话文件首行读取 cwd（轻量探测，最多读取 2KB，绝不完整解析整个 jsonl 消息历史）。
+ */
+async function readCwdFromSessionHeader(filePath: string): Promise<string | null> {
+	let handle: fsPromises.FileHandle | undefined;
+	try {
+		handle = await fsPromises.open(filePath, "r");
+		const buf = Buffer.alloc(2048);
+		const { bytesRead } = await handle.read(buf, 0, 2048, 0);
+		const text = buf.toString("utf8", 0, bytesRead);
+		const nl = text.indexOf("\n");
+		const firstLine = nl !== -1 ? text.slice(0, nl) : text;
+		if (!firstLine.trim()) return null;
+		const parsed = JSON.parse(firstLine);
+		return typeof parsed.cwd === "string" && parsed.cwd.trim() ? parsed.cwd : null;
+	} catch {
+		return null;
+	} finally {
+		if (handle) await handle.close().catch(() => {});
+	}
+}
+
+/**
+ * 快速轻量地从 SDK 会话目录中发现项目路径（仅读取会话文件的第一行头部获取 cwd，
+ * 绝不使用 SessionManager.listAll 遍历解析全部会话文本，避免大历史时阻塞数秒到数十秒）。
+ */
+async function discoverRecentProjectsFromDisk(sessionRoots: string[], limit = 30): Promise<ProjectSummary[]> {
+	const projects = new Map<string, ProjectSummary>();
+
+	for (const root of sessionRoots) {
+		if (projects.size >= limit) break;
+		try {
+			// 异步探测（issue #441）：会话根可能在已断连的网络盘上，同步 existsSync 会冻结事件循环。
+			try {
+				await fsPromises.access(root);
+			} catch {
+				continue;
+			}
+			const entries = await fsPromises.readdir(root, { withFileTypes: true });
+
+			// 1. 扁平布局（PI_CODING_AGENT_SESSION_DIR）：根目录下直接是 .jsonl
+			const flatFiles = entries.filter((e) => e.isFile() && e.name.endsWith(".jsonl"));
+			if (flatFiles.length > 0) {
+				const fileStats = await Promise.all(
+					flatFiles.map(async (f) => {
+						const fp = join(root, f.name);
+						try {
+							const st = await fsPromises.stat(fp);
+							return { path: fp, mtime: st.mtimeMs };
+						} catch {
+							return null;
+						}
+					}),
+				);
+				fileStats.sort((a, b) => (b?.mtime ?? 0) - (a?.mtime ?? 0));
+				for (const s of fileStats) {
+					if (!s || projects.size >= limit) break;
+					const cwd = await readCwdFromSessionHeader(s.path);
+					if (cwd) {
+						const key = normalizePathKey(cwd);
+						if (!projects.has(key)) {
+							try {
+								// 异步探测（issue #441）：cwd 可能在已断连的网络盘上。
+								await fsPromises.access(cwd);
+								projects.set(key, { path: cwd, lastUsed: s.mtime });
+							} catch {}
+						}
+					}
+				}
+			}
+
+			// 2. 默认子目录布局（<agentDir>/sessions/--<cwd>--/）：每 cwd 一个子目录
+			const subdirs = entries.filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => join(root, e.name));
+			if (subdirs.length > 0 && projects.size < limit) {
+				const CHUNK = 64;
+				const dirStats: { path: string; mtime: number }[] = [];
+				for (let i = 0; i < subdirs.length; i += CHUNK) {
+					const chunk = subdirs.slice(i, i + CHUNK);
+					const stats = await Promise.all(
+						chunk.map(async (dir) => {
+							try {
+								const st = await fsPromises.stat(dir);
+								return { path: dir, mtime: st.mtimeMs };
+							} catch {
+								return null;
+							}
+						}),
+					);
+					for (const s of stats) if (s) dirStats.push(s);
+				}
+				dirStats.sort((a, b) => b.mtime - a.mtime);
+
+				for (let i = 0; i < dirStats.length; i += 16) {
+					if (projects.size >= limit) break;
+					const batch = dirStats.slice(i, i + 16);
+					const batchRes = await Promise.all(
+						batch.map(async (d) => {
+							try {
+								const files = await fsPromises.readdir(d.path);
+								const jsonls = files.filter((f) => f.endsWith(".jsonl"));
+								if (jsonls.length === 0) return null;
+								let newestFile = "";
+								let newestMtime = 0;
+								for (const f of jsonls) {
+									const fp = join(d.path, f);
+									try {
+										const st = await fsPromises.stat(fp);
+										if (st.mtimeMs > newestMtime) {
+											newestMtime = st.mtimeMs;
+											newestFile = fp;
+										}
+									} catch {}
+								}
+								if (!newestFile) return null;
+								const cwd = await readCwdFromSessionHeader(newestFile);
+								if (!cwd) return null;
+								return { path: cwd, lastUsed: newestMtime };
+							} catch {
+								return null;
+							}
+						}),
+					);
+
+					for (const r of batchRes) {
+						if (!r) continue;
+						const key = normalizePathKey(r.path);
+						if (!projects.has(key)) {
+							try {
+								// 异步探测（issue #441）：cwd 可能在已断连的网络盘上。
+								await fsPromises.access(r.path);
+								projects.set(key, r);
+							} catch {}
+						}
+					}
+				}
+			}
+		} catch {
+			/* best effort */
+		}
+	}
+
+	return [...projects.values()].sort((a, b) => b.lastUsed - a.lastUsed);
+}
+
+/**
+ * 快速解析单个会话文件（提取 id/cwd/name/parentSessionPath/firstMessage/messageCount/modified，
+ * 以及可选的转录全文 allMessagesText）。仅用于会话列表发现与搜索，避免调用 SDK 重型的全量树解析。
+ *
+ * withAllMessagesText=false（默认，列表路径）时不收集转录全文，allMessagesText 返回空串 ——
+ * 全文单条可达 MB 级，绝不随列表进任何缓存（issue #440）；true（搜索路径）时收集全文并在
+ * MAX_SEARCH_TEXT_CHARS 处截断。
+ */
+async function parseSessionInfoFast(
+	filePath: string,
+	fileMtime: number,
+	withAllMessagesText = false,
+): Promise<SessionInfo | null> {
+	try {
+		const content = await fsPromises.readFile(filePath, "utf8");
+		const lines = content.split("\n");
+		let id = "";
+		let cwd = "";
+		let name: string | undefined;
+		let parentSessionPath: string | undefined;
+		let firstMessage = "";
+		let messageCount = 0;
+		let lastActivityTime = 0;
+		let headerTime = 0;
+		const allMessages: string[] | null = withAllMessagesText ? [] : null;
+
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let entry: unknown;
+			try {
+				entry = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const rec = entry as Record<string, unknown> | null;
+			if (!rec) continue;
+			if (rec.type === "session") {
+				id = typeof rec.id === "string" ? rec.id : "";
+				cwd = typeof rec.cwd === "string" ? rec.cwd : "";
+				if (typeof rec.timestamp === "string") headerTime = new Date(rec.timestamp).getTime();
+				if (typeof rec.parentSession === "string") parentSessionPath = rec.parentSession;
+			} else if (rec.type === "session_info") {
+				if (typeof rec.name === "string" && rec.name.trim()) name = rec.name.trim();
+			} else if (rec.type === "message") {
+				messageCount++;
+				const msg = rec.message as Record<string, unknown> | null;
+				if (msg) {
+					if (typeof msg.timestamp === "number") lastActivityTime = Math.max(lastActivityTime, msg.timestamp);
+					let text = "";
+					if (typeof msg.content === "string") {
+						text = msg.content;
+					} else if (Array.isArray(msg.content)) {
+						for (const part of msg.content) {
+							if (part && typeof part.text === "string") {
+								text += (text ? " " : "") + part.text;
+							}
+						}
+					}
+					if (text) {
+						if (!firstMessage && msg.role === "user") firstMessage = text;
+						allMessages?.push(text);
+					}
+				}
+			}
+		}
+
+		if (!id) return null;
+		const modified = lastActivityTime > 0 ? lastActivityTime : headerTime > 0 ? headerTime : fileMtime;
+		let allMessagesText = "";
+		if (allMessages) {
+			const joined = allMessages.join(" ");
+			allMessagesText = joined.length > MAX_SEARCH_TEXT_CHARS ? joined.slice(0, MAX_SEARCH_TEXT_CHARS) : joined;
+		}
+		return {
+			path: filePath,
+			id,
+			cwd,
+			name,
+			parentSessionPath,
+			created: new Date(headerTime || fileMtime),
+			modified: new Date(modified),
+			messageCount,
+			firstMessage: firstMessage || "(no messages)",
+			allMessagesText,
+		};
+	} catch {
+		return null;
+	}
 }
 
 /** 会话当前模型的 "provider/id"（无模型时 null；软上限按模型覆盖用，issue #229）。 */
@@ -2011,11 +2479,26 @@ export interface TakeoverPageCall {
 	conversationId: string;
 }
 
-/** 手动过户载荷：对话对象（含 runtime/终端/队列/缓存）整体搬迁 + 桥接中的问卷/页调用. */
+/** 手动过户时跟着对话一起搬走的待审批（id 在目标会话重排）. */
+export interface TakeoverApproval {
+	resolve: (res: ToolApprovalResolution) => void;
+	toolCallId: string;
+	toolName: string;
+	params: Record<string, unknown> | unknown;
+	reason?: string;
+	reasonEn?: string;
+	category?: UiApprovalCategory;
+	conversationId: string;
+	conversationTitle?: string;
+	createdAt: number;
+}
+
+/** 手动过户载荷：对话对象（含 runtime/终端/队列/缓存）整体搬迁 + 桥接中的问卷/页调用/待审批. */
 export interface TakeoverPayload {
 	convs: Conversation[];
 	questions: TakeoverQuestion[];
 	pageCalls: TakeoverPageCall[];
+	approvals: TakeoverApproval[];
 }
 
 /** 同项目判定（纯函数）：调度视口回退与 id 唤醒的 cwd 护栏用。
@@ -2024,13 +2507,50 @@ export function sameCwd(a: string, b: string): boolean {
 	const x = String(a ?? "").trim();
 	const y = String(b ?? "").trim();
 	if (!x || !y) return false;
-	const norm = (s: string): string => s.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-	if (norm(x) === norm(y)) return true;
 	try {
-		return norm(resolve(x)) === norm(resolve(y));
+		return normalizePathKey(x) === normalizePathKey(y);
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * 超时杀进程树的决策（纯函数，可单测）。runAsync 的超时兜底用：
+ * - win32：shell:true 实际起的是 cmd.exe，p.kill() 只杀 cmd 本身，npm/git 的
+ *   孙进程照活 —— 必须走 `taskkill /PID <pid> /T /F` 才能整树带走；
+ * - posix：配合 spawn 的 detached:true，向负 pid（整组）发 SIGTERM。
+ * 返回决策而不是直接执行，执行留在调用方（便于注入/测试）。
+ */
+export function processTreeKillPlan(
+	platform: NodeJS.Platform,
+	pid: number | undefined,
+):
+	| { kind: "taskkill"; cmd: string; args: string[] }
+	| { kind: "group-signal"; signal: NodeJS.Signals }
+	| { kind: "none" } {
+	if (!pid || pid <= 0) return { kind: "none" };
+	if (platform === "win32") return { kind: "taskkill", cmd: "taskkill", args: ["/PID", String(pid), "/T", "/F"] };
+	return { kind: "group-signal", signal: "SIGTERM" };
+}
+
+/**
+ * /cwd 目标解析（纯函数，可单测）：
+ * - 相对路径以**当前会话 cwd** 为基准（/cwd src = 当前项目的 src），不按 server
+ *   进程 cwd 解析 —— 两者经常不同，按进程 cwd 切必错位。绝对路径不受基准影响
+ *   （resolve 遇到绝对段会丢弃前面的基准）。
+ * - win32 裸盘符（"C:"）：resolve 会按该盘当前目录解析，必须显式指到盘根；仅
+ *   win32 生效——posix 下 "C:" 仍是普通相对路径，避免误伤同名目录。
+ */
+export function resolveCwdTarget(
+	raw: string,
+	sessionCwd: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const trimmed = String(raw ?? "").trim();
+	if (platform === "win32" && /^[A-Za-z]:$/.test(trimmed)) {
+		return `${trimmed.toUpperCase()}\\`;
+	}
+	return resolve(sessionCwd, trimmed);
 }
 
 export class ClientSession {
@@ -2056,6 +2576,9 @@ export class ClientSession {
 	 *  top bar applies to every chat, not just the one that set it. Seeded by
 	 *  the first conversation and reused by later ones. */
 	private sharedModelRuntime: Awaited<ReturnType<typeof createAgentSessionServices>>["modelRuntime"] | undefined;
+	/** 目标模式「委托执行」（Plan A）的「本轮结束」等待者：convId → 回调集合。
+	 *  agent_end 到达时唤醒（事件驱动，绝不轮询）；对话被移出时按 gone 收。 */
+	private turnEndWaiters = new Map<string, Set<(o: RoleWaitOutcome) => void>>();
 
 	// -----------------------------------------------------------------------
 	// Goal / review / wizard —— 自包含模块，见 goal-service.ts。每个对话有独立
@@ -2245,6 +2768,7 @@ export class ClientSession {
 		model?: string | null,
 		parentId?: string,
 		persist?: boolean,
+		title?: string,
 	): Promise<string> {
 		// 数量上限先行：每个子代理都是完整 runtime + TerminalManager，无上限时一次
 		// 并行派发几十个会把服务进程拖垮。持久化普通对话则受项目会话上限限制。
@@ -2252,7 +2776,7 @@ export class ClientSession {
 			const baseCwdForLimit = parentId ? (this.convs.get(parentId)?.cwd ?? this.cwd) : this.cwd;
 			const resolvedCwdForLimit = cwd ? resolve(baseCwdForLimit, cwd) : baseCwdForLimit;
 			const openInProject = [...this.convs.values()].filter(
-				(c) => c.cwd === resolvedCwdForLimit && !c.isSubagent,
+				(c) => c.cwd === resolvedCwdForLimit && !c.isSubagent && !c.isEphemeral,
 			).length;
 			if (openInProject >= MAX_OPEN_CONVERSATIONS) {
 				throw new Error(
@@ -2312,12 +2836,15 @@ export class ClientSession {
 		conv.parentId = parentId ?? this.activeId ?? undefined;
 		conv.subagentType = type;
 		conv.subagentPrompt = prompt;
+		// 模板快照留在对话上：forceReset 重建 runtime 时工厂要按同一模板组装
+		// （system prompt/技能/扩展白名单），否则重建后回落主会话设置。
+		conv.subagentTemplate = apply;
 		// 插件工具门与模板扩展白名单对齐：白名单非空时插件/MCP 工具（无 SDK
 		// extensionKey 身份）不进该会话。工厂期 customTools 不注册 + 下面的
 		// syncPluginTools 不回补，模板热改不影响已运行的子代理（与 prompt/技能一致）。
 		conv.subagentBarsPluginTools = !!apply && apply.enabledExtensions.length > 0;
 		conv.listed = true;
-		conv.title = subagentTitle(prompt);
+		conv.title = title ?? subagentTitle(prompt);
 		this.convs.set(conv.id, conv);
 		// 子代理会话同样订阅 SDK 事件：否则 onEvent 永不触发，点开查看时没有
 		// message_delta 流式增量、快照也不刷新，只能靠切走切回时的 flushSnapshot
@@ -2403,8 +2930,9 @@ export class ClientSession {
 				});
 			}
 		}
-		// 触发回合（后台执行；失败转识为通知）。
-		void conv.session.sendUserMessage(prompt).catch((err) => {
+		// 触发回合（后台执行；失败转识为通知）。把 Promise 挂在对话上：目标模式的
+		// 「等本回合结束」要先等它落定，才能区分「还没开跑」与「已跑完」。
+		conv.kickoff = conv.session.sendUserMessage(prompt).catch((err) => {
 			this.emit({
 				type: "notice",
 				level: "error",
@@ -2501,6 +3029,82 @@ export class ClientSession {
 		return {};
 	}
 
+	/**
+	 * 事件驱动地等某对话「当前回合结束」（目标模式委托执行用）。
+	 * 若当前并未在跑则立即返回既有结局；超时返回 "timeout"；对话已消失返回 "gone"。
+	 * 不轮询：靠 agent_end 的 notifyTurnEnd / removeConversation 唤醒。
+	 */
+	private async waitConversationTurnEnd(convId: string, timeoutMs: number): Promise<RoleWaitOutcome> {
+		const isStreaming = (c: Conversation): boolean => {
+			try {
+				return c.session.isStreaming;
+			} catch {
+				return false;
+			}
+		};
+		let conv = this.convs.get(convId);
+		if (!conv) return Promise.resolve("gone");
+		// spawn 的首回合是 fire-and-forget 投递的：先等它落定，否则「还没开跑」会被
+		// 误判成「已跑完」（空取样 → 下一轮派活撞在一起）。
+		if (conv.kickoff) {
+			await conv.kickoff.catch(() => {});
+			conv = this.convs.get(convId);
+			if (!conv) return "gone";
+		}
+		// 极短的启动宽限：投递刚返回时 isStreaming 可能还差一拍。只在这里等，
+		// 一旦开跑就交给事件驱动（agent_end），不是长轮询。
+		if (!isStreaming(conv)) {
+			const graceEnd = Date.now() + Math.min(3000, Math.max(0, timeoutMs));
+			while (!isStreaming(conv) && Date.now() < graceEnd) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				const again = this.convs.get(convId);
+				if (!again) return "gone";
+				conv = again;
+			}
+		}
+		if (!isStreaming(conv)) return this.roleOutcomeOf(conv);
+		return new Promise<RoleWaitOutcome>((resolve) => {
+			const set = this.turnEndWaiters.get(convId) ?? new Set<(o: RoleWaitOutcome) => void>();
+			this.turnEndWaiters.set(convId, set);
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const finish = (o: RoleWaitOutcome): void => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				set.delete(finish);
+				if (set.size === 0) this.turnEndWaiters.delete(convId);
+				resolve(o);
+			};
+			timer = setTimeout(() => finish("timeout"), Math.max(1000, timeoutMs));
+			timer.unref?.();
+			set.add(finish);
+			// 注册后复检：agent_end 可能恰好在 isStreaming 检查与注册之间到达。
+			const still = this.convs.get(convId);
+			if (!still) {
+				finish("gone");
+				return;
+			}
+			if (!isStreaming(still)) finish(this.roleOutcomeOf(still));
+		});
+	}
+
+	/** 对话结局 → 角色轮结局（报错 > 中止 > 正常）。 */
+	private roleOutcomeOf(conv: Conversation): RoleWaitOutcome {
+		const { error, canceled } = this.subagentRunOutcome(conv);
+		if (error) return "error";
+		if (canceled) return "canceled";
+		return "done";
+	}
+
+	/** 某对话回合结束 → 唤醒它的等待者（agent_end / 中止路径都调）。 */
+	private notifyTurnEnd(conv: Conversation): void {
+		const set = this.turnEndWaiters.get(conv.id);
+		if (!set || set.size === 0) return;
+		const outcome = this.roleOutcomeOf(conv);
+		for (const fn of set) fn(outcome);
+	}
+
 	private emitTerminal(conversationId: string, msg: ServerMessage): void {
 		// Background conversations keep collecting output in their own PTY buffer.
 		// Do not stream it into the active xterm; push the retained window on switch.
@@ -2550,10 +3154,14 @@ export class ClientSession {
 		toolGuidelines: string[];
 		contextFiles: { path: string; content: string }[];
 		skills: { name: string; description: string; filePath: string }[];
+		preset?: string;
 	}): PromptComposerInputs {
+		const preset = src.preset ?? this.conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
 		// 技能名录指纹观测（只打日志，不干预组装；预览与 run 共用此入口，
 		// 变化才记一行，首轮静默）。用未注文的目录（fill 前），全文注入不影响指纹。
 		this.noteSkillCatalogDigest(src.skills);
+		const showSkills = presetShowsSkillCatalog(preset);
+		const effectiveSkills = showSkills ? this.fillSkillContents(src.skills) : [];
 		return {
 			cwd: src.cwd,
 			systemPromptFile: this.lastBaseSystemPrompt || undefined,
@@ -2566,15 +3174,15 @@ export class ClientSession {
 			piExamples: PI_DOC_PATHS.examples,
 			appendFiles: this.lastSdkAppendFiles,
 			windowsPersona: process.platform === "win32" ? WINDOWS_PERSONA : "",
-			terminalGuidance: isTerminalGuidanceOn(effectiveDisabledAgentTools(this.settingsSvc.current))
+			terminalGuidance: isTerminalGuidanceOn(effectiveDisabledAgentTools(this.settingsSvc.current), preset)
 				? TERMINAL_TOOLS_GUIDANCE
 				: "",
 			markersGuidance: this.markerSvc.buildGuidance(),
 			// issue #91：组合模板各来源段按客户端 UI 语言渲染（英文默认）。
 			lang: this.getLang(),
 			contextFiles: src.contextFiles,
-			skills: this.fillSkillContents(src.skills),
-			skillsFullText: normalizeSkillList(this.settingsSvc.current.skillsFullText),
+			skills: effectiveSkills,
+			skillsFullText: showSkills ? normalizeSkillList(this.settingsSvc.current.skillsFullText) : [],
 		};
 	}
 
@@ -2601,8 +3209,9 @@ export class ClientSession {
 		});
 	}
 
-	/** 渲染当前组合模板。模板为空且无任何覆盖时返回 undefined（用 SDK 默认拼装，
-	 *  零开销且与原始行为逐字节一致）。 */
+	/** 渲染当前组合模板。当存在自定义模板/覆盖，或者当前会话预设非 standard（如 code/minimal/ask/reader），
+	 *  或者存在被禁用的工具时，必须渲染完整系统提示词，保证工具门控、技能隐藏与 Guidelines 严格对齐当前预设；
+	 *  仅在完全默认且全功能 standard 状态下返回 undefined 让 SDK 拼装。 */
 	private renderMainCompose(src: {
 		cwd: string;
 		selectedTools: string[];
@@ -2610,18 +3219,24 @@ export class ClientSession {
 		toolGuidelines: string[];
 		contextFiles: { path: string; content: string }[];
 		skills: { name: string; description: string; filePath: string }[];
+		preset?: string;
 	}): string | undefined {
 		const tpl = (this.settingsSvc.current.promptTemplate ?? "").trim();
 		const ovs = this.settingsSvc.current.promptOverrides ?? {};
 		const hasOverride = Object.values(ovs).some((v) => typeof v === "string" && v.trim());
-		if (!tpl && !hasOverride) return undefined;
+		const preset = src.preset ?? this.conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
+		const isCustomized =
+			!!tpl || hasOverride || preset !== "standard" || effectiveDisabledAgentTools(this.settingsSvc.current).length > 0;
+		if (!isCustomized) return undefined;
 		const texts = resolveSectionTexts(this.composeInputs(src));
-		return renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, ovs);
+		return renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, hasOverride ? ovs : undefined);
 	}
 
-	/** 从活动会话收集工具/资源快照 → 一次算出 ①各来源默认(自动)内容 ②实际生效的
-	 *  完整提示词。会话未就绪（或出错）返回 undefined，调用方给空值。 */
-	private sessionPromptSnapshot():
+	/** 从指定会话（缺省 = 活跃会话）收集工具/资源快照 → 一次算出 ①各来源默认(自动)
+	 *  内容 ②实际生效的完整提示词。会话未就绪（或出错）返回 undefined，调用方给空值。
+	 *  注意必须传目标 conv：preset/工具 schema 都是按会话走的，拿活跃会话的快照
+	 *  算后台会话的基线会串账（lastTurnBaseTokens 跨会话污染）。 */
+	private sessionPromptSnapshot(target?: Conversation):
 		| {
 				texts: Record<string, string>;
 				full: string;
@@ -2629,9 +3244,10 @@ export class ClientSession {
 		  }
 		| undefined {
 		try {
-			const sess = this.session;
-			if (!sess) return undefined;
-			const cwd = this.convs.get(this.activeId)?.cwd ?? this.cwd;
+			const conv = target ?? this.convs.get(this.activeId);
+			if (!conv) return undefined;
+			const sess = conv.session;
+			const cwd = conv.cwd;
 			const active = sess.getActiveToolNames();
 			const snippets: Record<string, string> = {};
 			const guidelines: string[] = [];
@@ -2648,6 +3264,7 @@ export class ClientSession {
 				});
 			}
 			const loader = sess.resourceLoader;
+			const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
 			const texts = resolveSectionTexts(
 				this.composeInputs({
 					cwd,
@@ -2660,15 +3277,15 @@ export class ClientSession {
 						description: s.description ?? "",
 						filePath: (s as { filePath?: string }).filePath ?? "",
 					})),
+					preset,
 				}),
 			);
-			// 模板/覆盖渲染（无则保持 SDK 默认拼装，与 renderMainCompose 同规则）。
+			// 模板/覆盖渲染（无自定义模板时用默认模板渲染完整提示词，确保与真实 run 规则一致且包含预设过滤）。
 			const tpl = (this.settingsSvc.current.promptTemplate ?? "").trim();
 			const ovs = this.settingsSvc.current.promptOverrides ?? {};
 			const hasOverride = Object.values(ovs).some((v) => typeof v === "string" && v.trim());
-			const rendered =
-				!tpl && !hasOverride ? undefined : renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, ovs);
-			return { texts, full: rendered ?? sess.systemPrompt, toolsSchema: buildToolsSchemaText(schemaEntries) };
+			const rendered = renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, hasOverride ? ovs : undefined);
+			return { texts, full: rendered, toolsSchema: buildToolsSchemaText(schemaEntries) };
 		} catch {
 			// Session not ready yet.
 			return undefined;
@@ -2679,6 +3296,32 @@ export class ClientSession {
 	 *  + 各来源默认（自动）内容。会话未就绪时给空值，面板保持可编辑但不预览。 */
 	private promptSnapshot(): { full: string; texts: Record<string, string>; toolsSchema: string } {
 		return this.sessionPromptSnapshot() ?? { full: "", texts: {}, toolsSchema: "" };
+	}
+
+	/** 会话级 Base Tokens 缓存（避免在节流快照热路径上重复计算正则）。 */
+	private cachedBaseTokens: { at: number; convId: string; tokens: number } | null = null;
+
+	/** 指定会话（缺省 = 活跃会话）系统提示词 + 工具 schema 的基础 token 开销
+	 *  （与设置面板中的「合计」完全一致）。会话未就绪返回 null——调用方必须区分
+	 *  null 与 0：把 0 写进 lastTurnBaseTokens 会让后续轮次双计全额 base。 */
+	private currentBaseTokens(target?: Conversation): number | null {
+		const conv = target ?? this.convs.get(this.activeId);
+		if (!conv) return null;
+		const now = Date.now();
+		if (
+			this.cachedBaseTokens &&
+			this.cachedBaseTokens.convId === conv.id &&
+			now - this.cachedBaseTokens.at < STATS_CACHE_MS
+		) {
+			return this.cachedBaseTokens.tokens;
+		}
+		const snap = this.sessionPromptSnapshot(conv);
+		if (!snap) return null;
+		const prompt = estimatePromptTokens(snap.full);
+		const schema = estimatePromptTokens(snap.toolsSchema);
+		const tokens = prompt + schema;
+		this.cachedBaseTokens = { at: now, convId: conv.id, tokens };
+		return tokens;
 	}
 
 	/** Web-facing extension UI context (widgets, notifications). */
@@ -2713,6 +3356,9 @@ export class ClientSession {
 
 		const record = { fromRunId, toRunId, timestamp: Date.now() };
 		this.subagentHandoffs.push(record);
+		if (this.subagentHandoffs.length > 50) {
+			this.subagentHandoffs = this.subagentHandoffs.slice(-50);
+		}
 		if (!fromConv?.peerHandoffTo) {
 			if (fromConv) fromConv.peerHandoffTo = [];
 		}
@@ -2952,10 +3598,17 @@ export class ClientSession {
 			},
 			readHistorySession: async (path) => {
 				const all = await SessionManager.listAll(piSessionsRoot());
-				const hit = all.find((s) => resolve(s.path) === resolve(path));
+				// win32 路径大小写不敏感：客户端回传的盘符/目录大小写常与服务端
+				// 列表不一致，严格相等会把合法请求误判为“不在白名单”。大小写
+				// 归一后再比（posix 不受影响）。
+				const norm = (p: string): string => {
+					const r = resolve(p);
+					return process.platform === "win32" ? r.toLowerCase() : r;
+				};
+				const hit = all.find((s) => norm(s.path) === norm(path));
 				if (!hit) return undefined;
 				try {
-					if (statSync(hit.path).size > 16 * 1024 * 1024) return undefined;
+					if (statSync(hit.path).size > MAX_TRANSCRIPT_SCAN_BYTES) return undefined;
 					const text = readFileSync(hit.path, "utf8");
 					return {
 						title: hit.name || hit.firstMessage,
@@ -3313,13 +3966,17 @@ export class ClientSession {
 					// （含重试次数覆盖）——依次重放：重试覆盖 → 软上限覆盖 → 终端门控。
 					this.applyRetryOverrides();
 					this.applyCompactionOverrides();
-					// reload() 会把 custom 工具重新加回活跃集——重放终端开关。
-					this.applyToolGating(this.session);
+					// reload() 会把 custom 工具重新加回活跃集——重放当前会话归属预设门控。
+					this.applyToolGating(this.session, this.conv?.agentPreset);
 					await this.pushSlashCommands();
 				},
 				applyRetryOverrides: () => this.applyRetryOverrides(),
 				applyCompactionOverrides: () => this.applyCompactionOverrides(),
-				applyToolGating: () => this.applyToolGating(this.session),
+				applyToolGating: () => {
+					for (const conv of this.convs.values()) {
+						this.applyToolGating(conv.session, conv.agentPreset);
+					}
+				},
 				promptSnapshot: () => this.promptSnapshot(),
 				getMarkerState: () => ({
 					markersEnabled: this.markerSvc.current.markersEnabled,
@@ -3327,6 +3984,10 @@ export class ClientSession {
 					markers: this.markerSvc.listForUi(),
 				}),
 				getApprovalPolicy: () => this.approvalPolicyState(),
+				// 目标模式总开关关闭 → 在飞的目标/调研立即停（幂等；无在飞目标时无声）。
+				onGoalModeDisabled: () => {
+					void this.goalSvc.stopAllGoals();
+				},
 			},
 			this.subagentTemplates,
 			this.approvalRules,
@@ -3348,8 +4009,124 @@ export class ClientSession {
 			activeConv: () => this.conv,
 			getConv: (id) => this.convs.get(id),
 			cwd: () => this.cwd,
-			reviewSettings: () => this.settingsSvc.reviewPrefs,
 			gitDiff: (dir) => this.gitDiff(dir),
+			// 任务计划看板（#389 目标与计划联动）：审查者核验步骤看板，向导产物注入看板
+			getPlan: (convId) => this.planManager.getPlan(convId),
+			describePlan: (convId) => this.planManager.describePlan(convId),
+			setPlan: (convId, steps) => {
+				this.updatePlan(steps, undefined, convId);
+			},
+			// 工作区 git 可用性（目标模式停滞判定的可信信号开关）：非仓库目录下
+			// git diff 恒为空，取样会跳过停滞计数，纯问答类目标不再被误熔断。
+			isGitRepo: async (cwd) => {
+				try {
+					const r = await this.runAsync("git", ["rev-parse", "--is-inside-work-tree"], 5_000, cwd || this.cwd);
+					return r.code === 0;
+				} catch {
+					return false;
+				}
+			},
+			// ---- 目标模式 2.0 的角色对话桥（唯一审查/执行路径）----
+			// 复用子代理通道（同一套模板/模型/思考强度/配额/左栏展示），但角色对话**落盘**
+			// （persist=true）：转录进历史、服务重启后仍可打开回看。
+			// 代价：落盘对话 isSubagent=false → 占「每项目 8 个普通对话」名额之一
+			// （spawnSubagentConversation 满员时抛错 → GoalService 降级回 self 并提示），
+			// 且左栏不再有「子代理」徽标 —— 故给它一个带前缀的标题保持可辨识。
+			spawnRoleAgent: async ({ role, prompt, cwd, model, parentId, title }) => {
+				const baseCwd = cwd || (parentId ? this.convs.get(parentId)?.cwd : undefined) || this.cwd;
+				const convId = await this.spawnSubagentConversation(
+					prompt,
+					role === "executor" ? "goal-executor" : "goal-reviewer",
+					baseCwd,
+					undefined,
+					model ?? null,
+					parentId,
+					true,
+					title,
+				);
+				if (title) {
+					const conv = this.convs.get(convId);
+					if (conv) conv.title = title;
+				}
+				return convId;
+			},
+			waitRoleAgent: (convId, timeoutMs) => this.waitConversationTurnEnd(convId, timeoutMs),
+			sendRoleAgent: async (convId, message, deliverAs) => {
+				const conv = this.convs.get(convId);
+				if (!conv?.session) return false;
+				await conv.session.sendUserMessage(
+					message,
+					deliverAs ? { deliverAs } : conv.session.isStreaming ? { deliverAs: "steer" } : undefined,
+				);
+				return true;
+			},
+			readRoleAgent: (convId) => {
+				const conv = this.convs.get(convId);
+				if (!conv?.session) return undefined;
+				let text = "";
+				try {
+					text = conv.session.getLastAssistantText() ?? "";
+				} catch {
+					text = "";
+				}
+				// 执行者 vitals（目标条实时进度 + 用量累计用；轮次边界才读一次，
+				// getSessionStats 会遍历转写，不在高频路径上调）。
+				let streaming: boolean | undefined;
+				let lastTool: string | undefined;
+				let usage: { input: number; output: number } | undefined;
+				try {
+					streaming = conv.session.isStreaming;
+				} catch {
+					streaming = undefined;
+				}
+				try {
+					lastTool = lastToolNameOfSession(conv.session);
+				} catch {
+					lastTool = undefined;
+				}
+				try {
+					const t = conv.session.getSessionStats()?.tokens;
+					if (t && typeof t.input === "number" && typeof t.output === "number") {
+						usage = { input: t.input, output: t.output };
+					}
+				} catch {
+					usage = undefined;
+				}
+				return {
+					text,
+					errorSnippet: extractErrorSnippetFromSession(conv.session, text),
+					streaming,
+					lastTool,
+					usage,
+				};
+			},
+			stopRoleAgent: async (convId) => {
+				const conv = this.convs.get(convId);
+				if (!conv) return;
+				try {
+					if (conv.session.isStreaming || !conv.session.isIdle) {
+						await this.interruptRun(
+							conv,
+							pick(this.getLang(), "目标模式停止角色对话", "Goal mode stopped a role conversation", "agent.role.stop"),
+						);
+					}
+				} catch {
+					// best-effort
+				}
+			},
+			dismissRoleAgent: async (convId) => {
+				const conv = this.convs.get(convId);
+				if (!conv) return;
+				// 用户正看着这个角色对话时不要把他弹走（对话留着，用户可自行关闭）。
+				if (convId === this.activeId) return;
+				try {
+					await this.dismissConversation(convId, true, true);
+				} catch {
+					// best-effort
+				}
+			},
+			hasConv: (convId) => this.convs.has(convId),
+			roleDeadlineMs: () => this.getBaseToolWatchdogTimeoutMs(),
 		});
 
 		this.modelAdmin = new ModelAdminService({
@@ -3454,6 +4231,57 @@ export class ClientSession {
 		}
 		await cs.restoreProjectProviderKeysForCwd(cwd);
 		await cs.restoreProjectModelForCwd(cwd);
+
+		if (conv.session.sessionFile && cs.stateStore?.isSessionPinned(cwd, conv.session.sessionFile)) {
+			conv.pinned = true;
+			conv.listed = true;
+		}
+
+		// 恢复本项目其他已被钉住的会话（重启后常驻运行列表，issue #433）
+		const pinnedPaths = cs.stateStore?.getPinnedSessions(cwd) ?? [];
+		for (const p of pinnedPaths) {
+			if (cs.convs.size >= MAX_OPEN_CONVERSATIONS) break;
+			const normP = normalizePathKey(p);
+			const alreadyOpen = [...cs.convs.values()].some(
+				(c) => c.session.sessionFile && normalizePathKey(c.session.sessionFile) === normP,
+			);
+			if (alreadyOpen) continue;
+			try {
+				const targetPath = resolve(p);
+				if (!existsSync(targetPath)) continue;
+				cs.repairTranscriptFileBeforeOpen(targetPath);
+				const sm = SessionManager.open(targetPath);
+				const convId = cs.nextConversationId();
+				const terms = cs.makeTerminalManager(convId, cwd);
+				const rt = await createAgentSessionRuntime(cs.makeRuntimeFactory(terms, undefined, convId), {
+					cwd,
+					agentDir,
+					sessionManager: sm,
+				});
+				const pinnedConv = cs.makeConversation(rt, convId, terms);
+				pinnedConv.pinned = true;
+				pinnedConv.listed = true;
+				pinnedConv.promptedSinceActive = true;
+				cs.convs.set(pinnedConv.id, pinnedConv);
+				pinnedConv.unsubscribe = pinnedConv.session.subscribe((event) => cs.onEvent(pinnedConv, event));
+				try {
+					await pinnedConv.session.bindExtensions({
+						mode: "rpc",
+						uiContext: WebUIContext.headless(),
+						onError: cs.makeExtensionErrorReporter({
+							text: `会话 ${convId}：`,
+							textEn: `Conversation ${convId}: `,
+						}),
+					});
+				} catch {
+					// 忽略扩展绑定失败
+				}
+				cs.applyToolGating(pinnedConv.session, pinnedConv.agentPreset);
+			} catch {
+				// best effort
+			}
+		}
+
 		return cs;
 	}
 
@@ -3471,6 +4299,7 @@ export class ClientSession {
 		apply?: SubagentTemplate,
 		ownerId?: string,
 		initialModel?: Parameters<AgentSession["setModel"]>[0],
+		targetPreset?: string,
 	): CreateAgentSessionRuntimeFactory {
 		return async ({ cwd: effectiveCwd, sessionManager }) => {
 			const services = await createAgentSessionServices({
@@ -3508,6 +4337,21 @@ export class ClientSession {
 							out.push(pickTemplatePrompt(apply, this.getLang()));
 						}
 						// 主会话自定义「追加」已并入组合模板的 {{append}} 覆盖，不再在此注入。
+						// 计划模式：只规划不实施 —— 硬闸门（server/plan-mode.ts 拒写类/旁路
+						// 工具与非常规 bash）之外再补一段软约束，每轮重建提示词时读当前
+						// 会话状态，切换后下一次 reload 生效。提示词正文可在设置面板改
+						// （追加/替换内置默认，见 buildPlanModePrompt）。
+						// ⚠️ 这一段与平台无关（曾在 win32 分支里被误嵌套，导致非 Windows
+						// 上计划模式的软约束从来没进过提示词，只有硬闸门在挡）。
+						if (this.planModeOf(ownerId)) {
+							const planPrefs = this.settingsSvc.current;
+							out.push(buildPlanModePrompt(planPrefs.planModePromptMode, planPrefs.planModePrompt));
+						}
+						// 审查者模式（自动委派）：本对话只审阅，活由服务端派给常驻执行对话。
+						// 与计划模式**互斥优先级**：计划模式开着时以计划模式为准，不派活。
+						if (this.delegateModeOf(ownerId) && !this.planModeOf(ownerId)) {
+							out.push(DELEGATION_SYSTEM_PROMPT);
+						}
 						if (process.platform === "win32") {
 							// Windows 专属 persona：bash 工具跑 Git Bash 且无默认超时、终端
 							// 是交互式 TTY——注入约束避免 heredoc/交互/长驻命令挂死整个会话；
@@ -3575,27 +4419,51 @@ export class ClientSession {
 							hidden: true,
 							factory: (pi) => {
 								pi.on("before_agent_start", (event) => {
+									// 我们是链上最后一个 handler：先把早前扩展的首尾增补摘出来（pre/post），
+									// 只在 SDK 原始提示词 core 上做事，最后原样套回去——否则返回 systemPrompt
+									// 会整体替换，把别的扩展注入的内容（如 <invoked_skill>）一起丢掉。
+									const { pre, core, post } = splitAgentStartPrompt(event);
+									const rewrap = (next: string) => pre + next + post;
 									// 子代理模板 replace（无 SYSTEM.md 时）：默认分支拼好的提示词里
 									// 把灵魂段换成模板提示词，自动段保留；SYSTEM.md 情形已在
 									// systemPromptOverride 整体替换，此处边界不存在会自然跳过。
 									if (apply) {
 										const tplPrompt = pickTemplatePrompt(apply, this.getLang()).trim();
 										if (apply.promptMode !== "replace" || !tplPrompt) return undefined;
-										const boundary = event.systemPrompt.indexOf("\n\nAvailable tools:");
+										const boundary = core.indexOf("\n\nAvailable tools:");
 										// 边界串是 SDK 提示词的内部格式：版本一变就可能对不上。
 										// 对不上时不再静默回退默认 persona（模板等于没生效），而是把模板
 										// 提示词前置拼接——角色约束仍在，只是灵魂段没被精确替换。
-										if (boundary === -1) {
-											const fallback = `${tplPrompt}\n\n${event.systemPrompt}`;
-											return fallback === event.systemPrompt ? undefined : { systemPrompt: fallback };
-										}
-										const swapped = tplPrompt + event.systemPrompt.slice(boundary);
+										const swapped = rewrap(
+											boundary === -1 ? `${tplPrompt}\n\n${core}` : tplPrompt + core.slice(boundary),
+										);
 										return swapped === event.systemPrompt ? undefined : { systemPrompt: swapped };
 									}
-									// 主会话：组合模板渲染（模板为空且无覆盖时返回 undefined = 用 SDK 默认）。
+									// 主会话：按当前会话归属预设与真正活跃的工具列表组装系统提示词
+									const conv = this.convs.get(ownerId ?? this.activeId) ?? this.conv;
+									const sess = conv?.session;
+									const activeToolNames = sess ? sess.getActiveToolNames() : [];
+									const activeSet = new Set(activeToolNames);
+									const activeSnippets: Record<string, string> = {};
+									const activeGuidelines: string[] = [];
+									if (sess) {
+										for (const name of activeSet) {
+											const def = sess.getToolDefinition(name);
+											if (!def) continue;
+											if (def.promptSnippet && def.promptSnippet.trim()) {
+												activeSnippets[name] = def.promptSnippet.trim();
+											}
+											if (def.promptGuidelines) {
+												activeGuidelines.push(...def.promptGuidelines);
+											}
+										}
+									}
+									const currentPreset =
+										conv?.agentPreset ?? targetPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
 									const opts = event.systemPromptOptions as
 										| {
 												cwd?: string;
+												forceSystemPrompt?: string;
 												selectedTools?: string[];
 												toolSnippets?: Record<string, string>;
 												promptGuidelines?: string[];
@@ -3604,18 +4472,20 @@ export class ClientSession {
 										  }
 										| undefined;
 									const rendered = this.renderMainCompose({
-										cwd: typeof opts?.cwd === "string" ? opts.cwd : this.cwd,
-										selectedTools: opts?.selectedTools ?? [],
-										toolSnippets: opts?.toolSnippets ?? {},
-										toolGuidelines: opts?.promptGuidelines ?? [],
+										cwd: typeof opts?.cwd === "string" ? opts.cwd : (conv?.cwd ?? effectiveCwd ?? this.cwd),
+										selectedTools: activeToolNames.length > 0 ? activeToolNames : (opts?.selectedTools ?? []),
+										toolSnippets: activeSnippets,
+										toolGuidelines: activeGuidelines,
 										contextFiles: opts?.contextFiles ?? [],
 										skills: (opts?.skills ?? []).map((s) => ({
 											name: s.name,
 											description: s.description ?? "",
 											filePath: s.filePath ?? "",
 										})),
+										preset: currentPreset,
 									});
-									return rendered ? { systemPrompt: rendered } : undefined;
+									// 不自定义时 rendered 为 undefined：不返回提示词，前面扩展的改动原样保留。
+									return rendered ? { systemPrompt: rewrap(rendered) } : undefined;
 								});
 							},
 						},
@@ -3664,6 +4534,8 @@ export class ClientSession {
 				// 覆盖 SDK 内置 bash（customTools 按 name 覆盖）。双实现分流：
 				// 「默认 bash 覆盖」开关（terminalBash）关 → 原生 SDK bash（纯进程、不开终端）；
 				// 开 → 终端接管 bash（persist 决定一次性/持久，可静默自动转后台）。
+				// 整列工具统一过计划模式闸门（只规划不实施，写类/旁路工具执行前拒），
+				// read/write/edit 三处覆盖在会话建好后另注入（见 installToolOverrides）。
 				customTools: [
 					// P1-5：bash/read 包插件拦截（pre 拒/问即拦、post 脱敏补上下文；
 					// 未注入 toolGuard 时 withToolGuard 原样返回，零开销）。
@@ -3706,69 +4578,77 @@ export class ClientSession {
 							"workspace-write-never",
 						() => this.getLang(),
 					),
-					...makePersistentTerminalTools(terminals, effectiveCwd, () => this.getLang()),
-					// 覆盖 SDK 内置 read（customTools 按 name 覆盖）：路径是目录时列出目录
-					// 条目（复用 SDK ls 的排序/`/` 后缀/截断口径），其余情况原样转发内置实现。
-					// 开关是行为开关（read 本体不可关），每次调用实时读设置——不进
-					// tool-manager 的 ActiveSet 目录。DSH 引擎无 customTool 注册面，不接。
-					withToolGuard(
-						makeReadDirTool(effectiveCwd, {
-							dirEnabled: () => this.settingsSvc.current.readDirEnabled !== false,
-							getLang: () => this.getLang(),
-						}),
-						{
-							toolName: "read",
-							guard: this.toolGuard,
-							conversationId: () => ownerId,
-							getLang: () => this.getLang(),
-							cwd: effectiveCwd,
-							getRoots: () => this.roots,
-							askApproval: (toolCallId, toolName, params, reason, reasonEn, convId, category) =>
-								this.askApproval(toolCallId, toolName, params, reason, reasonEn, convId, category),
-							getRules: () => this.approvalRules.list(),
+					...makePersistentTerminalTools(terminals, effectiveCwd, () => this.getLang(), {
+						checkSafety: (cmd) => {
+							// 计划模式：终端只放行只读命令（常驻终端也走这条，与 bash 覆盖同口径）。
+							if (this.planModeOf(ownerId)) {
+								const denied = planModeDenial("bash", { command: cmd });
+								if (denied) return { blocked: true, reason: denied.reason };
+							}
+							// 目标审查回合：常驻终端同样只放只读命令（审查者跑测试可以，改文件不行）。
+							if (this.goalReviewTurnOf(ownerId)) {
+								const denied = goalReviewDenial("bash", { command: cmd });
+								if (denied) return { blocked: true, reason: denied.reason };
+							}
+							const perm =
+								(ownerId ? this.convs.get(ownerId)?.permissionPreset : undefined) ??
+								this.settingsSvc.current.defaultPermissionPreset ??
+								"workspace-write-never";
+							if (perm === "read-only") {
+								const danger = checkDangerousToolCall(
+									"bash",
+									{ command: cmd },
+									effectiveCwd,
+									this.roots,
+									this.approvalRules.list(),
+								);
+								if (danger.denied || danger.dangerous) {
+									return { blocked: true, reason: danger.reason || "只读模式禁止执行高危/破坏性命令" };
+								}
+							}
+							const danger = checkDangerousToolCall(
+								"bash",
+								{ command: cmd },
+								effectiveCwd,
+								this.roots,
+								this.approvalRules.list(),
+							);
+							if (danger.denied) {
+								return { blocked: true, reason: danger.reason || "命中系统阻断规则" };
+							}
+							return {};
 						},
-					),
-					// 覆盖 SDK 内置 write / edit，并在执行层注入会话级三档权限沙箱门禁与人机协同审批。
-					wrapWriteToolWithPermission(
-						effectiveCwd,
-						() =>
-							(ownerId ? this.convs.get(ownerId)?.permissionPreset : undefined) ??
-							this.settingsSvc.current.defaultPermissionPreset ??
-							"workspace-write-never",
-						() => this.roots,
-						() => this.getLang(),
-						(toolCallId, toolName, params, reason, reasonEn, convId, category) =>
-							this.askApproval(toolCallId, toolName, params, reason, reasonEn, convId, category),
-						() => ownerId,
-						() => this.approvalRules.list(),
-					),
-					wrapEditToolWithPermission(
-						effectiveCwd,
-						() =>
-							(ownerId ? this.convs.get(ownerId)?.permissionPreset : undefined) ??
-							this.settingsSvc.current.defaultPermissionPreset ??
-							"workspace-write-never",
-						() => this.roots,
-						() => this.getLang(),
-						(toolCallId, toolName, params, reason, reasonEn, convId, category) =>
-							this.askApproval(toolCallId, toolName, params, reason, reasonEn, convId, category),
-						() => ownerId,
-						() => this.approvalRules.list(),
-					),
+					}),
+					// read / write / edit 三处覆盖**不在这里注册**：创建时的 customTools 恒胜、与
+					// 扩展加载顺序无关，直接塞进来会静默顶掉第三方扩展注册的同名工具（见
+					// tool-overrides.ts）；它们改在会话建好后由 installToolOverrides 注入。
 					// 不覆盖内置 edit 的独立宽松编辑工具（缩进不敏感匹配；开关看设置；带权限沙箱拦截与人机协同）。
-					wrapEditSoftToolWithPermission(
-						makeEditSoftTool(effectiveCwd, () => this.getLang()),
-						effectiveCwd,
-						() =>
-							(ownerId ? this.convs.get(ownerId)?.permissionPreset : undefined) ??
-							this.settingsSvc.current.defaultPermissionPreset ??
-							"workspace-write-never",
-						() => this.roots,
+					// 目标审查闸门包在最外层：审查回合的理由最贴合此刻（跟模型说「这是审查回合」）。
+					withGoalReviewGate(
+						withDelegationGate(
+							withPlanModeGate(
+								wrapEditSoftToolWithPermission(
+									makeEditSoftTool(effectiveCwd, () => this.getLang()),
+									effectiveCwd,
+									() =>
+										(ownerId ? this.convs.get(ownerId)?.permissionPreset : undefined) ??
+										this.settingsSvc.current.defaultPermissionPreset ??
+										"workspace-write-never",
+									() => this.roots,
+									() => this.getLang(),
+									(toolCallId, toolName, params, reason, reasonEn, convId, category) =>
+										this.askApproval(toolCallId, toolName, params, reason, reasonEn, convId, category),
+									() => ownerId,
+									() => this.approvalRules.list(),
+								),
+								() => this.planModeOf(ownerId),
+								() => this.getLang(),
+							),
+							() => this.delegateModeOf(ownerId),
+							() => this.getLang(),
+						),
+						() => this.goalReviewTurnOf(ownerId),
 						() => this.getLang(),
-						(toolCallId, toolName, params, reason, reasonEn, convId, category) =>
-							this.askApproval(toolCallId, toolName, params, reason, reasonEn, convId, category),
-						() => ownerId,
-						() => this.approvalRules.list(),
 					),
 					// 插件注册的 AI 工具（创建时刻的实时快照，已按 disabledPluginTools 过滤；
 					// 后续注册经 refreshPluginTools 动态补入已有会话）。
@@ -3858,16 +4738,40 @@ export class ClientSession {
 						lang: () => this.getLang(),
 					}),
 					// 高可靠行补丁工具（patch，基于内容哈希与语法块级替换）。
-					makePatchTool({ cwd: effectiveCwd, ownerId }),
+					makePatchTool({ cwd: effectiveCwd, ownerId, lang: () => this.getLang() }),
 					// 原生语言服务器工具（lsp，定义跳转/引用/悬停/诊断）。
-					makeLspTool({ cwd: effectiveCwd, ownerId }),
-				],
+					makeLspTool({ cwd: effectiveCwd, ownerId, lang: () => this.getLang() }),
+				].map((t) =>
+					// 目标审查闸门在最外层（理由最贴合此刻）；插件工具也在这个数组里，
+					// 创建时注册的同样被闸门覆盖（后续动态补入的走 syncPluginTools，与
+					// 计划/审查者闸门同口径不在覆盖面，见 goal-review-gate.ts 头注）。
+					withGoalReviewGate(
+						withDelegationGate(
+							withPlanModeGate(
+								t,
+								() => this.planModeOf(ownerId),
+								() => this.getLang(),
+							),
+							() => this.delegateModeOf(ownerId),
+							() => this.getLang(),
+						),
+						() => this.goalReviewTurnOf(ownerId),
+						() => this.getLang(),
+					),
+				),
 			});
 			// 桥接工具归属锚点：SDK 会话对象在本 runtime 生命周期内稳定，过户只搬对话
 			// 不改它（见 ClientSession.findConversationHome）。
 			bridgeAnchor.session = created.session;
-			// 终端工具开关从创建起就生效（工具始终注册进注册表，只调活跃集）。
-			this.applyToolGating(created.session);
+			// read / write / edit 三处覆盖在会话建好后注入（见 tool-overrides.ts）：SDK 的合并链是
+			// [...扩展工具, ...customTools] 后写赢 ⇒ 创建时塞进 customTools 会**恒定顶掉**第三方
+			// 扩展注册的同名工具（官方 docs/extensions.md 明写扩展可覆盖 read/write/edit）。
+			installToolOverrides(
+				created.session as unknown as OverrideSessionLike,
+				this.toolOverrideSpecs(ownerId, effectiveCwd),
+			);
+			// 终端工具开关与预设门控从创建起就生效（工具始终注册进注册表，只调活跃集）。
+			this.applyToolGating(created.session, targetPreset);
 			return {
 				...created,
 				services,
@@ -3903,6 +4807,8 @@ export class ClientSession {
 				readPermissionFromSession(runtime.session.sessionManager) ??
 				this.settingsSvc.current.defaultPermissionPreset ??
 				"workspace-write-never",
+			planMode: readPlanModeFromSession(runtime.session.sessionManager) === true,
+			delegateMode: readDelegateModeFromSession(runtime.session.sessionManager) === true,
 			// A brand-new conversation is not yet LISTED — it enters the running
 			// list only when it is displaced to the background while still
 			// streaming (its runtime is what `listed` protects). A blank chat is
@@ -3916,7 +4822,6 @@ export class ClientSession {
 			stallNoticed: false,
 			goal: this.makeGoalStatus(),
 			goalGeneration: 0,
-			goalReviewGeneration: 0,
 			wizardRunning: false,
 			deltaSeq: 0,
 			terminals,
@@ -3989,7 +4894,7 @@ export class ClientSession {
 					textEn: `Restart interrupted "${r.title}" — reopening it and continuing automatically.`,
 				});
 				await this.switchSession(r.sessionFile!);
-				await this.prompt(continueText);
+				await this.promptResumedConversation(r.sessionFile!, continueText);
 			} catch {
 				// switchSession/prompt already surface failures as notices;
 				// one bad session must not block the rest.
@@ -4004,6 +4909,48 @@ export class ClientSession {
 		} catch {
 			/* staying on the last resumed session is a fine fallback */
 		}
+	}
+
+	/** 找持有指定转录文件的本地对话 id（找不到 = 已被关闭/搬走/还没建好）。 */
+	private conversationIdBySessionFile(file: string): string | null {
+		let abs: string;
+		try {
+			abs = resolve(file);
+		} catch {
+			return null;
+		}
+		for (const c of this.convs.values()) {
+			try {
+				const f = c.session.sessionFile;
+				if (f && resolve(f) === abs) return c.id;
+			} catch {
+				// session 被替换中 —— 跳过
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * 恢复流程的「继续」投递（resumeInterrupted 专用）。
+	 * 读码结论：prompt() 在**调用时刻**同步捕获 active 对话（进入函数第一行取
+	 * this.conv，先于任何 await），调用之后发生的切换不影响投递目标。唯一的错投
+	 * 窗口在 switchSession 内部：activeId 置位后还要 await bindSession/恢复模型，
+	 * 期间用户的并发切换会把 active 挪走 —— 恢复循环接着调 prompt 就会把「继续」
+	 * 投进用户当前对话。因此投递前把目标对话修回 active，并在同一同步执行段内
+	 * （上一个 await 恢复点之后、无新 await 处）核对 activeId 后才调用 prompt；
+	 * 修不回（再次被抢）就放弃自动继续 —— 宁可少投，不投错对话。
+	 */
+	private async promptResumedConversation(sessionFile: string, text: string): Promise<void> {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const targetId = this.conversationIdBySessionFile(sessionFile);
+			if (!targetId) return; // 目标对话已没了（被关/被过户），不投
+			if (this.activeId === targetId) {
+				await this.prompt(text);
+				return;
+			}
+			await this.switchConversation(targetId);
+		}
+		// 两次都没能稳定拿回 active：放弃自动继续，用户可手动点开那条对话。
 	}
 
 	/** Add a socket to this client's broadcast set; flushes buffered startup notices. */
@@ -4094,9 +5041,11 @@ export class ClientSession {
 		};
 	}
 
-	/** (Re)attach event plumbing to the ACTIVE conversation's session. */
-	private async bindSession(): Promise<void> {
-		const conv = this.conv;
+	/** (Re)attach event plumbing to a conversation's session. 默认绑当前活跃对话；
+	 *  forceReset 重建非活跃对话（子代理/角色对话）时必须显式传入该对话，
+	 *  否则重建后的会话永远拿不回事件订阅（issue #484）。 */
+	private async bindSession(target?: Conversation): Promise<void> {
+		const conv = target ?? this.conv;
 		conv.unsubscribe?.();
 		conv.session = conv.runtime.session;
 		await conv.session.bindExtensions({
@@ -4283,6 +5232,9 @@ export class ClientSession {
 			const modelId = curModel ? `${curModel.provider}/${curModel.id}` : undefined;
 			return {
 				conversationId: target.id,
+				sessionId: target.session.sessionId,
+				sessionFile: target.session.sessionFile,
+				sessionDir: target.session.sessionManager?.getSessionDir?.(),
 				title: target.title,
 				model: modelId,
 				at: target.lastActiveAt,
@@ -4334,7 +5286,7 @@ export class ClientSession {
 	}
 
 	/** 插件扩展点 v2（供 conversationSearcher）：运行中对话标题 + 历史会话全文匹配，返回前 N 个 {id,title}。
-	 *  复用 searchSessions 的 sessionMatchesSearch 判定（含转录全文），只读不 emit。 */
+	 *  复用 searchSessions 的匹配口径（元信息 + 按需加载的转录全文），只读不 emit。 */
 	async searchForPlugins(query: string, limit = 20): Promise<{ id: string; title: string }[]> {
 		const q = query.trim().toLowerCase();
 		if (!q) return [];
@@ -4345,8 +5297,8 @@ export class ClientSession {
 		}
 		try {
 			const infos = await this.loadSessionInfos();
-			for (const s of infos) {
-				if (!sessionMatchesSearch(q, s)) continue;
+			const matched = await ClientSession.filterSessionsForSearch(q, infos);
+			for (const s of matched) {
 				out.push({
 					id: s.path,
 					title: (s.name?.trim() || s.firstMessage.trim() || basename(s.path)).slice(0, 60),
@@ -4551,6 +5503,11 @@ export class ClientSession {
 		// Any SDK event proves the run is alive — feeds the stall watchdog below.
 		conv.lastSdkEventAt = Date.now();
 		conv.stallNoticed = false;
+		// 模型可能在 pi-web-ui 之外被换（SDK 从会话历史恢复、/model 命令等），
+		// 而软上限 reserve 是按注入那一刻的窗口换算的固定值——模型一变必须重算，
+		// 否则大窗口算出的 reserve 泄漏到小窗口模型上，触发点被压成负数，
+		// 上下文刚过几万 token 就反复触发压缩。热路径只做一次字符串比对。
+		this.reapplySoftCapIfModelChanged(conv);
 		switch (event.type) {
 			case "bash_execution_update": {
 				if (event.id) {
@@ -4809,10 +5766,13 @@ export class ClientSession {
 					return a.role === "assistant" && a.stopReason === "aborted";
 				});
 				if (aborted) {
+					// 角色轮等待者先唤醒（中止也算「本轮结束」），再让 GoalService 作废目标。
+					this.notifyTurnEnd(conv);
 					const stopNotice = this.goalSvc.onAgentEnd(conv, true);
 					if (stopNotice) {
 						this.emit({ type: "notice", level: "warning", text: stopNotice.text, textEn: stopNotice.textEn });
 					}
+					this.emitConversations();
 					break;
 				}
 				// 子代理运行报错（provider 400 / 超时等）→ 通知主对话，让用户/AI 知道
@@ -4835,6 +5795,9 @@ export class ClientSession {
 					this.emitConversations();
 				}
 				// Goal review hook lives in GoalService.onAgentEnd(conv, false).
+				// 先唤醒角色轮等待者：委托执行（Plan A）下服务端正阻塞在「等主对话给 verdict」
+				// 或「等对话空闲」上，而 onAgentEnd 随后会把它需要的 verdict 交回。
+				this.notifyTurnEnd(conv);
 				this.goalSvc.onAgentEnd(conv, false);
 				// Deferred settings reload: settings (system prompt / skills /
 				// extensions) changed while the run was streaming — applying now
@@ -4875,9 +5838,17 @@ export class ClientSession {
 						}
 					}, 50);
 				}
+				// 本轮真正结束且不再重试：立即向客户端广播最新会话状态（流式状态及时复位）
+				if (!event.willRetry) {
+					this.emitConversations();
+				}
 				break;
 			}
 			case "agent_settled": {
+				// 记录本会话自己的 Base 基线：currentBaseTokens 必须传 conv（否则串成
+				// 活跃会话的基线）；快照未就绪时保持 undefined，宁可少补偿也不把 0 钉死。
+				const settledBaseTokens = this.currentBaseTokens(conv);
+				if (settledBaseTokens != null) conv.lastTurnBaseTokens = settledBaseTokens;
 				if (conv.pendingCompaction && !this.disposed) {
 					const pending = conv.pendingCompaction;
 					conv.pendingCompaction = null;
@@ -5089,7 +6060,44 @@ export class ClientSession {
 		// 一次扫描同时收齐「当前转写里的全部缓存键」（live 集合，供
 		// pruneMessageCache 精确回收死条目）与各自的序列化结果。
 		const live = new Set<string>();
-		let rawMessages = conv.session.agent.state.messages
+
+		let agentMessages = conv.session.agent.state.messages;
+		// issue #448: 多次压缩后 SDK state.messages 只保留最后一次压缩卡片。
+		// 从当前分支祖先链中提取前序未展示的历史 compaction 并正序置前，
+		// 使前端能逐段回溯展开历史折叠内容。
+		if (conv.session.sessionManager?.getBranch) {
+			try {
+				const branch = conv.session.sessionManager.getBranch();
+				const compEntries = branch.filter((e) => e.type === "compaction");
+				if (compEntries.length > 1) {
+					const existingCompKeys = new Set(
+						agentMessages
+							.filter((m) => m.role === "compactionSummary")
+							.map((m) => `${m.timestamp}:${(m as { summary?: string }).summary ?? ""}`),
+					);
+					const missingComps: AgentMessage[] = [];
+					for (const ce of compEntries) {
+						const ts = ce.timestamp ? new Date(ce.timestamp).getTime() : 0;
+						const key = `${ts}:${ce.summary ?? ""}`;
+						if (!existingCompKeys.has(key)) {
+							missingComps.push({
+								role: "compactionSummary",
+								summary: ce.summary ?? "",
+								tokensBefore: ce.tokensBefore,
+								timestamp: ts,
+							} as AgentMessage);
+						}
+					}
+					if (missingComps.length > 0) {
+						agentMessages = [...missingComps, ...agentMessages];
+					}
+				}
+			} catch {
+				// 获取分支异常不影响当前渲染
+			}
+		}
+
+		let rawMessages = agentMessages
 			.map((m) => {
 				const k = this.uiMessageKey(conv, m);
 				live.add(k.cacheKey);
@@ -5156,14 +6164,42 @@ export class ClientSession {
 							tokens: conv.lastCompactionTokens,
 							contextWindow: cu.contextWindow,
 							percent: (conv.lastCompactionTokens / cu.contextWindow) * 100,
-							estimated: true,
+							estimated: false,
 							softCap: this.activeSoftCap(cu.contextWindow),
 						};
 					}
+					// 展示用兜底 0（会话未就绪时旧行为也是 0）；落账 lastTurnBaseTokens 的路径
+					// 在 agent_settled 处对 null 跳过，不受此兜底影响。
+					const baseTokens = this.currentBaseTokens(conv) ?? 0;
+					// 空白会话（尚未发言，SDK 报 0 或 null）：真实反映当前模式/工具配置下的 Base 开销。
+					if (cu.contextWindow > 0 && (this.isBlankConversation(conv) || cu.tokens == null || cu.tokens === 0)) {
+						return {
+							tokens: baseTokens,
+							contextWindow: cu.contextWindow,
+							percent: (baseTokens / cu.contextWindow) * 100,
+							estimated: false,
+							softCap: this.activeSoftCap(cu.contextWindow),
+						};
+					}
+					// 首轮对话中（尚未有定稿 assistant 消息，SDK cu.tokens 仅为当前消息估算）：叠加 Base 开销
+					if (conv.lastTurnBaseTokens == null && cu.contextWindow > 0) {
+						const total = baseTokens + (cu.tokens ?? 0);
+						return {
+							tokens: total,
+							contextWindow: cu.contextWindow,
+							percent: (total / cu.contextWindow) * 100,
+							estimated: false,
+							softCap: this.activeSoftCap(cu.contextWindow),
+						};
+					}
+					// 已有多轮对话历史：若在对话间歇切预设或开关工具，叠加当前 Base 开销相比上一轮定稿时的差额
+					const baseDelta = baseTokens - (conv.lastTurnBaseTokens ?? baseTokens);
+					const effectiveTokens = Math.max(0, (cu.tokens ?? 0) + baseDelta);
 					return {
-						tokens: cu.tokens,
+						tokens: effectiveTokens,
 						contextWindow: cu.contextWindow,
-						percent: cu.percent,
+						percent: cu.contextWindow > 0 ? (effectiveTokens / cu.contextWindow) * 100 : cu.percent,
+						estimated: false,
 						softCap: this.activeSoftCap(cu.contextWindow),
 					};
 				})(),
@@ -5217,11 +6253,21 @@ export class ClientSession {
 			pendingQuestion: this.pendingQuestionForSnapshot(),
 			pendingApproval: this.pendingApprovalForSnapshot(),
 			plan: this.planManager.getPlan(this.activeId),
+			// 计划模式是**会话级**开关：快照恒给布尔（不用 undefined），否则
+			// snapshot_delta 里 key 缺席 → 前端 spread 合并会残留上一对话的 true。
+			planMode: conv?.planMode === true,
+			// 审查者模式同样是**会话级**：布尔恒给（理由同 planMode），另带执行对话 id。
+			delegateMode: conv?.delegateMode === true,
+			delegateConvId: conv?.delegateConvId ?? null,
 			subagentHandoffs: this.subagentHandoffs.length > 0 ? [...this.subagentHandoffs] : undefined,
 			agentPreset: conv
 				? {
 						id: conv.agentPreset ?? "standard",
-						name: PI_AGENT_PRESETS.find((p) => p.id === conv.agentPreset)?.name ?? "全功能",
+						name: localizedName(
+							PI_AGENT_PRESETS.find((p) => p.id === conv.agentPreset),
+							this.getLang(),
+							"全功能",
+						),
 						locked: conv.presetLocked || !this.isBlankConversation(conv),
 					}
 				: null,
@@ -5698,12 +6744,108 @@ export class ClientSession {
 		this.flushSnapshot();
 	}
 
+	updatePlanStep(stepId: string, patch: Partial<import("./protocol.js").PlanStep>, conversationId?: string): void {
+		const convId = conversationId ?? this.activeId;
+		const plan = this.planManager.updateStep(convId, stepId, patch);
+		this.emit({
+			type: "plan_updated",
+			conversationId: convId,
+			plan,
+		});
+		this.flushSnapshot();
+	}
+
+	deletePlanStep(stepId: string, conversationId?: string): void {
+		const convId = conversationId ?? this.activeId;
+		const plan = this.planManager.deleteStep(convId, stepId);
+		this.emit({
+			type: "plan_updated",
+			conversationId: convId,
+			plan,
+		});
+		this.flushSnapshot();
+	}
+
+	addPlanStep(step: import("./protocol.js").PlanStep, afterStepId?: string, conversationId?: string): void {
+		const convId = conversationId ?? this.activeId;
+		const plan = this.planManager.addStep(convId, step, afterStepId);
+		this.emit({
+			type: "plan_updated",
+			conversationId: convId,
+			plan,
+		});
+		this.flushSnapshot();
+	}
+
+	/** 「✨ 净室执行（Clean-session Handoff）」：
+	 *  关闭源会话的计划闸门，新建隔离会话，在新会话中原子设置计划步骤、可选迁移目标，并触发实施轮 prompt。 */
+	async planCleanHandoff(steps: import("./protocol.js").PlanStep[], promptText: string): Promise<void> {
+		const sourceConv = this.conv;
+		if (sourceConv?.planMode) {
+			await this.setPlanMode(false, sourceConv.id);
+		}
+		const sourceGoal = sourceConv?.goal?.goal;
+
+		await this.newChat();
+		const targetConv = this.conv;
+		this.planManager.setPlan(targetConv.id, steps);
+		if (sourceGoal) {
+			try {
+				await this.goalSvc.setGoal(sourceGoal, { targetConvId: targetConv.id, autoStart: false });
+			} catch {
+				// 目标迁移失败不阻塞实施
+			}
+		}
+		this.flushSnapshot();
+		await this.prompt(promptText);
+	}
+
 	/** 关闭所有挂起提问（dispose 时清理）：以「取消」解析，避免模型挂死。 */
 	cancelPendingQuestions(): void {
 		for (const [, p] of this.pendingQuestions) {
 			p.resolve(null);
 		}
 		this.pendingQuestions.clear();
+	}
+
+	/** #487：结算指定会话的挂起提问/审批（按 conversationId 精确匹配）。
+	 *  abort/移除/重建会话后残留的条目会让 isWaitingOnUser 恒真——stall 失联
+	 *  检测被永久豁免，且问卷/审批弹窗跨轮残留。dispose 口径范本：提问以
+	 *  「取消」解析、审批以「拒绝」解析并广播 tool_approval_resolved。 */
+	private settlePendingsForConv(convId: string): void {
+		for (const [id, q] of this.pendingQuestions) {
+			if (q.conversationId !== convId) continue;
+			this.pendingQuestions.delete(id);
+			try {
+				q.resolve(null);
+			} catch {
+				// 单个结算异常不影响其余清理
+			}
+		}
+		for (const [id, a] of this.pendingApprovals) {
+			if (a.conversationId !== convId) continue;
+			this.pendingApprovals.delete(id);
+			try {
+				a.resolve({ decision: "deny", reason: "运行已停止" });
+			} catch {
+				// 单个结算异常不影响其余清理
+			}
+			this.emit({ type: "tool_approval_resolved", id });
+		}
+	}
+
+	/** 关闭所有挂起审批（dispose 时清理）：以「拒绝」解析，避免等答复的
+	 *  Promise 与对应 runtime 泄漏（会话没了，审批弹窗永远不会有人点）。 */
+	cancelPendingApprovals(): void {
+		for (const [id, a] of this.pendingApprovals) {
+			this.pendingApprovals.delete(id);
+			try {
+				a.resolve({ decision: "deny", reason: "会话已关闭" });
+			} catch {
+				// 单个 resolve 异常不影响其余清理
+			}
+			this.emit({ type: "tool_approval_resolved", id });
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -5912,6 +7054,10 @@ export class ClientSession {
 					// Windows: npm and friends are .cmd shims — Node can only exec
 					// them through the shell (otherwise spawn npm → ENOENT).
 					shell: process.platform === "win32",
+					// posix 下让子进程自成进程组：超时时能整组杀掉（孙进程不残留）。
+					// 代价是父进程退出后子进程可能短暂存活——这些都是带超时的短命令，
+					// 可接受；win32 不需要（走 taskkill /T）。
+					detached: process.platform !== "win32",
 				});
 			} catch (err) {
 				resolve({ code: -1, out: String(err) });
@@ -5925,7 +7071,24 @@ export class ClientSession {
 				clearTimeout(t);
 				resolve({ code, out: text ?? out });
 			};
-			const t = setTimeout(() => p.kill(), timeoutMs);
+			const t = setTimeout(() => {
+				// 只 p.kill() 杀不掉整棵树（win32 下杀的是 cmd.exe 壳，posix 下
+				// 杀不到孙进程）—— 按平台走整树杀，失败再退回 p.kill 兜底。
+				const plan = processTreeKillPlan(process.platform, p.pid);
+				try {
+					if (plan.kind === "taskkill") {
+						// taskkill 独立进程执行：父 cmd 死活不影响命中目标树。
+						spawn(plan.cmd, plan.args, { stdio: "ignore", windowsHide: true });
+					} else if (plan.kind === "group-signal") {
+						process.kill(-p.pid!, plan.signal);
+					} else {
+						p.kill();
+					}
+				} catch {
+					// 进程组已不在（正常退出竞态）等 —— 退回直接杀。
+					p.kill();
+				}
+			}, timeoutMs);
 			p.stdout?.on("data", (d: Buffer) => (out += d.toString()));
 			p.stderr?.on("data", (d: Buffer) => (out += d.toString()));
 			p.on("error", (err) => done(-1, String(err)));
@@ -6050,10 +7213,92 @@ export class ClientSession {
 	/** Cache window for the all-source check: 30 minutes. */
 	static UPDATE_ALL_CACHE_MS = 30 * 60_000;
 	private updatesAllCache: { at: number; items: UpdateItem[] } | null = null;
+	private notifiedPluginUpdates = new Set<string>();
+	private lastPluginUpdates: UiPluginUpdateInfo[] = [];
+
+	/**
+	 * 主动检查已安装界面插件（<dataDir>/plugins）的更新状态并向客户端推送。
+	 */
+	async checkPluginUpdates(manual = false): Promise<void> {
+		const lang = () => this.getLang();
+		try {
+			const updates = await checkPluginUpdates(this.stateStore.dataDir, undefined, lang);
+			const list: UiPluginUpdateInfo[] = updates.map((p) => ({
+				id: p.id,
+				name: p.name,
+				version: p.version,
+				latestVersion: p.latestVersion ?? null,
+				source: p.source,
+				localSha: p.localSha,
+				remoteSha: p.remoteSha,
+				updatable: p.updatable,
+				builtin: p.builtin,
+				error: p.error,
+			}));
+			this.lastPluginUpdates = list;
+			this.emit({ type: "plugin_updates", updates: list });
+
+			const updatableBuiltins = list.filter((p) => p.builtin && p.updatable);
+			if (manual) {
+				if (updatableBuiltins.length > 0) {
+					const names = updatableBuiltins.map((p) => p.name || p.id).join(", ");
+					this.emit({
+						type: "notice",
+						level: "info",
+						text: `发现 ${updatableBuiltins.length} 个内置插件有更新：${names}`,
+						textEn: `Update available for ${updatableBuiltins.length} built-in plugin(s): ${names}`,
+					});
+				} else {
+					const allUpdatable = list.filter((p) => p.updatable);
+					if (allUpdatable.length > 0) {
+						const names = allUpdatable.map((p) => p.name || p.id).join(", ");
+						this.emit({
+							type: "notice",
+							level: "info",
+							text: `发现 ${allUpdatable.length} 个插件有更新：${names}`,
+							textEn: `Update available for ${allUpdatable.length} plugin(s): ${names}`,
+						});
+					} else {
+						this.emit({
+							type: "notice",
+							level: "info",
+							text: "所有插件均为最新版本。",
+							textEn: "All plugins are up to date.",
+						});
+					}
+				}
+			} else {
+				const newUpdatables = updatableBuiltins.filter((p) => {
+					const key = `${p.id}@${p.latestVersion || p.remoteSha || "upd"}`;
+					if (this.notifiedPluginUpdates.has(key)) return false;
+					this.notifiedPluginUpdates.add(key);
+					return true;
+				});
+				if (newUpdatables.length > 0) {
+					const names = newUpdatables.map((p) => p.name || p.id).join(", ");
+					this.emit({
+						type: "notice",
+						level: "info",
+						text: `发现 ${newUpdatables.length} 个内置插件有更新可用：${names}，可前往设置或更新面板中更新。`,
+						textEn: `Update available for ${newUpdatables.length} built-in plugin(s): ${names}. You can update in Settings or the Updates panel.`,
+					});
+				}
+			}
+		} catch (err) {
+			if (manual) {
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `检查插件更新失败：${(err as Error).message}`,
+					textEn: `Failed to check plugin updates: ${(err as Error).message}`,
+				});
+			}
+		}
+	}
 
 	/**
 	 * All-source update check: pi-web-ui + the pi core + direct pi extensions
-	 * from the agent manifest (fallback: raw walk). Re-emits the cached list
+	 * from the agent manifest (fallback: raw walk) + installed UI plugins. Re-emits the cached list
 	 * within UPDATE_ALL_CACHE_MS; pass force=true (explicit refresh) to bypass.
 	 */
 	async checkUpdatesAll(force = false): Promise<void> {
@@ -6072,17 +7317,72 @@ export class ClientSession {
 				items: this.updatesAllCache.items,
 				piSdk,
 			});
+			if (this.lastPluginUpdates.length > 0) {
+				this.emit({ type: "plugin_updates", updates: this.lastPluginUpdates });
+			}
 			return;
 		}
 		try {
 			const targets = collectTargets(this.agentDir, ClientSession.currentAppVersion(), undefined, {
 				projectCwd: this.convs.get(this.activeId)?.cwd ?? this.cwd,
 			});
-			const items = sortUpdateItems(
-				await checkAllUpdates(targets, undefined, () => this.getLang(), resolveNpmRegistry(this.agentDir)),
-			);
-			this.updatesAllCache = { at: Date.now(), items };
-			this.emit({ type: "update_status_all", items, piSdk });
+			const items = await checkAllUpdates(targets, undefined, () => this.getLang(), resolveNpmRegistry(this.agentDir));
+
+			let pluginItems: UpdateItem[] = [];
+			try {
+				const pluginUpdates = await checkPluginUpdates(this.stateStore.dataDir, undefined, () => this.getLang());
+				const list: UiPluginUpdateInfo[] = pluginUpdates.map((p) => ({
+					id: p.id,
+					name: p.name,
+					version: p.version,
+					latestVersion: p.latestVersion ?? null,
+					source: p.source,
+					localSha: p.localSha,
+					remoteSha: p.remoteSha,
+					updatable: p.updatable,
+					builtin: p.builtin,
+					error: p.error,
+				}));
+				this.lastPluginUpdates = list;
+				this.emit({ type: "plugin_updates", updates: list });
+
+				pluginItems = pluginUpdates.map((p) => ({
+					name: p.name ? `${p.name} (${p.id})` : p.id,
+					kind: "plugin" as const,
+					current: p.version ? `v${p.version}` : (p.localSha ?? "unknown"),
+					latest: p.latestVersion ? `v${p.latestVersion}` : (p.remoteSha ?? null),
+					latestPublishedAt: null,
+					upToDate: !p.updatable,
+					error: p.error,
+					source: p.source,
+					pluginId: p.id,
+					builtin: p.builtin,
+				}));
+
+				const newUpdatables = pluginUpdates
+					.filter((p) => p.builtin && p.updatable)
+					.filter((p) => {
+						const key = `${p.id}@${p.latestVersion || p.remoteSha || "upd"}`;
+						if (this.notifiedPluginUpdates.has(key)) return false;
+						this.notifiedPluginUpdates.add(key);
+						return true;
+					});
+				if (newUpdatables.length > 0) {
+					const names = newUpdatables.map((p) => p.name || p.id).join(", ");
+					this.emit({
+						type: "notice",
+						level: "info",
+						text: `发现 ${newUpdatables.length} 个内置插件有更新可用：${names}，可前往设置或更新面板中更新。`,
+						textEn: `Update available for ${newUpdatables.length} built-in plugin(s): ${names}. You can update in Settings or the Updates panel.`,
+					});
+				}
+			} catch (err) {
+				console.warn("[agent-service] 检查插件更新失败:", err);
+			}
+
+			const allItems = sortUpdateItems([...items, ...pluginItems]);
+			this.updatesAllCache = { at: Date.now(), items: allItems };
+			this.emit({ type: "update_status_all", items: allItems, piSdk });
 		} catch (err) {
 			// checkAll degrades per-item; only local enumeration blowing up lands
 			// here — still report a usable (webui-only) error item.
@@ -6214,11 +7514,13 @@ export class ClientSession {
 			this.flushSnapshot();
 		},
 		refreshSessions: () => this.refreshSessions(),
+		setPlanMode: (enabled) => this.setPlanMode(enabled),
+		getPlanMode: () => this.conv?.planMode === true,
 		afterReload: () => {
 			// /reload 同样重读磁盘 settings.json——重放重试覆盖 + 软上限覆盖 + 终端门控。
 			this.applyRetryOverrides();
 			this.applyCompactionOverrides();
-			this.applyToolGating(this.session);
+			this.applyToolGating(this.session, this.conv?.agentPreset);
 		},
 		pluginCommands: () => this.pluginCommandsProvider?.() ?? [],
 		execPluginCommand: async (name, args) => {
@@ -6312,8 +7614,15 @@ export class ClientSession {
 	reloadModelsConfig(): Promise<void> {
 		return this.modelAdmin.reloadModelsConfig();
 	}
-	fetchModelsList(reqId: number, baseUrl: string, apiKey?: string, authHeader?: boolean, api?: string): Promise<void> {
-		return this.modelAdmin.fetchModelsList(reqId, baseUrl, apiKey, authHeader, api, () => this.getLang());
+	fetchModelsList(
+		reqId: number,
+		baseUrl: string,
+		apiKey?: string,
+		authHeader?: boolean,
+		api?: string,
+		providerId?: string,
+	): Promise<void> {
+		return this.modelAdmin.fetchModelsList(reqId, baseUrl, apiKey, authHeader, api, () => this.getLang(), providerId);
 	}
 
 	testModelConnection(
@@ -6322,8 +7631,9 @@ export class ClientSession {
 		apiKey?: string,
 		authHeader?: boolean,
 		api?: string,
+		providerId?: string,
 	): Promise<void> {
-		return this.modelAdmin.testConnection(reqId, baseUrl, apiKey, authHeader, api, () => this.getLang());
+		return this.modelAdmin.testConnection(reqId, baseUrl, apiKey, authHeader, api, () => this.getLang(), providerId);
 	}
 	refreshProviderModels(providerId: string, reqId: number): Promise<void> {
 		return this.modelAdmin.refreshProviderModels(providerId, reqId, () => this.getLang());
@@ -6525,21 +7835,46 @@ export class ClientSession {
 	 *  合并视图，SDK 每次自动压缩检查前都重读 getCompactionSettings()，
 	 *  无需 reload；软上限关闭时回填 SDK 默认 reserve（不让旧覆盖泄漏）。
 	 *  窗口未知（会话未就绪/无模型）的会话跳过——创建/就绪/换模型路径
-	 *  会重放（见各 applyRetryOverrides 调用点）。 */
+	 *  会重放（见各 applyRetryOverrides 调用点）；此外 onEvent 按模型
+	 *  key 变化兜底重放（reapplySoftCapIfModelChanged），保证会话模型
+	 *  在 pi-web-ui 之外被换（如 SDK 从会话历史恢复）后覆盖不泄漏。 */
 	applyCompactionOverrides(): void {
 		const s = this.settingsSvc.current;
 		for (const c of this.convs.values()) {
 			try {
-				const modelId = modelKeyOf(c.session);
-				const contextWindow = contextWindowOf(c.session);
-				const cap = effectiveSoftCap(s.softCapTokens, s.softCapByModel, modelId);
-				const reserve = softCapToReserve(contextWindow, cap);
-				c.session.settingsManager.applyOverrides({
-					compaction: { reserveTokens: reserve ?? DEFAULT_COMPACTION_RESERVE_TOKENS },
-				});
+				this.applyCompactionOverrideForConv(c, s);
 			} catch {
 				// 会话未就绪或已释放 → 其 runtime 创建时统一注入。
 			}
+		}
+	}
+
+	/** 单会话换算并注入软上限 reserve（applyCompactionOverrides 的循环体；
+	 *  reapplySoftCapIfModelChanged 单会话重放也复用）。抛错交调用方处置。 */
+	private applyCompactionOverrideForConv(c: Conversation, s: ClientSettings): void {
+		const modelId = modelKeyOf(c.session);
+		const contextWindow = contextWindowOf(c.session);
+		const cap = effectiveSoftCap(s.softCapTokens, s.softCapByModel, modelId);
+		const reserve = softCapToReserve(contextWindow, cap);
+		c.session.settingsManager.applyOverrides({
+			compaction: { reserveTokens: reserve ?? DEFAULT_COMPACTION_RESERVE_TOKENS },
+		});
+	}
+
+	/** 会话模型变化时重放该会话的软上限覆盖。SDK 恢复历史会话的模型
+	 *  （findInitialModel）与 /model 命令都不经过 pi-web-ui 的 setModel
+	 *  路径，注入过的 reserve 会停留在旧模型窗口的换算值上——例如默认
+	 *  模型（1M 窗口）算出 748576，泄漏到 500K 窗口的会话后压缩触发点
+	 *  变成负数，上下文几万 token 就被反复压缩。onEvent 每个事件比对
+	 *  一次 model key（O(1) 字符串比较），变化才重放。 */
+	private reapplySoftCapIfModelChanged(conv: Conversation): void {
+		try {
+			const key = modelKeyOf(conv.session);
+			if (conv.lastModelKey === key) return;
+			conv.lastModelKey = key;
+			if (key) this.applyCompactionOverrideForConv(conv, this.settingsSvc.current);
+		} catch {
+			// 会话未就绪或已释放 → 留给创建/换模型路径与后续事件重试。
 		}
 	}
 
@@ -6640,7 +7975,7 @@ export class ClientSession {
 					await this.session.reload();
 					this.applyRetryOverrides();
 					this.applyCompactionOverrides();
-					this.applyToolGating(this.session);
+					this.applyToolGating(this.session, this.conv?.agentPreset);
 					await this.pushSlashCommands();
 					this.pushSettings();
 				} catch (err) {
@@ -6713,16 +8048,123 @@ export class ClientSession {
 		return undefined;
 	}
 
+	private convOfSession(session: AgentSession): Conversation | undefined {
+		for (const c of this.convs.values()) if (c.session === session) return c;
+		return undefined;
+	}
+
+	/**
+	 * read / write / edit 三处覆盖的注入规格：基底 = 扩展注册的同名工具优先，否则 SDK 内置实现
+	 * （见 tool-overrides.ts —— 这三处覆盖不能塞进创建时的 `customTools`，那会静默顶掉扩展的
+	 * 同名工具，而官方 docs/extensions.md 明写扩展可覆盖 read/write/edit）。
+	 */
+	private toolOverrideSpecs(ownerId: string | undefined, cwd: string): ToolOverrideSpec[] {
+		const currentPermission = (): string =>
+			(ownerId ? this.convs.get(ownerId)?.permissionPreset : undefined) ??
+			this.settingsSvc.current.defaultPermissionPreset ??
+			"workspace-write-never";
+		const approve: AskApprovalFn = (toolCallId, toolName, params, reason, reasonEn, convId, category) =>
+			this.askApproval(toolCallId, toolName, params, reason, reasonEn, convId, category);
+		// 行为开关（read 本体不可关）：每次调用实时读设置 —— 不进 tool-manager 的 ActiveSet 目录。
+		const readDirOptions: ReadDirToolOptions = {
+			dirEnabled: (): boolean => this.settingsSvc.current.readDirEnabled !== false,
+			getLang: (): ServerLang => this.getLang(),
+		};
+		const readGuardOptions: Parameters<typeof withToolGuard>[1] = {
+			toolName: "read",
+			guard: this.toolGuard,
+			conversationId: () => ownerId,
+			getLang: () => this.getLang(),
+			cwd,
+			getRoots: () => this.roots,
+			askApproval: approve,
+			getRules: () => this.approvalRules.list(),
+		};
+		// 写/编的权限沙箱包装：同一个函数，有扩展同名工具时把它的定义当基底（末参）。
+		// 目标审查闸门包在**最外层**（权限沙箱之前）：审查回合只读核实，写类直接拒。
+		const planGate = (def: ToolDefinition): ToolDefinition =>
+			withGoalReviewGate(
+				withDelegationGate(
+					withPlanModeGate(
+						def,
+						() => this.planModeOf(ownerId),
+						() => this.getLang(),
+					),
+					() => this.delegateModeOf(ownerId),
+					() => this.getLang(),
+				),
+				() => this.goalReviewTurnOf(ownerId),
+				() => this.getLang(),
+			);
+		const composeWrite = (base?: AnyToolDefinition): ToolDefinition =>
+			planGate(
+				wrapWriteToolWithPermission(
+					cwd,
+					currentPermission,
+					() => this.roots,
+					() => this.getLang(),
+					approve,
+					() => ownerId,
+					() => this.approvalRules.list(),
+					base,
+				),
+			);
+		const composeEdit = (base?: AnyToolDefinition): ToolDefinition =>
+			planGate(
+				wrapEditToolWithPermission(
+					cwd,
+					currentPermission,
+					() => this.roots,
+					() => this.getLang(),
+					approve,
+					() => ownerId,
+					() => this.approvalRules.list(),
+					base,
+				),
+			);
+		return [
+			{
+				name: "read",
+				// 没有扩展 read：完整覆盖（内置基底 + 英文描述 + file_path 别名）。
+				fallback: () => withToolGuard(makeReadDirTool(cwd, readDirOptions), readGuardOptions),
+				// 有扩展 read：只叠「目录列条目」，它的锚协议/独有参数/渲染全保留（行为委托它）。
+				composeWith: (base) => withToolGuard(withReadDirSupport(base, cwd, readDirOptions), readGuardOptions),
+			},
+			{ name: "write", fallback: () => composeWrite(), composeWith: (base) => composeWrite(base) },
+			{ name: "edit", fallback: () => composeEdit(), composeWith: (base) => composeEdit(base) },
+		];
+	}
+
 	/** 统一工具门控（tool_manage 唯一落点）：按 disabledAgentTools 把目录内工具
 	 *  逐个加回/剔除活跃集（工具仍留在注册表，重开可直接加回；live 生效无需
 	 *  reload）。支持按当前会话预设（preset）进行工具过滤。
 	 *  session.reload() 与新会话创建都会把 custom 工具加回活跃集，
 	 *  所以这两条路径之后都要重放本方法（见 reloadSession/创建处）。 */
 	private applyToolGating(session: AgentSession, preset?: string): void {
+		const conv = this.convOfSession(session);
 		const targetPreset =
-			preset ?? this.presetOfSession(session) ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
-		applyAgentToolsGating(session, effectiveDisabledAgentTools(this.settingsSvc.current), targetPreset);
+			preset ??
+			conv?.agentPreset ??
+			this.presetOfSession(session) ??
+			this.settingsSvc.current.defaultAgentPreset ??
+			"standard";
+		const isPlanMode = conv?.planMode === true;
+		const disabled = new Set(effectiveDisabledAgentTools(this.settingsSvc.current));
+		if (isPlanMode) {
+			for (const toolName of PLAN_MODE_BLOCKED_TOOL_NAMES) {
+				disabled.add(toolName);
+			}
+		}
+		applyAgentToolsGating(session, [...disabled], targetPreset);
+		const ownerId = conv?.id;
+		syncSubagentOverride(session as unknown as OverrideSessionLike, disabled.has("subagent"), () =>
+			ownerId
+				? makeSubagentTools(withSubagentOwner(this.subagentHost, ownerId), undefined, ownerId)[0]
+				: makeSubagentTools(this.subagentHost)[0],
+		);
 		this.syncPluginTools(session, targetPreset);
+		this.sessionStatsCache = null;
+		this.cachedBaseTokens = null;
 		// SDK 的 setActiveToolsByName 只改 agent.state.tools，不派发任何事件——门控后
 		// 主动推一次快照，否则快照里的 tools 要等下一个 SDK 事件才对齐（会话空闲时永远
 		// 等不到；回归：tests/terminal-smoke-test.mjs「agent exposes persistent terminal tools」）。
@@ -6780,6 +8222,8 @@ export class ClientSession {
 		}
 		conv.agentPreset = hit.id;
 		this.applyToolGating(conv.session, hit.id);
+		this.sessionStatsCache = null;
+		this.cachedBaseTokens = null;
 		// 技能名录段/终端引导是按 run 组装的提示词：重载 resourceLoader 让新预设
 		// 即时生效（只有空白会话能切到这里，无历史可丢）。
 		try {
@@ -6790,9 +8234,10 @@ export class ClientSession {
 		this.emit({
 			type: "notice",
 			level: "info",
-			text: `已切换为「${hit.name}」预设`,
-			textEn: `Switched to preset "${hit.name}"`,
+			text: `已切换为「${localizedName(hit, this.getLang())}」预设`,
+			textEn: `Switched to preset "${localizedName(hit, this.getLang())}"`,
 		});
+		this.pushSettings();
 		this.flushSnapshot();
 	}
 
@@ -6852,10 +8297,213 @@ export class ClientSession {
 		this.emit({
 			type: "notice",
 			level: "info",
-			text: `当前会话权限已切换为「${hit.name}」`,
-			textEn: `Current session permission switched to "${hit.name}"`,
+			text: `当前会话权限已切换为「${localizedName(hit, this.getLang())}」`,
+			textEn: `Current session permission switched to "${localizedName(hit, this.getLang())}"`,
 		});
 		this.flushSnapshot();
+	}
+
+	/** 该会话是否处于计划模式（ownerId 缺省 = 当前对话）。 */
+	private planModeOf(ownerId: string | undefined): boolean {
+		const id = ownerId ?? this.activeId;
+		return this.convs.get(id)?.planMode === true;
+	}
+
+	/** 审查者模式（自动委派）是否对该 runtime 所属会话开着。 */
+	private delegateModeOf(ownerId: string | undefined): boolean {
+		const id = ownerId ?? this.activeId;
+		return this.convs.get(id)?.delegateMode === true;
+	}
+
+	/** 该会话是否正在跑目标审查回合（awaitingVerdict 置位）：是则写类 / 派发类工具
+	 *  走目标审查闸门（server/goal-review-gate.ts）。ownerId 恒为会话 id（创建时传入），
+	 *  缺省才回退活动对话 —— 与 planModeOf / delegateModeOf 同口径。 */
+	private goalReviewTurnOf(ownerId: string | undefined): boolean {
+		const id = ownerId ?? this.activeId;
+		return (this.convs.get(id) as unknown as GoalConversation | undefined)?.awaitingVerdict != null;
+	}
+
+	/**
+	 * 切换审查者模式（会话级，默认关）。
+	 *  开启后：① 本对话只审阅（写类/派发类工具硬闸门 + 提示词段）；② 用户发的每条
+	 *  prompt 由服务端转给一个**常驻落盘执行对话**执行。计划模式优先（两者同开不派活）。
+	 */
+	async setDelegateMode(enabled: boolean, conversationId?: string): Promise<void> {
+		const target = conversationId ? this.convs.get(conversationId) : this.conv;
+		if (!target) return;
+		if (target.delegateMode === enabled) {
+			this.flushSnapshot();
+			return;
+		}
+		target.delegateMode = enabled;
+		if (!enabled) target.delegateConvId = null; // 关闭后不再指向旧执行对话
+		try {
+			// 与 plan/mode 同口径写进转录：切会话/重载能回放（布尔），执行对话 id 不落盘。
+			const sm = target.session.sessionManager as unknown as {
+				appendCustomEntry?: (customType: string, data: unknown) => void;
+			};
+			sm?.appendCustomEntry?.("delegate/mode", { enabled });
+		} catch {
+			// best effort for in-memory sessions
+		}
+		const notice = delegateNoticeText(enabled);
+		this.emit({ type: "notice", level: "info", text: notice.text, textEn: notice.textEn });
+		this.flushSnapshot();
+		// 提示词段随之增减（下一轮生效）；失败不阻断（硬闸门仍拦得住）。
+		try {
+			await target.session.reload?.();
+		} catch {
+			// best effort
+		}
+	}
+
+	/**
+	 * 自动路由：把本轮用户输入转给常驻执行对话执行（审查者模式的干活路径）。
+	 *  返回 true = 已接管（调用方不要再跑主会话的模型）；false = 没收走（走正常路径）。
+	 *
+	 *  与计划模式互斥：计划模式开着时**不派活**（那边已把 spawn/旁路工具全拒，
+	 *  再自动派活就是死锁），由计划模式那一轮自己在主对话里出计划。
+	 */
+	private async dispatchToDelegate(conv: Conversation, text: string): Promise<boolean> {
+		if (conv.delegateMode !== true) return false;
+		if (conv.planMode === true) return false; // 计划模式优先
+		if (this.quiesceBlocked()) return false;
+		const trimmed = text.trim();
+		if (!trimmed) return false;
+		let execId = conv.delegateConvId;
+		if (execId && !this.convs.get(execId)?.session) execId = null;
+		// 首轮：第一条 prompt 直接交给 spawnSubagentConversation（它会跑起这一轮）——
+		// **不要再 sendUserMessage 一次**，否则执行对话正在处理中，第二次投递会被
+		// SDK 拒（"Agent is already processing a prompt"）。之后每轮才走追加投递。
+		const firstTurn = !execId;
+		if (firstTurn) {
+			try {
+				// 常驻执行对话：落盘普通对话（进历史、可续聊），与目标模式的执行对话同一通道。
+				// 满员（项目 8 个普通对话）→ 抛错 → 下面提示用户，不会静默把活留在主对话。
+				execId = await this.spawnSubagentConversation(
+					trimmed,
+					"delegate-executor",
+					conv.cwd ?? this.cwd,
+					undefined,
+					null,
+					conv.id,
+					true,
+					pick(this.getLang(), "委派执行", "Delegate executor"),
+				);
+				const execConv = this.convs.get(execId);
+				if (execConv) execConv.title = pick(this.getLang(), "委派执行", "Delegate executor");
+				conv.delegateConvId = execId;
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `审查者模式：无法创建执行对话（${msg}）。请关闭审查者模式，或先释放一些对话名额。`,
+					textEn: `Reviewer mode: could not create the executor conversation (${msg}). Turn reviewer mode off, or free up some conversation slots first.`,
+				});
+				this.flushSnapshot();
+				return false;
+			}
+		} else {
+			const execConv = this.convs.get(execId as string);
+			if (!execConv?.session) return false;
+			try {
+				await execConv.session.sendUserMessage(
+					trimmed,
+					execConv.session.isStreaming ? { deliverAs: "steer" } : undefined,
+				);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `审查者模式：派活失败（${msg}）`,
+					textEn: `Reviewer mode: dispatch failed (${msg})`,
+				});
+				this.flushSnapshot();
+				return false;
+			}
+		}
+		this.emit({
+			type: "notice",
+			level: "info",
+			text: `🔎 已派给执行对话：${trimmed.slice(0, 120)}${trimmed.length > 120 ? "…" : ""}（本对话只审阅）`,
+			textEn: `🔎 Dispatched to the executor conversation: ${trimmed.slice(0, 120)}${trimmed.length > 120 ? "…" : ""} (this conversation reviews only)`,
+		});
+		this.flushSnapshot();
+		// 执行对话跑完 → 回报主对话（只通知，不自动验收：验收由人/主对话下一轮做）。
+		void this.notifyWhenDelegateFinishes(conv, execId as string);
+		return true;
+	}
+
+	/** 等常驻执行对话这一轮结束，回主对话一条通知（带它的最后一条回复摘要）。 */
+	private async notifyWhenDelegateFinishes(conv: Conversation, execId: string): Promise<void> {
+		try {
+			await this.waitConversationTurnEnd(execId, 30 * 60 * 1000);
+		} catch {
+			// 超时/取消：仍给一条「执行对话还没结束」的弱提示，避免主对话永远静默。
+		}
+		const execConv = this.convs.get(execId);
+		if (!execConv) return;
+		const last = [...(execConv.session.agent.state.messages as { role?: string; content?: unknown }[])]
+			.reverse()
+			.find((m) => m.role === "assistant");
+		const summary =
+			typeof last?.content === "string" ? last.content : JSON.stringify(last?.content ?? "").slice(0, 400);
+		this.emit({
+			type: "notice",
+			level: "info",
+			text: `✅ 执行对话已交付，请审阅：${summary.slice(0, 300)}${summary.length > 300 ? "…" : ""}（左栏「委派执行」可打开看全文）`,
+			textEn: `✅ The executor conversation delivered — review it: ${summary.slice(0, 300)}${summary.length > 300 ? "…" : ""} (open “Delegate executor” in the sidebar for the full transcript)`,
+		});
+		this.flushSnapshot();
+	}
+
+	/**
+	 * 切换计划模式（会话级，只规划不实施）。
+	 *  软约束（系统提示词段）+ 硬闸门（写类/旁路工具与非常规 bash 直接拒）双管：
+	 *  状态随会话转录落盘（切会话/重载恢复），并即时提示用户当前口径。
+	 */
+	async setPlanMode(enabled: boolean, conversationId?: string): Promise<void> {
+		const target = conversationId ? this.convs.get(conversationId) : this.conv;
+		if (!target) return;
+		if (target.planMode === enabled) {
+			this.flushSnapshot();
+			return;
+		}
+		target.planMode = enabled;
+		try {
+			// 持久会话：写入转录日志，切会话/重载后回放恢复（与 permission/preset 同口径）。
+			const sm = target.session.sessionManager as unknown as {
+				appendCustomEntry?: (customType: string, data: unknown) => void;
+			};
+			sm?.appendCustomEntry?.("plan/mode", { enabled });
+		} catch {
+			// best effort for in-memory sessions
+		}
+		// 动态应用工具门控：开启计划模式时剔除写类工具，关闭时恢复写类工具
+		this.applyToolGating(target.session);
+		// 计划模式有会话准入校验（空白对话也能开，但快照要立刻反映按钮态）。
+		const notice = planModeNoticeText(enabled);
+		this.emit({ type: "notice", level: "info", text: notice.text, textEn: notice.textEn });
+		this.flushSnapshot();
+		// 提示词段随之增减：重建资源让下一轮就带上/去掉计划模式约束。
+		void this.reloadPromptForPlanMode(target);
+	}
+
+	/**
+	 * 提示词重建：切换计划模式后需要让**下一轮**带上/去掉计划模式段
+	 * （appendSystemPromptOverride 在资源加载重放时取值）。会话空闲时即时
+	 * 重建，用户下一句就生效；重建失败不阻断（硬闸门仍然拦得住）。
+	 */
+	private async reloadPromptForPlanMode(conv: Conversation): Promise<void> {
+		try {
+			await conv.session.reload?.();
+			// reload() 重新加载扩展时可能会将工具加回活跃集，重跑一次门控确保写工具被持续剔除
+			this.applyToolGating(conv.session);
+		} catch {
+			// best effort：某些引擎/临时态不支持 reload
+		}
 	}
 
 	/** 设置新会话默认权限预设。 */
@@ -6876,14 +8524,20 @@ export class ClientSession {
 		this.flushSnapshot();
 	}
 
-	/** 当前启用的插件 AI 工具定义（provider 快照按 disabledPluginTools 过滤；
+	/** 当前启用的插件 AI 工具定义（provider 快照按 disabledPlugins 与 disabledPluginTools 过滤；
 	 *  未知/已卸载插件的禁用条目保留但不影响现有工具）。
 	 *  预设是第二层门控（见 tool-manager.ts 语义总表）：非 standard 预设下插件工具
 	 *  一律不可用（读写未知，保守处理），此时返回空表，调用方负责从会话移除。 */
 	private enabledPluginToolDefs(preset?: string): ToolDefinition[] {
 		if (!presetAllowsPluginTools(preset)) return [];
 		const off = new Set(normalizeDisabledPluginTools(this.settingsSvc.current.disabledPluginTools));
-		return (this.pluginToolsProvider?.() ?? []).filter((t) => !off.has(t.name)).map(pluginToolToDefinition);
+		const disabledPlugins = new Set(this.settingsSvc.current.disabledPlugins ?? []);
+		return (this.pluginToolsProvider?.() ?? [])
+			.filter((t) => {
+				if (t.pluginId && disabledPlugins.has(t.pluginId)) return false;
+				return !off.has(t.name);
+			})
+			.map(pluginToolToDefinition);
 	}
 
 	/** 把插件 AI 工具同步进一个已存在的会话（新增/更新/移除；禁用工具同步移除）。
@@ -7168,19 +8822,7 @@ export class ClientSession {
 
 	async prompt(
 		text: string,
-		attachments?: {
-			path: string;
-			/** "inline" is a legacy alias of "reference"（见 protocol.ts 的 PromptAttachment）。 */
-			mode?: "inline" | "reference" | "lines";
-			lines?: { start: number; end: number };
-			/** Raw pasted/dropped/uploaded image (base64) — bypasses workspace path. */
-			imageData?: string;
-			/** Raw uploaded file bytes (base64) — persisted, attached as reference. */
-			fileData?: string;
-			mimeType?: string;
-			name?: string;
-			size?: number;
-		}[],
+		attachments?: PromptAttachment[],
 		/**
 		 * true = followUp: while streaming, queue the prompt and deliver it only
 		 * after the WHOLE run finishes (补充 button — "AI 生成结束才发送").
@@ -7189,6 +8831,19 @@ export class ClientSession {
 		 */
 		queue = false,
 	): Promise<void> {
+		const trimmedText = (text ?? "").trim();
+		const hasAttachments = Boolean(attachments && attachments.length > 0);
+		if (!trimmedText && !hasAttachments) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "发送已忽略：提示词为空且未附带文件或上下文引用。",
+				textEn: "Prompt ignored: text is empty and no attachments were provided.",
+			});
+			this.flushSnapshot();
+			return;
+		}
+
 		// Captured at the START (before any await): the conversation being
 		// addressed by this prompt. See the naming block below — a concurrent
 		// switch/new_chat while prompt() is in flight must never target a
@@ -7196,6 +8851,60 @@ export class ClientSession {
 		const conv = this.conv;
 		const promptAc = new AbortController();
 		conv.activePromptAc = promptAc;
+		if (conv.planMode === true) {
+			this.applyToolGating(conv.session);
+		}
+		// 审查者模式（自动委派）：本对话只审阅 —— 用户这条 prompt 直接转给常驻执行
+		// 对话执行，主会话这一轮**不跑模型**。接在 promptAc 之后、draft 清理之前：
+		// 转走的内容不该把主对话的草稿也清掉（用户可能还想在主对话里追一句）。
+		// 计划模式优先（那边直接返回 false）。
+		if (await this.dispatchToDelegate(conv, text)) {
+			conv.presetLocked = true;
+			return;
+		}
+		// 目标审查回合进行中：纯文本插话顺延到 verdict 落定后（steer 进去会污染
+		// verdict，一次插话烧掉整个目标；followUp 由 SDK 排在整轮结束后才送达，
+		// 本来就安全所以只拦 steer）。斜杠命令直通（原生配置类不进模型）；带附件 /
+		// 图片的不顺延（附件引用只在发送瞬间有效）→ 响亮拒绝，草稿保留在输入框。
+		// 判定抽成纯函数（server/goal-review-gate.ts），单测见 goal-review-gate.test.ts。
+		if (
+			shouldDeferPromptForReview({
+				queue,
+				text,
+				hasAttachments: !!attachments && attachments.length > 0,
+				awaitingVerdict: (conv as unknown as GoalConversation | undefined)?.awaitingVerdict != null,
+			})
+		) {
+			const gc = conv as unknown as GoalConversation;
+			(gc.deferredPrompts ??= []).push(text);
+			this.emit({
+				type: "notice",
+				level: "info",
+				text: "审查回合进行中，你的消息已排队（审查结束后自动发送，不会打断审查）。",
+				textEn:
+					"A review round is running; your message is queued and will be sent automatically when it ends (without interrupting the review).",
+			});
+			this.flushSnapshot();
+			return;
+		}
+		if (
+			!queue &&
+			!text.trim().startsWith("/") &&
+			!!attachments &&
+			attachments.length > 0 &&
+			(conv as unknown as GoalConversation | undefined)?.awaitingVerdict != null
+		) {
+			// 带附件的插话不顺延也不 steer：直接拒绝，用户稍后重发（草稿还在输入框）。
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "审查回合进行中：带附件/图片的消息请等审查结束后再发（文本草稿已保留）。",
+				textEn:
+					"A review round is running; please resend messages with attachments/images after it ends (your draft is kept).",
+			});
+			this.flushSnapshot();
+			return;
+		}
 		// 输入框内容被消费（发送/斜杠执行）→ 清掉该会话存过的草稿（best-effort）。
 		// 快捷短语发送（不碰输入框）同样清：客户端发送成功后会把当前草稿重存回来。
 		// clear() 同时记录 clear 时间戳水位：清掉之后才 landing 的旧 draft_update
@@ -7503,8 +9212,21 @@ export class ClientSession {
 				// 立刻要有它（此刻还在流式输出，不能等 agent_end 的防抖刷新）。
 				this.emitConversations();
 			}
+			// 置换守卫：从这一刻起进入异步前置（附件构建 + 影子快照）——在它们完成前
+			// 对话既不 streaming 也没有新消息落盘，displaceActive() 会把它误判成
+			// 空闲对话并销毁 runtime，导致投递中的消息被静默丢弃。放在所有同步校验 /
+			// 原生斜杠命令拦截之后：原生命令（/new, /cwd 等）不进投递流程且可能
+			// 立即切换会话，若提前置位会被 displaceActive 误判为有消息投递而报错通知。
+			conv.promptInFlight = true;
 			// Attach files as independent nextTurn context messages (asides) so the
 			// user message stays clean; they render as separate attachment cards.
+			// SDK 的流式队列只消费用户消息；引用须与对应队列项一起入队和撤回。
+			const streamingQuotes = s.isStreaming
+				? (attachments ?? [])
+						.filter((a) => a.mode === "quote")
+						.map((a) => readTextQuote(a.quote))
+						.filter((q) => q !== null)
+				: [];
 			const asides = await buildAttachmentMessages(
 				{
 					cwd: this.cwd,
@@ -7515,10 +9237,18 @@ export class ClientSession {
 					// issue #91：附件/视觉桥文案按客户端 UI 语言出中英（英文默认）。
 					getLang: () => this.getLang(),
 				},
-				attachments,
+				streamingQuotes.length ? attachments?.filter((a) => a.mode !== "quote") : attachments,
 			);
 			if (promptAc.signal.aborted) {
 				conv.activePromptAc = undefined;
+				// #492：displacement（新对话顶替/会话被移出）在 prompt 前置阶段 abort 时
+				// 原本静默 return——消息凭空消失、草稿已清，用户毫无回执。
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: `消息未送达：该对话已被关闭或运行已被停止`,
+					textEn: `Message not delivered: the conversation was closed or the run was stopped`,
+				});
 				return;
 			}
 			for (const aside of asides) {
@@ -7541,10 +9271,26 @@ export class ClientSession {
 			}
 			if (promptAc.signal.aborted) {
 				conv.activePromptAc = undefined;
+				// #492：同上——影子快照阶段的 abort 也必须给回执，不能静默黑洞。
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: `消息未送达：该对话已被关闭或运行已被停止`,
+					textEn: `Message not delivered: the conversation was closed or the run was stopped`,
+				});
 				return;
 			}
 			conv.activePromptAc = undefined;
-
+			// 前置阶段（附件 / 影子快照）期间用户可能已经切走或新建了对话：消息仍然
+			// 落在本对话里，指给用户看，免得「发出去的消息不见了」。
+			if (conv.id !== this.activeId) {
+				this.emit({
+					type: "notice",
+					level: "info",
+					text: `消息已投递到「${conv.title}」——你刚切换了对话，它不在当前对话里`,
+					textEn: `Message delivered to "${conv.title}" — you switched conversations before it landed`,
+				});
+			}
 			if (s.isStreaming) {
 				// queue=true (补充 button) → followUp: the message is delivered only
 				// after the whole run finishes — the agent finishes what it started,
@@ -7556,11 +9302,11 @@ export class ClientSession {
 				// Enter-during-streaming semantic (docs/usage: Enter queues a
 				// steering message); followUp would wait for the whole run
 				// to finish, which users perceive as ordinary queueing.
-				await s.prompt(text, {
+				await s.prompt(formatQuotedPrompt(text, streamingQuotes), {
 					streamingBehavior: queue ? "followUp" : "steer",
 				});
 			} else {
-				await s.prompt(text);
+				await s.prompt(formatQuotedPrompt(text, streamingQuotes));
 			}
 
 			// 关联快照与本次 prompt 产生的用户消息 entry
@@ -7592,6 +9338,10 @@ export class ClientSession {
 				text: `提示发送失败：${(err as Error).message}`,
 				textEn: `Failed to send prompt: ${(err as Error).message}`,
 			});
+		} finally {
+			// 无论走哪条出口（斜杠命令 / quiesce 拒绝 / 中止 / 抛错 / 正常落定），
+			// 投递窗口都结束了；留着 true 会让这条对话永远不被置换。
+			conv.promptInFlight = false;
 		}
 		// The active conversation (captured at prompt start — see above) has been
 		// continued since it was opened — it must not be dismissed when the user
@@ -7753,7 +9503,22 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
-		const { steering, followUp } = s.clearQueue();
+		let steering: string[];
+		let followUp: string[];
+		try {
+			({ steering, followUp } = s.clearQueue());
+		} catch (err) {
+			// #491：runtime 被 forceReset 置换等半死状态下 clearQueue 可能抛错——
+			// 回退到本地显示镜像移除，等 queue_update 对账；绝不把 reject 的 Promise
+			// 扔回给 dispatch（无兜底 handler 时 unhandledRejection 直接崩进程）。
+			console.error("[agent-service] clearQueue failed while removing a queued message:", err);
+			const next = removeQueuedByIndexOrText(local, text, index);
+			if (next.length !== local.length) {
+				local.splice(0, local.length, ...next);
+			}
+			this.flushSnapshot();
+			return;
+		}
 		// 气泡 ✕ 对应的是「第几个气泡」（index），不是「哪段文本」：同一文本排队两次时
 		// 按文本只会删掉第一条，点第二个气泡却删掉第一个。用 index 定位，位置对不上
 		// （队列在点击与执行之间变化）或旧客户端没发 index 时回落到第一处文本匹配。
@@ -7895,6 +9660,9 @@ export class ClientSession {
 
 	/** Interrupt a run: abort, with a force-reset fallback on timeout. */
 	private async interruptRun(conv: Conversation, reason: string): Promise<void> {
+		// #487：停下就结算该会话的挂起提问/审批——残留条目让 isWaitingOnUser 恒真
+		// （stall 失联检测被永久豁免），弹窗也会跨轮残留；dispose 语义已范本化。
+		this.settlePendingsForConv(conv.id);
 		if (!this.conversationStreaming(conv) && conv.session.isIdle) {
 			return;
 		}
@@ -7964,6 +9732,10 @@ export class ClientSession {
 			conv.toolStartTimes.clear();
 			disposeEvalSession(conv.id);
 			await conv.runtime.dispose();
+			// #485：dispose 挂起期间会话可能已被强行关闭移出（forceDismiss 走
+			// removeConversation）——此时绝不能幽灵重建，否则新 runtime 挂在已脱离
+			// this.convs 的 conv 对象上，无人持有、永不回收。
+			if (!this.convs.has(conv.id)) return;
 			// #280：dispose 丢弃了内存里的在飞状态（未落盘的工具结果蒸发），
 			// 文件尾可能留下一个悬空 toolCall——先补合成 toolResult 再重建，
 			// 否则重建后的 prompt 会把非法转录链喂给 provider（零落盘黑洞）。
@@ -7976,18 +9748,37 @@ export class ClientSession {
 					// best-effort：修不好就按原路径重建，下面的守卫会在 prompt 前再拦。
 				}
 			}
-			// #235：转录链损坏时修一次再试（见 openManagerAndRuntime）。
+			// #280 & #335：转录链损坏时修一次再试（见 openManagerAndRuntime）。
+			// 严禁在 ownFile 不存在时回退到 continueRecent(conv.cwd) 或按 mtime list 历史文件，
+			// 否则会直接接错并顶替同项目的其它历史会话，污染别人的转录记录。
 			const opened = await this.openManagerAndRuntime(
-				() => (ownFile && existsSync(ownFile) ? SessionManager.open(ownFile) : SessionManager.continueRecent(conv.cwd)),
+				() => {
+					if (ownFile && existsSync(ownFile)) {
+						return SessionManager.open(ownFile);
+					}
+					return conv.isEphemeral ? SessionManager.inMemory(conv.cwd) : SessionManager.create(conv.cwd);
+				},
 				(m) =>
-					createAgentSessionRuntime(this.makeRuntimeFactory(conv.terminals, undefined, conv.id), {
+					// 子代理带模板时按原模板重建（conv.subagentTemplate 是派发时工厂
+					// 用的同一快照）；普通对话 undefined，行为不变。
+					createAgentSessionRuntime(this.makeRuntimeFactory(conv.terminals, conv.subagentTemplate, conv.id), {
 						cwd: conv.cwd,
 						agentDir: this.agentDir,
 						sessionManager: m,
 					}),
-				async () => (ownFile && existsSync(ownFile) ? ownFile : (await SessionManager.list(conv.cwd))[0]?.path),
+				async () => (ownFile && existsSync(ownFile) ? ownFile : undefined),
 			);
 			const runtime = opened.runtime;
+			// #485：openManagerAndRuntime 的长 await 期间会话被移出的同一守卫——
+			// 刚建好的 runtime 无人认领，就地 dispose 防止扩展宿主子进程泄漏。
+			if (!this.convs.has(conv.id)) {
+				try {
+					await runtime.dispose();
+				} catch {
+					// 已被移除的会话：dispose 失败无处上报，best-effort。
+				}
+				return;
+			}
 			if (opened.repair) {
 				for (const n of this.transcriptRepairNotices(opened.repair)) this.emit(n);
 			}
@@ -8017,7 +9808,10 @@ export class ClientSession {
 				text: reason,
 				textEn: `${reason} (forced reset: run did not terminate)`,
 			});
-			await this.bindSession();
+			// #484：把订阅重挂到**被重建的那个对话**上。非活跃对话（子代理/角色
+			// 对话）此前永远走 bindSession() → 只给活跃对话挂订阅，重建后该对话
+			// 的所有 SDK 事件失聪：快照冻结、看门狗不再布防、turnEndWaiters 死等。
+			await this.bindSession(conv);
 			this.emitConversations();
 			void this.pushSlashCommands();
 		} catch (err) {
@@ -8052,7 +9846,10 @@ export class ClientSession {
 		const active = this.conv;
 		if (!ephemeral && active && isBlank(active)) {
 			if (_preset) await this.selectAgentPreset(_preset);
-			else this.flushSnapshot();
+			else {
+				this.pushSettings();
+				this.flushSnapshot();
+			}
 			return true;
 		}
 		if (!ephemeral) {
@@ -8077,8 +9874,8 @@ export class ClientSession {
 				this.emit({
 					type: "notice",
 					level: "warning",
-					text: `当前项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个），请先打开某个对话并离开（不继续对话）以移出列表`,
-					textEn: `This project already has the max open conversations (${MAX_OPEN_CONVERSATIONS}). Open one and leave it (without continuing) to remove it from the list.`,
+					text: `当前项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个），请先移出不需要的对话（打开后离开不继续对话即移出；钉住的对话需先取消钉住）`,
+					textEn: `This project already has the max open conversations (${MAX_OPEN_CONVERSATIONS}). Open one and leave it (without continuing) to remove it from the list; pinned chats must be unpinned first.`,
 				});
 				return false;
 			}
@@ -8109,7 +9906,7 @@ export class ClientSession {
 				sessionManager = SessionManager.create(this.cwd);
 			}
 			const runtime = await createAgentSessionRuntime(
-				this.makeRuntimeFactory(terminals, undefined, conversationId, prevModel ?? undefined),
+				this.makeRuntimeFactory(terminals, undefined, conversationId, prevModel ?? undefined, _preset),
 				{
 					cwd: this.cwd,
 					agentDir: this.agentDir,
@@ -8180,6 +9977,7 @@ export class ClientSession {
 			void this.pushSlashCommands();
 			// 新对话即当前打开 → 插件重拉（轨迹视图跟随）。
 			this.notifyConversationChanged();
+			this.pushSettings();
 			ready = true;
 		} catch (err) {
 			this.emit({
@@ -8289,7 +10087,7 @@ export class ClientSession {
 				};
 				lines[idx] = JSON.stringify(done);
 			}
-			writeFileSync(file, lines.join("\n"));
+			atomicWriteFileSync(file, lines.join("\n"));
 		} catch {
 			// Best-effort, same as the write path.
 		}
@@ -8308,7 +10106,7 @@ export class ClientSession {
 			const raw = readFileSync(file, "utf8");
 			if (!raw.includes('"pi-web-ui/compaction-pending"')) return;
 			const kept = raw.split("\n").filter((line) => !line.includes("pi-web-ui/compaction-pending"));
-			writeFileSync(file, kept.join("\n"));
+			atomicWriteFileSync(file, kept.join("\n"));
 			this.emitCompactionInterruptedNotice();
 		} catch {
 			// Best-effort, same as the write path.
@@ -8448,11 +10246,22 @@ export class ClientSession {
 				openTerminals: conv.terminals.countBlockingLive(),
 				listed: conv.listed,
 				promptedSinceActive: conv.promptedSinceActive,
+				pinned: conv.pinned,
+				// 投递中的消息（附件构建 / 影子快照阶段）：见 Conversation.promptInFlight。
+				promptInFlight: Boolean(conv.promptInFlight),
 				hasActiveSubagentRun: () => hasActiveSubagentRun({ sessionId: conv.session.sessionFile }),
 				hasPendingWake: () => hasPendingWaitSubscription({ sessionId: conv.session.sessionFile }),
 			});
 		if (retained) {
 			conv.listed = true;
+			if (conv.promptInFlight && !conv.session.isStreaming) {
+				this.emit({
+					type: "notice",
+					level: "info",
+					text: `「${conv.title}」的消息正在投递，已为你保留该对话`,
+					textEn: `"${conv.title}" is still sending your message — kept in the running list`,
+				});
+			}
 			return null;
 		}
 		return conv;
@@ -8464,6 +10273,21 @@ export class ClientSession {
 	private removeConversation(id: string): void {
 		const conv = this.convs.get(id);
 		if (!conv || id === this.activeId) return;
+		// #487：会话没了，挂起的提问/审批永远等不到人点——按 dispose 口径就地结算。
+		this.settlePendingsForConv(id);
+		// 正在投递的消息（附件构建 / 影子快照阶段）必须先打断：否则 prompt() 醒来
+		// 后会把用户消息写进已销毁的 runtime，静默丢失。
+		if (conv.activePromptAc) {
+			conv.activePromptAc.abort();
+			conv.activePromptAc = undefined;
+		}
+		// 角色轮等待者：对话被移出 → 等它的循环收到 gone（否则要等到超时）。
+		const waiters = this.turnEndWaiters.get(id);
+		if (waiters) {
+			this.turnEndWaiters.delete(id);
+			// 先摘表再逐个唤醒：回调里的自删不会弄脏迭代。
+			for (const fn of waiters) fn("gone");
+		}
 		// 对话真关闭（dismiss/释放）→ 放掉它的认领。过户不走这里（对话换个会话
 		// 继续，owner 不变，认领继续有效），所以只在此处释放。
 		try {
@@ -8504,13 +10328,21 @@ export class ClientSession {
 	}
 
 	/** 过户用的对话摘要（AgentService 拼移动集合 + 容量检查用）。 */
-	takeoverBriefs(): { id: string; title: string; cwd: string; parentId?: string; isSubagent: boolean }[] {
+	takeoverBriefs(): {
+		id: string;
+		title: string;
+		cwd: string;
+		parentId?: string;
+		isSubagent: boolean;
+		isEphemeral?: boolean;
+	}[] {
 		return [...this.convs.values()].map((c) => ({
 			id: c.id,
 			title: c.title,
 			cwd: c.cwd,
 			...(c.parentId ? { parentId: c.parentId } : {}),
 			isSubagent: c.isSubagent,
+			isEphemeral: !!c.isEphemeral,
 		}));
 	}
 
@@ -8542,6 +10374,13 @@ export class ClientSession {
 			this.clearAllToolWatchdogs(conv);
 			conv.unsubscribe?.();
 			conv.unsubscribe = undefined;
+			// issue #457: 唤醒角色轮等待者与目标审查等待者，避免会话搬走后原会话循环永久卡死
+			const waiters = this.turnEndWaiters.get(conv.id);
+			if (waiters) {
+				this.turnEndWaiters.delete(conv.id);
+				for (const fn of waiters) fn("gone");
+			}
+			this.goalSvc.notifyTakeover(conv);
 		}
 		const questions: TakeoverQuestion[] = [];
 		for (const [qid, p] of this.pendingQuestions) {
@@ -8561,9 +10400,30 @@ export class ClientSession {
 				pageCalls.push({ resolve: p.resolve, req: p.req, timeoutMs: p.timeoutMs, conversationId: p.conversationId });
 			}
 		}
+		// 待审批跟对话走：留在源会话就是幽灵弹窗（id 失效点不动，runtime 已搬走，
+		// 永远等不到答复）。只搬归属明确的（conversationId 对得上，与问卷/页调用
+		// 同一规则）；目标侧按新 id 重发弹窗，等待中的 Promise 原样过户不 resolve。
+		const approvals: TakeoverApproval[] = [];
+		for (const [aid, a] of this.pendingApprovals) {
+			if (a.conversationId !== undefined && set.has(a.conversationId)) {
+				this.pendingApprovals.delete(aid);
+				approvals.push({
+					resolve: a.resolve,
+					toolCallId: a.toolCallId,
+					toolName: a.toolName,
+					params: a.params,
+					reason: a.reason,
+					reasonEn: a.reasonEn,
+					...(a.category ? { category: a.category } : {}),
+					conversationId: a.conversationId,
+					...(a.conversationTitle ? { conversationTitle: a.conversationTitle } : {}),
+					createdAt: a.createdAt,
+				});
+			}
+		}
 		this.emitConversations();
 		this.flushSnapshot();
-		return { ok: true, payload: { convs, questions, pageCalls } };
+		return { ok: true, payload: { convs, questions, pageCalls, approvals } };
 	}
 
 	/**
@@ -8643,7 +10503,64 @@ export class ClientSession {
 				timeoutMs: p.timeoutMs,
 			});
 		}
+		// 迁入的待审批按新 id 重新挂上（等待中的 Promise 未动，模型还在等）。
+		// 主对话的立即弹窗（子代理的靠角标与快照呈现，与问卷同一口径）。
+		for (const a of payload.approvals) {
+			const nid = `appr-${++this.approvalSeq}`;
+			const aConvId = fix(a.conversationId);
+			this.pendingApprovals.set(nid, {
+				id: nid,
+				toolCallId: a.toolCallId,
+				toolName: a.toolName,
+				params: a.params,
+				reason: a.reason,
+				reasonEn: a.reasonEn,
+				...(a.category ? { category: a.category } : {}),
+				conversationId: aConvId,
+				...(a.conversationTitle ? { conversationTitle: a.conversationTitle } : {}),
+				resolve: a.resolve,
+				createdAt: a.createdAt,
+			});
+			if (aConvId === mainId) {
+				this.emit({
+					type: "tool_approval_pending",
+					id: nid,
+					toolCallId: a.toolCallId,
+					toolName: a.toolName,
+					params: a.params as Record<string, unknown>,
+					reason: a.reason,
+					reasonEn: a.reasonEn,
+					...(a.category ? { category: a.category } : {}),
+					conversationId: aConvId,
+					...(a.conversationTitle ? { conversationTitle: a.conversationTitle } : {}),
+				});
+			}
+		}
 		return mainId;
+	}
+
+	/**
+	 * 切到新工作目录后的“跟随面”刷新（roots / 插件钩子 / 最近项目 / 历史列表 /
+	 * 文件树 / 命令目录）。调用方先把 this.cwd 改好再调本函数。
+	 * switchConversation 跨项目切换、set_cwd、switchSession 打开别项目的历史
+	 * 会话三处共用 —— 之前 switchSession 只改了 cwd 没同步 roots，文件树/
+	 * 工作区插件/历史列表都还停在旧项目。集中一处避免再漏。
+	 */
+	private applyCwdSideEffects(abs: string): void {
+		this.roots = this.stateStore.getWorkspaceRoots(this.clientId, abs);
+		// 工作区跟随型插件（编辑器文件树等）同步切根。
+		try {
+			this.onCwdChanged?.(abs, this.roots);
+		} catch {
+			/* 钩子异常不影响主流程 */
+		}
+		// Remember the new workspace (restore target + recent-project entry).
+		this.stateStore.remember(this.clientId, abs);
+		void this.pushProjects();
+		this.refreshSessionsOnSwitch();
+		void this.listFiles(undefined);
+		// Commands are per-project (.pi/commands.json in the current cwd).
+		void this.listCommands();
 	}
 
 	/** Switch the ACTIVE conversation without interrupting any other chat. */
@@ -8668,7 +10585,6 @@ export class ClientSession {
 		void this.pushSlashCommands();
 		if (cwdChanged) {
 			this.cwd = newCwd;
-			this.roots = this.stateStore.getWorkspaceRoots(this.clientId, newCwd);
 			// 模型/key 恢复不挡快照：后台做，带代际 guard（用户又切走就跳过），
 			// 做完补一次 flush 刷新模型栏。
 			{
@@ -8687,19 +10603,11 @@ export class ClientSession {
 			}
 			// Mirror set_cwd's project-switch side-effects so the whole UI follows
 			// the new workspace, not just the chat pane.
-			try {
-				this.onCwdChanged?.(newCwd, this.roots);
-			} catch {
-				/* hook failure must not break the switch */
-			}
-			this.stateStore.remember(this.clientId, newCwd);
-			void this.pushProjects();
-			this.refreshSessionsOnSwitch();
-			void this.listFiles(undefined);
-			void this.listCommands();
+			this.applyCwdSideEffects(newCwd);
 		}
 		// 当前打开对话变了 → 插件重拉（轨迹视图切会话后即刷新，不等轮询）。
 		this.notifyConversationChanged();
+		this.pushSettings();
 		this.flushSnapshot();
 	}
 
@@ -8779,6 +10687,7 @@ export class ClientSession {
 					return pq ? { hasQuestion: true as const, questionId: pq.id, questionTitle: pq.title } : {};
 				})(),
 				parentId: conv.parentId,
+				...(conv.pinned ? { pinned: true as const } : {}),
 				...(conv.forkFrom ? { forkFrom: conv.forkFrom } : {}),
 			});
 		}
@@ -8828,33 +10737,233 @@ export class ClientSession {
 	 * pushSessions() and searchSessions() share this fridge — opening the
 	 * panel warms it, then every keystroke inside the TTL is free.
 	 */
-	private sessionInfosCache: { cwd: string; infos: SessionInfo[]; at: number } | null = null;
-	private static readonly SESSION_INFO_CACHE_TTL = 3000;
+	/** 最近项目列表缓存：跨客户端共享静态缓存，TTL 窗口内直接复用。 */
+	private static projectsCache: { at: number; projects: ProjectSummary[] } | null = null;
+	private static readonly PROJECTS_CACHE_TTL = 60_000;
+	private static projectsInFlight: Promise<ProjectSummary[] | null> | null = null;
 
-	/** 最近项目列表缓存：pushProjects 的全量扫盘（SessionManager.listAll +
-	 *  existsSync 逐个校验）昂贵，切项目/新对话/跨客户端通知时频繁触发 ——
-	 *  TTL 内直接复用并把当前 cwd 合并进去，不反复扫盘。 */
-	private projectsCache: { at: number; projects: ProjectSummary[] } | null = null;
-	private static readonly PROJECTS_CACHE_TTL = 15_000;
-	private projectsInFlight: Promise<ProjectSummary[] | null> | null = null;
+	/**
+	 * 会话单文件元信息缓存（path -> { mtime, size, info }）：避免对未修改的会话文件
+	 * 重复读取与 JSON 解析。LRU 上限（issue #440）：静态 Map 跨项目共享，原先没有任何
+	 * 上限/TTL —— 删除、更名、被挤出 200 名额的文件只要曾进过缓存就永久驻留，长驻
+	 * 服务 + 多项目重度使用下 RSS 单调上涨。
+	 *
+	 * 上限 512 的依据：单项目单轮扫描只取最新 200 个候选，512 ≈ 2.5 倍余量，足够容纳
+	 * 多个最近活跃项目的热集；且拆分后（issue #440）条目只含元信息不含转录全文
+	 * （单条 KB 级），总占用恒定且极小 —— 上限防的是「无界累积」，不是单条重量。
+	 *
+	 * LRU 淘汰语义：把 Map 当 LRU 用（Map 迭代序 = 插入序）—— 命中即 delete+set 重插
+	 * 到最新端，写入超上限从最旧端淘汰。mtime/size 未变的条目命中即复用（行为与原先
+	 * 一致），变化的条目由调用方重新解析后经 store 覆盖（也落到最新端）。
+	 */
+	private static sessionFileCache = new Map<string, { mtime: number; size: number; info: SessionInfo }>();
+	private static readonly SESSION_FILE_CACHE_MAX = 512;
+
+	/**
+	 * 转录全文缓存（path -> { text, at }）：仅供 searchSessions / searchForPlugins 的
+	 * 全文命中判定按需加载（issue #440 拆分）。与列表缓存分离的原因：列表路径
+	 * （pushSessions / 插件列表 / 删除后切换）只需要元信息，而全文单条可达 MB 级，
+	 * 随列表常驻会让每个曾进过列表的文件都占住内存。
+	 *
+	 * 容量依据：256 ≥ 单项目候选上限 200，键入查询的其余按键在 TTL 窗口内全程免读盘；
+	 * 单条在 parseSessionInfoFast 里按 MAX_SEARCH_TEXT_CHARS（256K 字符）封顶。
+	 * TTL 只在访问时判断（无定时器），每次载入顺手清扫过期项 —— 搜索空闲后不长期
+	 * 占内存。删除/更名经 invalidateSessionInfos 同步清理。
+	 */
+	private static sessionTextCache = new Map<string, { text: string; at: number }>();
+	private static readonly SESSION_TEXT_CACHE_MAX = 256;
+	private static readonly SESSION_TEXT_CACHE_TTL = 30_000;
+
+	/** sessionFileCache LRU 读取：命中即重插到最新端（续期），未命中返回 undefined。 */
+	private static sessionFileCacheLookup(key: string): { mtime: number; size: number; info: SessionInfo } | undefined {
+		const entry = ClientSession.sessionFileCache.get(key);
+		if (!entry) return undefined;
+		ClientSession.sessionFileCache.delete(key);
+		ClientSession.sessionFileCache.set(key, entry);
+		return entry;
+	}
+
+	/** sessionFileCache LRU 写入：新/更新条目放最新端，超上限从最旧端淘汰。 */
+	private static sessionFileCacheStore(key: string, entry: { mtime: number; size: number; info: SessionInfo }): void {
+		ClientSession.sessionFileCache.delete(key);
+		ClientSession.sessionFileCache.set(key, entry);
+		while (ClientSession.sessionFileCache.size > ClientSession.SESSION_FILE_CACHE_MAX) {
+			const oldest = ClientSession.sessionFileCache.keys().next();
+			if (oldest.done) break;
+			ClientSession.sessionFileCache.delete(oldest.value);
+		}
+	}
+
+	/** sessionTextCache 读取：TTL 内命中即重插续期；过期即清并按未命中处理。 */
+	private static sessionTextCacheLookup(key: string, now: number): string | undefined {
+		const entry = ClientSession.sessionTextCache.get(key);
+		if (!entry) return undefined;
+		ClientSession.sessionTextCache.delete(key);
+		if (now - entry.at >= ClientSession.SESSION_TEXT_CACHE_TTL) return undefined;
+		ClientSession.sessionTextCache.set(key, entry);
+		return entry.text;
+	}
+
+	/** sessionTextCache 写入：放最新端，超上限从最旧端淘汰。 */
+	private static sessionTextCacheStore(key: string, text: string, at: number): void {
+		ClientSession.sessionTextCache.delete(key);
+		ClientSession.sessionTextCache.set(key, { text, at });
+		while (ClientSession.sessionTextCache.size > ClientSession.SESSION_TEXT_CACHE_MAX) {
+			const oldest = ClientSession.sessionTextCache.keys().next();
+			if (oldest.done) break;
+			ClientSession.sessionTextCache.delete(oldest.value);
+		}
+	}
+
+	/** 惰性清扫 sessionTextCache 过期项：TTL 只在访问时判断，没有定时器兜底，
+	 *  靠每次全文载入顺手扫一遍，保证搜索空闲后全文不会无限期滞留内存。 */
+	private static sessionTextCacheSweep(now: number): void {
+		for (const [key, entry] of ClientSession.sessionTextCache) {
+			if (now - entry.at >= ClientSession.SESSION_TEXT_CACHE_TTL) ClientSession.sessionTextCache.delete(key);
+		}
+	}
+
+	/**
+	 * 转录全文按需加载（搜索专用）：TTL 缓存命中直接回；未命中读盘提取全文
+	 * （与 parseSessionInfoFast 同口径：user/assistant 消息文本，MAX_SEARCH_TEXT_CHARS
+	 * 截断）。解析失败回空串且不缓存 —— 与列表路径一样下次重试。
+	 */
+	private static async loadSessionSearchText(filePath: string): Promise<string> {
+		const now = Date.now();
+		ClientSession.sessionTextCacheSweep(now);
+		const hit = ClientSession.sessionTextCacheLookup(filePath, now);
+		if (hit !== undefined) return hit;
+		const info = await parseSessionInfoFast(filePath, 0, true);
+		const text = info?.allMessagesText ?? "";
+		if (text) ClientSession.sessionTextCacheStore(filePath, text, now);
+		return text;
+	}
+
+	/**
+	 * searchSessions / searchForPlugins 共用的全文匹配：先比元信息（零 IO，覆盖绝大多数
+	 * 按标题/文件名/首条消息的查询），元信息未命中的会话再按需加载转录全文判定
+	 * （小容量短 TTL 缓存，见 sessionTextCache）。保序返回命中子集。
+	 * issue #440：全文不再随列表缓存常驻，改在这里按需加载。
+	 */
+	private static async filterSessionsForSearch(q: string, infos: SessionInfo[]): Promise<SessionInfo[]> {
+		const flags = await Promise.all(
+			infos.map(async (s) => {
+				if (sessionMatchesMetadata(q, s)) return true;
+				const text = await ClientSession.loadSessionSearchText(s.path);
+				return text.toLowerCase().includes(q);
+			}),
+		);
+		return infos.filter((_, i) => flags[i]);
+	}
+
+	/** 会话列表缓存（按 cwdKey 隔离，30s TTL）。 */
+	private static sessionInfosCache = new Map<string, { infos: SessionInfo[]; at: number }>();
+	private static sessionInfosInFlight = new Map<string, Promise<SessionInfo[]>>();
+	private static readonly SESSION_INFO_CACHE_TTL = 30_000;
 
 	private async loadSessionInfos(): Promise<SessionInfo[]> {
 		const now = Date.now();
-		const c = this.sessionInfosCache;
-		if (c && c.cwd === this.cwd && now - c.at < ClientSession.SESSION_INFO_CACHE_TTL) {
+		const cwdKey = normalizePathKey(this.cwd);
+		const c = ClientSession.sessionInfosCache.get(cwdKey);
+		if (c && now - c.at < ClientSession.SESSION_INFO_CACHE_TTL) {
 			return c.infos;
 		}
-		const infos = await SessionManager.list(this.cwd, piSessionsRoot());
-		this.sessionInfosCache = { cwd: this.cwd, infos, at: now };
-		return infos;
+
+		const inFlight = ClientSession.sessionInfosInFlight.get(cwdKey);
+		if (inFlight) return inFlight;
+
+		const run = (async (): Promise<SessionInfo[]> => {
+			try {
+				const sessionDir = piSessionsRoot()
+					? resolve(piSessionsRoot()!)
+					: SessionManager.create(this.cwd).getSessionDir();
+				if (!existsSync(sessionDir)) return [];
+
+				const dirEntries = await fsPromises.readdir(sessionDir);
+				const files = dirEntries.filter((f) => f.endsWith(".jsonl"));
+				if (files.length === 0) return [];
+
+				// Stat files to detect modified/new files (takes only ~8ms for 600+ files)
+				const stats = await Promise.all(
+					files.map(async (f) => {
+						const fp = join(sessionDir, f);
+						try {
+							const st = await fsPromises.stat(fp);
+							return { path: fp, mtime: st.mtimeMs, size: st.size };
+						} catch {
+							return null;
+						}
+					}),
+				);
+
+				const validStats = stats.filter((s): s is { path: string; mtime: number; size: number } => s !== null);
+				validStats.sort((a, b) => b.mtime - a.mtime);
+
+				const results = await Promise.all(
+					validStats.map(async (file) => {
+						const cached = ClientSession.sessionFileCacheLookup(file.path);
+						if (cached && cached.mtime === file.mtime && cached.size === file.size) {
+							return cached.info;
+						}
+						// 列表路径不收集转录全文（issue #440）——全文只在搜索时按需加载
+						const info = await parseSessionInfoFast(file.path, file.mtime);
+						if (info) {
+							ClientSession.sessionFileCacheStore(file.path, {
+								mtime: file.mtime,
+								size: file.size,
+								info,
+							});
+						}
+						return info;
+					}),
+				);
+
+				const validInfos = results.filter((info): info is SessionInfo => info !== null);
+				// issue #438：扁平布局（PI_CODING_AGENT_SESSION_DIR）下根目录顶层直接是**所有项目**
+				// 共享的 .jsonl，所属 cwd 是文件内字段；不过滤的话其他项目的会话会混进本项目
+				// 「历史会话」列表，点开即把整个工作区切走。与 SessionManager.list(cwd, ...) 的
+				// fallback 及 discoverRecentProjectsFromDisk 同口径：normalizePathKey（Windows
+				// 大小写/斜杠归一）。空 cwd 的损坏文件须排除——normalizePathKey("") 会 resolve 到
+				// process.cwd()，恰好等于本项目时会把垃圾文件误收进来。
+				const ownInfos = validInfos.filter((info) => info.cwd !== "" && normalizePathKey(info.cwd) === cwdKey);
+				// 200 名额只在 cwd 过滤**之后**分配：扁平布局下若先截断，本项目会话可能被
+				// 其他项目的文件挤出列表。截断仍按上面的 mtime 降序序取（Promise.all 保序），
+				// 与原有选集口径一致；非扁平布局每-cwd 子目录内文件全属本项目，过滤幂等。
+				const candidates = ownInfos.slice(0, 200);
+				candidates.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+				ClientSession.sessionInfosCache.set(cwdKey, { infos: candidates, at: Date.now() });
+				return candidates;
+			} catch {
+				try {
+					const fallback = await SessionManager.list(this.cwd, piSessionsRoot());
+					// 统一口径：列表缓存一律不带转录全文（issue #440），搜索按需另行加载
+					const stripped = fallback.map((s) => ({ ...s, allMessagesText: "" }));
+					ClientSession.sessionInfosCache.set(cwdKey, { infos: stripped, at: Date.now() });
+					return stripped;
+				} catch {
+					return [];
+				}
+			} finally {
+				ClientSession.sessionInfosInFlight.delete(cwdKey);
+			}
+		})();
+
+		ClientSession.sessionInfosInFlight.set(cwdKey, run);
+		return run;
 	}
 
 	/** Session files on disk changed (delete / new-transcript) — drop the brief
 	 *  TTL fridge so the NEXT listing re-reads the directory instead of serving
 	 *  the pre-mutation snapshot (delete-then-refresh commonly runs inside the
 	 *  window, which would re-push the just-removed session). */
-	private invalidateSessionInfos(): void {
-		this.sessionInfosCache = null;
+	private invalidateSessionInfos(filePath?: string): void {
+		ClientSession.sessionInfosCache.clear();
+		if (filePath) {
+			const abs = resolve(filePath);
+			ClientSession.sessionFileCache.delete(abs);
+			// 全文缓存一并清（issue #440）：文件已删/更名，正文不该再被搜索命中
+			ClientSession.sessionTextCache.delete(abs);
+		}
 	}
 
 	/** Push the persisted session list to the client (client-requested). */
@@ -8880,7 +10989,7 @@ export class ClientSession {
 
 			// 隐藏「被 fork 掉的父会话」，历史列表只保留每条 fork 链最新的链尾会话
 			// （全文搜索 searchSessions 保留全部会话，不受此影响）。
-			const normSessionPath = (p: string) => String(p).replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
+			const normSessionPath = (p: string) => normalizePathKey(p);
 			const forkedParentPaths = new Set<string>();
 			for (const info of infos) {
 				if (typeof info.parentSessionPath === "string" && info.parentSessionPath) {
@@ -8897,6 +11006,7 @@ export class ClientSession {
 
 			const sessions = new Map<string, SessionSummary>();
 			for (const s of visibleInfos) {
+				const isPinned = this.stateStore?.isSessionPinned(this.cwd, s.path);
 				sessions.set(s.path, {
 					path: s.path,
 					name: s.name,
@@ -8904,6 +11014,7 @@ export class ClientSession {
 					messageCount: s.messageCount,
 					modified: s.modified.getTime(),
 					source: "web",
+					...(isPinned ? { pinned: true } : {}),
 				});
 			}
 			const sorted = [...sessions.values()].sort((a, b) => b.modified - a.modified).slice(0, 200); // newest first — the panel shows recent history
@@ -8963,7 +11074,7 @@ export class ClientSession {
 			}
 			if (holder) {
 				// Same source the history panel uses (refreshSessions): newest first.
-				const infos = await SessionManager.list(this.cwd, piSessionsRoot());
+				const infos = await this.loadSessionInfos();
 				const next = infos
 					.filter((s) => resolve(s.path) !== abs)
 					.sort((a, b) => b.modified.getTime() - a.modified.getTime())[0];
@@ -8998,7 +11109,26 @@ export class ClientSession {
 					return;
 				}
 			}
+			// #145 同款守卫：删之前查一遍其他客户端是否持有这份转录 ——
+			// 对端 runtime 还开着时硬删等于把文件从活 writer 身下抽走（跑着时
+			// 更是两支并发写）。被持有就拒绝删除；本客户端自己的持有已在上面处理。
+			const otherOwner = this.findSessionOwner?.(abs);
+			if (otherOwner) {
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: otherOwner.isStreaming
+						? `该对话正在另一处运行中（「${otherOwner.title}」），已停止删除；请先回到原窗口停止或关闭它`
+						: `该对话在另一处仍开着（「${otherOwner.title}」），已停止删除；请先在原窗口关闭它再删`,
+					textEn: otherOwner.isStreaming
+						? `This conversation is running in another window ("${otherOwner.title}"); delete aborted — stop or close it there first`
+						: `This conversation is still open in another window ("${otherOwner.title}"); delete aborted — close it there first`,
+				});
+				return;
+			}
 			rmSync(abs, { force: true });
+			// 转录删了，钉住记录一起清理（issue #433）。
+			this.stateStore?.cleanPinnedSession(abs);
 			// 转录删了，sidecar 再留着就是孤儿，一起清掉（不存在不报错）。
 			removeTouchSidecar(abs);
 			// 转录删了，未发送草稿再留着就是孤儿，一起清掉。
@@ -9010,7 +11140,7 @@ export class ClientSession {
 			// Bust the brief session-info fridge: refreshSessions() below usually
 			// lands inside its 3s TTL and would otherwise re-serve a listing that
 			// still contains the deleted transcript.
-			this.invalidateSessionInfos();
+			this.invalidateSessionInfos(abs);
 			await this.refreshSessions();
 		} catch (err) {
 			this.emit({
@@ -9042,7 +11172,7 @@ export class ClientSession {
 			const mgr = SessionManager.open(abs);
 			mgr.appendSessionInfo(trimmed);
 			this.setConversationTitleForFile(abs, trimmed);
-			this.invalidateSessionInfos();
+			this.invalidateSessionInfos(abs);
 			await this.refreshSessions();
 		} catch (err) {
 			this.emit({
@@ -9052,6 +11182,84 @@ export class ClientSession {
 				textEn: `Failed to rename session: ${(err as Error).message}`,
 			});
 		}
+	}
+
+	/** 钉住 / 取消钉住某个对话（左栏右键菜单）。钉住后切走也不从「运行的对话」
+	 *  释放（见 shouldRetainActive 的 pinned 判据，最高优先级）；取消钉住不立即
+	 *  释放，下一次自然置换时按常规规则处理。*/
+	async setConversationPinned(id: string, pinned: boolean): Promise<void> {
+		const conv = this.convs.get(id);
+		if (!conv) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "该对话不存在或已关闭",
+				textEn: "This conversation does not exist or is already closed",
+			});
+			return;
+		}
+		// 子代理本来就永久豁免置换（displaceActive 开头即返回），钉子对它们无意义。
+		if (conv.isSubagent) {
+			this.emit({
+				type: "notice",
+				level: "info",
+				text: "子代理对话始终保留在运行列表，无需钉住",
+				textEn: "Subagent chats always stay in the running list — no need to pin",
+			});
+			return;
+		}
+		if (pinned === !!conv.pinned) {
+			this.emitConversations();
+			return;
+		}
+		if (pinned) {
+			conv.pinned = true;
+			// 立即进入运行列表（含空白对话）：listed 一旦置位，shownInRunningList 即放行。
+			conv.listed = true;
+			if (conv.session.sessionFile) {
+				this.stateStore?.setSessionPinned(conv.cwd, conv.session.sessionFile, true);
+			}
+		} else {
+			delete conv.pinned;
+			if (conv.session.sessionFile) {
+				this.stateStore?.setSessionPinned(conv.cwd, conv.session.sessionFile, false);
+			}
+		}
+		this.emitConversations();
+		this.flushSnapshot();
+		this.emit({
+			type: "notice",
+			level: "info",
+			text: pinned
+				? `已钉住对话「${conv.title}」，切换其他对话不会将它移出运行列表`
+				: `已取消钉住对话「${conv.title}」，下次切换离开时按常规规则处理`,
+			textEn: pinned
+				? `Pinned "${conv.title}" — switching away keeps it in the running list`
+				: `Unpinned "${conv.title}" — it will be handled by the usual rules on the next switch`,
+		});
+	}
+
+	/** 钉住 / 取消钉住历史会话（持久化并在运行中/历史列表生效）。 */
+	async pinSession(path: string, pinned: boolean): Promise<void> {
+		const targetPath = resolve(path);
+		this.stateStore?.setSessionPinned(this.cwd, targetPath, pinned);
+
+		// 如果当前已在运行列表中，同步其 pinned 状态
+		for (const conv of this.convs.values()) {
+			if (conv.session.sessionFile && resolve(conv.session.sessionFile) === targetPath) {
+				if (pinned) {
+					conv.pinned = true;
+					conv.listed = true;
+				} else {
+					delete conv.pinned;
+				}
+				break;
+			}
+		}
+
+		this.emitConversations();
+		this.flushSnapshot();
+		await this.refreshSessions();
 	}
 
 	/** Rename a live conversation by id: retitle in memory AND persist a
@@ -9113,6 +11321,7 @@ export class ClientSession {
 			// Dismiss 口径：只看“用过”的用户终端（AI bash 不钉住，见上）。
 			openTerminals: conv.terminals.countUserBlockingLive(),
 			listed: false,
+			promptInFlight: Boolean(conv.promptInFlight),
 			promptedSinceActive: false,
 			hasActiveSubagentRun: () => hasActiveSubagentRun({ sessionId: conv.session.sessionFile }),
 			hasPendingWake: () => hasPendingWaitSubscription({ sessionId: conv.session.sessionFile }),
@@ -9301,6 +11510,7 @@ export class ClientSession {
 				openTerminals: 0,
 				listed: conv.listed,
 				promptedSinceActive: conv.promptedSinceActive,
+				promptInFlight: Boolean(conv.promptInFlight),
 				hasActiveSubagentRun: () => hasActiveSubagentRun({ sessionId: conv.session.sessionFile }),
 				hasPendingWake: () => hasPendingWaitSubscription({ sessionId: conv.session.sessionFile }),
 			})
@@ -9539,6 +11749,7 @@ export class ClientSession {
 						// Dismiss 口径：只看“用过”的用户终端（issue #181，AI bash 不钉住）。
 						openTerminals: conv.terminals.countUserBlockingLive(),
 						listed: false,
+						promptInFlight: Boolean(conv.promptInFlight),
 						promptedSinceActive: false,
 						hasActiveSubagentRun: () => hasActiveSubagentRun({ sessionId: conv.session.sessionFile }),
 						hasPendingWake: () => hasPendingWaitSubscription({ sessionId: conv.session.sessionFile }),
@@ -9675,9 +11886,9 @@ export class ClientSession {
 			const oldListed = this.conv.listed;
 			const displaced = this.displaceActive();
 			const openInProject =
-				[...this.convs.values()].filter((c) => c.cwd === targetCwd && !c.isSubagent).length +
+				[...this.convs.values()].filter((c) => c.cwd === targetCwd && !c.isSubagent && !c.isEphemeral).length +
 				1 -
-				(displaced?.cwd === targetCwd && !displaced?.isSubagent ? 1 : 0);
+				(displaced?.cwd === targetCwd && !displaced?.isSubagent && !displaced?.isEphemeral ? 1 : 0);
 			if (openInProject > MAX_OPEN_CONVERSATIONS) {
 				// displaceActive() may have promoted a streaming conversation into the
 				// running list. Roll that presentation-only mutation back because no
@@ -9690,8 +11901,8 @@ export class ClientSession {
 				this.emit({
 					type: "notice",
 					level: "warning",
-					text: `当前项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个），请先打开某个对话并离开（不继续对话）以移出列表`,
-					textEn: `This project already has the max open conversations (${MAX_OPEN_CONVERSATIONS}). Open one and leave it (without continuing) to remove it from the list.`,
+					text: `当前项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个），请先移出不需要的对话（打开后离开不继续对话即移出；钉住的对话需先取消钉住）`,
+					textEn: `This project already has the max open conversations (${MAX_OPEN_CONVERSATIONS}). Open one and leave it (without continuing) to remove it from the list; pinned chats must be unpinned first.`,
 				});
 				return;
 			}
@@ -9700,6 +11911,10 @@ export class ClientSession {
 			// Deliberately resumed — must not be dismissed when the user later
 			// switches away without sending a new message.
 			conv.promptedSinceActive = true;
+			if (this.stateStore?.isSessionPinned(targetCwd, targetPath)) {
+				conv.pinned = true;
+				conv.listed = true;
+			}
 			this.noticeInterruptedCompaction(conv);
 			this.convs.set(conv.id, conv);
 			this.activeId = conv.id;
@@ -9707,7 +11922,14 @@ export class ClientSession {
 			openedTerminals = null;
 			if (displaced) this.removeConversation(displaced.id);
 			await this.bindSession();
+			// #436：转录回放恢复的 planMode 在 runtime 工厂的 applyToolGating 时还读不到
+			//（conv 尚未进 this.convs，planModeOf 落空）——注册后统一补一次门控，让
+			// 计划模式的写类/旁路工具剥离对重开的会话同样生效。下同（forkSession/setCwd）。
+			this.applyToolGating(conv.session, conv.agentPreset);
 			this.cwd = targetCwd;
+			// 打开的历史会话可能属于另一个项目 —— 工作区跟随面（roots/文件树/
+			// 历史列表/命令目录/最近项目）必须跟着切，否则 UI 停在旧项目。
+			this.applyCwdSideEffects(targetCwd);
 			await this.restoreProjectProviderKeysForCwd(targetCwd);
 			await this.restoreProjectModelForCwd(targetCwd);
 			this.conv.lastActiveAt = Date.now();
@@ -9719,6 +11941,7 @@ export class ClientSession {
 			void this.pushSlashCommands();
 			// 切历史会话成功 → 插件重拉（轨迹视图立即显示该会话时间线）。
 			this.notifyConversationChanged();
+			this.pushSettings();
 		} catch (err) {
 			openedTerminals?.killAll();
 			if (openedRuntime) await openedRuntime.dispose().catch(() => {});
@@ -9764,42 +11987,37 @@ export class ClientSession {
 		conv: Conversation,
 		messageId: string,
 	): import("@earendil-works/pi-coding-agent").SessionEntry | null {
-		const userSeqByTs = new Map<number, number>();
-		const assistantSeqByTs = new Map<number, number>();
-		let globalSeq = 0;
-
+		// The matcher re-derives rendered ids with the SAME derivation
+		// serializeCachedFor() used to hand them to the browser (uiMessageId +
+		// the counter below). Historically this recomputed ids with its own
+		// numbering (per-timestamp assistant seq, branch-entry global seq),
+		// which never matched what was rendered — fork/rollback on any
+		// assistant bubble failed 100% of the time (issue #381).
 		const entries = conv.session.sessionManager.buildContextEntries();
-		for (const entry of entries) {
-			globalSeq += 1;
-			if (entry.id === messageId) return entry;
-			if (entry.type === "message") {
-				const m = (entry as unknown as { message?: AgentMessage }).message;
-				if (!m) continue;
-				let uiId = "";
-				if (m.role === "user") {
-					const ts = m.timestamp ?? 0;
-					const seq = (userSeqByTs.get(ts) ?? 0) + 1;
-					userSeqByTs.set(ts, seq);
-					uiId = `u-${ts}-${seq}`;
-				} else if (m.role === "assistant") {
-					const ts = m.timestamp ?? 0;
-					const seq = (assistantSeqByTs.get(ts) ?? 0) + 1;
-					assistantSeqByTs.set(ts, seq);
-					uiId = `a-${ts}-${seq}`;
-				} else if (m.role === "toolResult") {
-					uiId = `t-${m.toolCallId}`;
-				} else if (m.role === "bashExecution") {
-					uiId = `b-${m.timestamp}-${globalSeq}`;
-				}
-				if (uiId === messageId) return entry;
-			} else if (entry.type === "custom_message") {
-				const ts = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
-				const uiId = `c-${ts}-${globalSeq}`;
-				if (uiId === messageId) return entry;
-			}
-		}
+		const found = findEntryByUiId(
+			entries as (UiIdEntryLike & import("@earendil-works/pi-coding-agent").SessionEntry)[],
+			messageId,
+			(m) => this.uiMessageKey(conv, m).n,
+		);
 		// 兜底：getEntry 查整棵树
-		return conv.session.sessionManager.getEntry(messageId) ?? null;
+		return found ?? conv.session.sessionManager.getEntry(messageId) ?? null;
+	}
+
+	/**
+	 * 获取被某个压缩卡片折叠的历史消息（issue #398，按需惰性加载）。
+	 */
+	getCompactedMessages(compactionMessageId: string, targetConvId?: string): void {
+		const targetConv = (targetConvId ? this.convs.get(targetConvId) : this.conv) ?? this.conv;
+		const sm = targetConv.session.sessionManager as SessionManagerLike;
+		const result = getCompactedMessages(sm, compactionMessageId, (m) => this.uiMessageKey(targetConv, m).n);
+
+		this.emit({
+			type: "compacted_messages_result",
+			compactionMessageId,
+			conversationId: targetConv.id,
+			messages: result.messages,
+			error: result.error,
+		});
 	}
 
 	/**
@@ -9887,9 +12105,38 @@ export class ClientSession {
 				title: targetConv.title,
 			};
 
+			// 与 newChat/switchSession 同一护栏：fork 出的对话也占项目名额，被换下
+			// 的旧 active 也要走运行列表生命周期（该保留的保留、该释放的释放）。
+			// 之前两者皆无 —— 可以无限 fork 堆爆名额，旧对话也永远留在列表里。
+			// 顺序照 switchSession：新 runtime 建好才 displace，失败不伤现有对话。
+			const oldListed = this.conv.listed;
+			const displaced = this.displaceActive();
+			const openInProject =
+				[...this.convs.values()].filter((c) => c.cwd === targetConv.cwd && !c.isSubagent && !c.isEphemeral).length +
+				1 -
+				(displaced?.cwd === targetConv.cwd && !displaced?.isSubagent && !displaced?.isEphemeral ? 1 : 0);
+			if (openInProject > MAX_OPEN_CONVERSATIONS) {
+				// displaceActive() 可能只是把旧对话标成后台展示（presentation-only）；
+				// 没有切换发生时回滚该标记，新 fork 的 runtime/终端直接释放。
+				this.conv.listed = oldListed;
+				terminals.killAll();
+				await runtime.dispose();
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: `当前项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个），请先移出不需要的对话（打开后离开不继续对话即移出；钉住的对话需先取消钉住）`,
+					textEn: `This project already has the max open conversations (${MAX_OPEN_CONVERSATIONS}). Open one and leave it (without continuing) to remove it from the list; pinned chats must be unpinned first.`,
+				});
+				return;
+			}
+
 			this.convs.set(conversationId, newConv);
 			this.activeId = conversationId;
+			if (displaced) this.removeConversation(displaced.id);
 			await this.bindSession();
+			// #436：同 switchSession —— 派生出的会话若从转录回放恢复了 planMode，
+			// 工厂里的门控当时读不到它，注册后补一次。
+			this.applyToolGating(newConv.session, newConv.agentPreset);
 
 			if (prevModel && this.sharedModelRuntime) {
 				try {
@@ -10068,7 +12315,8 @@ export class ClientSession {
 	): Promise<void> {
 		if (this.quiesceBlocked()) return;
 		const trimmed = text.trim();
-		if (!trimmed) {
+		const hasAttachments = Boolean(attachments && attachments.length > 0);
+		if (!trimmed && !hasAttachments) {
 			this.emit({
 				type: "notice",
 				level: "warning",
@@ -10149,55 +12397,47 @@ export class ClientSession {
 	 */
 	async pushProjects(): Promise<void> {
 		const now = Date.now();
-		const cached = this.projectsCache;
+		const cached = ClientSession.projectsCache;
 		// TTL 命中：直接复用（把当前 cwd 合并进去，刚 remember 的新项目也可见）。
 		if (cached && now - cached.at < ClientSession.PROJECTS_CACHE_TTL) {
 			this.emit({ type: "projects", projects: this.withCurrentCwd(cached.projects, now) });
 			return;
 		}
+
 		// 已有扫描在跑：搭车等它，不要并发扫两遍盘。
-		if (this.projectsInFlight) {
+		if (ClientSession.projectsInFlight) {
 			try {
-				const projects = await this.projectsInFlight;
+				const projects = await ClientSession.projectsInFlight;
 				if (projects) this.emit({ type: "projects", projects: this.withCurrentCwd(projects, Date.now()) });
 			} catch {
 				/* 首发扫描已自行 emit 错误结果，这里不再补 */
 			}
 			return;
 		}
-		const run: Promise<ProjectSummary[] | null> = (async () => {
+
+		// 执行轻量磁盘发现（仅读会话文件首行头部获取 cwd，不解析全部消息历史）
+		const sessionRoots = [resolve(this.agentDir, "sessions")];
+		const extra = piSessionsRoot();
+		if (extra) sessionRoots.push(resolve(extra));
+
+		const run = (async (): Promise<ProjectSummary[] | null> => {
 			try {
-				const saved = this.stateStore.get(this.clientId);
-				const removedProjects = new Set(this.stateStore.getRemovedProjects(this.clientId).map(normalizePathKey));
-				const map = new Map<string, number>();
-				for (const p of saved.projects) map.set(p.path, p.lastUsed);
-				const all = await SessionManager.listAll(piSessionsRoot());
-				for (const s of all) {
-					if (s.cwd) {
-						const t = s.modified.getTime();
-						const prev = map.get(s.cwd);
-						if (prev === undefined || t > prev) map.set(s.cwd, t);
-					}
-				}
-				// Only keep directories that still exist — a deleted/unmounted workspace
-				// is useless in the picker. Tombstoned entries (explicitly removed by
-				// the user) stay hidden even though session files still mention them.
-				const projects: ProjectSummary[] = [...map.entries()]
-					.filter(([path]) => !removedProjects.has(normalizePathKey(path)) && existsSync(path))
-					.map(([path, lastUsed]) => ({ path, lastUsed }))
-					.sort((a, b) => b.lastUsed - a.lastUsed)
-					.slice(0, 20);
-				this.projectsCache = { at: Date.now(), projects };
-				this.emit({ type: "projects", projects });
-				return projects;
+				const discovered = await discoverRecentProjectsFromDisk(sessionRoots, 30);
+				this.stateStore.mergeDiscoveredProjects(discovered);
+				const merged = await this.stateStore.getRecentProjects(this.clientId);
+				ClientSession.projectsCache = { at: Date.now(), projects: merged };
+				const result = this.withCurrentCwd(merged, Date.now());
+				this.emit({ type: "projects", projects: result });
+				return merged;
 			} catch {
-				this.emit({ type: "projects", projects: [] });
-				return null;
+				const fallback = this.withCurrentCwd(await this.stateStore.getRecentProjects(this.clientId), Date.now());
+				this.emit({ type: "projects", projects: fallback });
+				return fallback;
 			} finally {
-				this.projectsInFlight = null;
+				ClientSession.projectsInFlight = null;
 			}
 		})();
-		this.projectsInFlight = run;
+		ClientSession.projectsInFlight = run;
 		await run;
 	}
 
@@ -10220,7 +12460,7 @@ export class ClientSession {
 
 	/** 最近项目缓存失效（用户显式移除项目后，下一次推送必须重扫）。 */
 	private invalidateProjectsCache(): void {
-		this.projectsCache = null;
+		ClientSession.projectsCache = null;
 	}
 
 	/** List a workspace directory (relative to the configured cwd). */
@@ -10235,8 +12475,9 @@ export class ClientSession {
 
 	/** 全局搜索：在当前工作区的会话转录全文里做大小写不敏感匹配 ——
 	 *  不止首条消息，而是每一段 user 与 assistant 文本（AI 输出也在内）。
-	 *  结果经 session_search_results 回推（reqId 匹配）；复用 loadSessionInfos()
-	 *  缓存，避免每个按键都重新解析全部转录文件。 */
+	 *  结果经 session_search_results 回推（reqId 匹配）；元信息复用 loadSessionInfos()
+	 *  缓存，转录全文按需加载（issue #440，小容量短 TTL 缓存），避免每个按键都重新
+	 *  解析全部转录文件、也不让全文长期驻留内存。 */
 	async searchSessions(query: string, reqId: number): Promise<void> {
 		const q = query.trim().toLowerCase();
 		if (!q) {
@@ -10245,11 +12486,12 @@ export class ClientSession {
 		}
 		try {
 			const infos = await this.loadSessionInfos();
-			const results = infos
-				.filter((s) => sessionMatchesSearch(q, s))
+			const matched = await ClientSession.filterSessionsForSearch(q, infos);
+			const results = matched
 				.sort((a, b) => b.modified.getTime() - a.modified.getTime())
 				.slice(0, 50)
 				.map((s) => {
+					const isPinned = this.stateStore?.isSessionPinned(this.cwd, s.path);
 					const base: SessionSummary = {
 						path: s.path,
 						name: s.name,
@@ -10257,6 +12499,7 @@ export class ClientSession {
 						messageCount: s.messageCount,
 						modified: s.modified.getTime(),
 						source: "web",
+						...(isPinned ? { pinned: true } : {}),
 					};
 					// 命中会话里再定位具体消息（供点击跳转）；仅元数据命中则无锚点
 					return { ...base, anchors: collectSessionAnchors(s.path, q) };
@@ -10506,7 +12749,7 @@ export class ClientSession {
 
 	async setCwd(newCwd: string): Promise<void> {
 		try {
-			const { resolve, sep } = await import("node:path");
+			const { resolve } = await import("node:path");
 			this.files.unwatchGit(); // stale repo's watcher must not fire across projects
 			const fs = await import("node:fs/promises");
 			const trimmed = newCwd.trim();
@@ -10520,12 +12763,9 @@ export class ClientSession {
 				});
 				return;
 			}
-			// Windows 裸盘符（"C:"）：resolve 会按该盘当前目录解析，必须显式指到盘根；
-			// 仅 win32 生效——posix 下 "C:" 仍是普通相对路径，避免误伤同名目录。
-			const abs =
-				process.platform === "win32" && /^[A-Za-z]:$/.test(trimmed)
-					? `${trimmed.toUpperCase()}${sep}`
-					: resolve(trimmed);
+			// Windows 裸盘符（"C:"）与相对路径基准的处理收敛到 resolveCwdTarget
+			// （纯函数，含 win32/posix 差异说明与单测）。
+			const abs = resolveCwdTarget(trimmed, this.cwd);
 			const st = await fs.stat(abs);
 			if (!st.isDirectory()) {
 				throw new Error("路径不是目录");
@@ -10618,6 +12858,9 @@ export class ClientSession {
 					}
 				}
 				await this.bindSession();
+				// #436：同 switchSession —— 续聊最近会话若从转录回放恢复了 planMode，
+				// 工厂里的门控当时读不到它，注册后补一次。
+				this.applyToolGating(conv.session, conv.agentPreset);
 				if (resumeSkipped) {
 					this.emit(
 						resumeSkipped.isStreaming
@@ -10641,7 +12884,6 @@ export class ClientSession {
 			this.conv.promptedSinceActive = false;
 			this.conv.lastActiveAt = Date.now();
 			this.cwd = abs;
-			this.roots = this.stateStore.getWorkspaceRoots(this.clientId, abs);
 			// 模型/key 恢复不挡快照：后台做，带切换代际 guard（用户又切走就跳过，
 			// 否则会把旧项目的 key 套到新对话上），做完补一次 flush 刷新模型栏。
 			{
@@ -10658,15 +12900,7 @@ export class ClientSession {
 					}
 				})();
 			}
-			// 工作区跟随型插件（编辑器文件树等）同步切根。
-			try {
-				this.onCwdChanged?.(abs, this.roots);
-			} catch {
-				/* 钩子异常不影响主流程 */
-			}
-			// Remember the new workspace (restore target + recent-project entry).
-			this.stateStore.remember(this.clientId, abs);
-			void this.pushProjects();
+			this.applyCwdSideEffects(abs);
 			this.webUi.refresh();
 			this.emitConversations();
 			this.goalSvc.emitGoalStatus();
@@ -10678,12 +12912,9 @@ export class ClientSession {
 				text: `已切换到工作目录：${abs}`,
 				textEn: `Switched to directory: ${abs}`,
 			});
-			this.refreshSessionsOnSwitch();
-			void this.listFiles(undefined);
-			// Commands are per-project (.pi/commands.json in the current cwd).
-			void this.listCommands();
 			// 切项目即换了当前打开对话 → 插件重拉。
 			this.notifyConversationChanged();
+			this.pushSettings();
 		} catch (err) {
 			this.emit({
 				type: "notice",
@@ -10745,6 +12976,8 @@ export class ClientSession {
 			reviewModel?: string;
 			maxRounds?: number;
 			locked?: boolean;
+			/** 目标模式 2.0：执行者模型。 */
+			execModel?: string;
 			autoStart?: boolean;
 		},
 	): Promise<void> {
@@ -10762,7 +12995,12 @@ export class ClientSession {
 		return this.goalSvc.startGoalWizard(text, opts);
 	}
 
-	async setGoalPrefs(opts?: { reviewModel?: string; maxRounds?: number; locked?: boolean }): Promise<void> {
+	async setGoalPrefs(opts?: {
+		reviewModel?: string;
+		maxRounds?: number;
+		locked?: boolean;
+		execModel?: string;
+	}): Promise<void> {
 		return this.goalSvc.setGoalPrefs(opts);
 	}
 
@@ -10770,13 +13008,27 @@ export class ClientSession {
 		return this.goalSvc.clearGoal();
 	}
 
-	/** Run a git diff (unstaged + staged) in a conversation's workspace, or
-	 * "" when not a repo. */
+	/**
+	 * Run a git diff (unstaged + staged) in a conversation's workspace, or
+	 * "" when not a repo.
+	 *
+	 * 返回值是 goal 审查用的「变更指纹」，构造规则（截断与等值比较的相互作用）
+	 * 见 buildDiffFingerprint：diff 为空时以排序后的 `git status --porcelain`
+	 * 兜底（未跟踪文件也算变更），diff 非空时正文截断后拼 [diff-meta] 尾段，
+	 * 避免大 diff 截断后两轮前缀相同被误判成停滞。
+	 */
 	private async gitDiff(cwd: string): Promise<string> {
 		try {
 			const { code, out } = await this.runAsync("git", ["diff", "HEAD"], 10_000, cwd);
 			if (code !== 0) return "";
-			return out.slice(0, 60_000);
+			let status = "";
+			try {
+				const st = await this.runAsync("git", ["status", "--porcelain"], 10_000, cwd);
+				if (st.code === 0) status = st.out;
+			} catch {
+				// status 拍不到 → 指纹退化为纯 diff，行为与旧版一致
+			}
+			return buildDiffFingerprint(out, status);
 		} catch {
 			return "";
 		}
@@ -10989,6 +13241,8 @@ export class ClientSession {
 		this.cancelPendingQuestions();
 		// 同理关闭挂起的页面调用（以失败解析：对面是扩展，没有答可等）。
 		this.cancelPendingPageCalls();
+		// 挂起的工具审批一并清掉（以「拒绝」解析，防 Promise/runtime 泄漏）。
+		this.cancelPendingApprovals();
 		this.bg.stop();
 		for (const conv of this.convs.values()) {
 			this.clearAllToolWatchdogs(conv);
@@ -11038,7 +13292,13 @@ export function checkPluginCwd(cwd: string): { ok: boolean; abs?: string; error?
 	return { ok: true, abs };
 }
 
+/** 插件/调度伪客户端：sink 常驻（fire-and-forget 的空函数），不能按浏览器存活判断。 */
+export function isPseudoClientId(id: string): boolean {
+	return id.startsWith("plugin:") || id.startsWith("scheduler:");
+}
+
 export class AgentService {
+	static isPseudoClientId = isPseudoClientId;
 	/** index.ts 注入：SDK 工具执行事件的插件转发钩子，attach 时拷贝到每个新会话。 */
 	onToolEvent: ((ev: PluginToolEvent) => void) | undefined = undefined;
 	/** index.ts 注入：bash/read 插件拦截钩子，attach 时拷贝到每个新会话。 */
@@ -11357,8 +13617,15 @@ export class AgentService {
 			if (clientId === excludeClientId) continue;
 			// issue #291：跳过无浏览器连接的残骸（非伪客户端 sinkCount=0 = 断连留存）。
 			// 伪客户端（scheduler:/plugin:）不走浏览器，sinkCount 永远为 0，保留。
-			if (!AgentService.isPseudoClientId(clientId) && cs.sinkCount() === 0) continue;
-			for (const r of cs.streamingSummariesAll()) out.push({ ...r, owner: clientId });
+			const isPseudo = AgentService.isPseudoClientId(clientId);
+			if (!isPseudo && cs.sinkCount() === 0) continue;
+			for (const r of cs.streamingSummariesAll()) {
+				out.push({
+					...r,
+					owner: clientId,
+					...(isPseudo ? { pseudo: true } : {}),
+				});
+			}
 		}
 		return out;
 	}
@@ -11372,6 +13639,11 @@ export class AgentService {
 		// 伪客户端常驻一个 noop sink（chatFromScheduler 的 attach），所以不能按
 		// sinkCount 判断「有没有浏览器」—— 它永远为 1。这里就是它的回收点。
 		this.clients.delete(clientId);
+		// 先摘出 map 再异步 dispose：只删 map 的话，对话的 runtime/终端/看门狗
+		// 计时器全都留在内存里（泄漏），转录还挂着活 writer（同文件双写者风险）。
+		void cs.dispose().catch(() => {
+			// 回收失败不拦主流程：尽力而为，进程退出时 OS 兜底
+		});
 		// 通知其他客户端刷新 elsewhere 列表。
 		this.pokeExternalRunning(clientId);
 	}
@@ -11638,10 +13910,7 @@ export class AgentService {
 		};
 	}
 
-	/** 插件/调度伪客户端：sink 常驻（fire-and-forget 的空函数），不能按浏览器存活判断。 */
-	private static isPseudoClientId(id: string): boolean {
-		return id.startsWith("plugin:") || id.startsWith("scheduler:");
-	}
+	// （原 private static isPseudoClientId 已抽到模块级导出并挂为 static 属性）
 
 	/**
 	 * 浏览器重启认领：给 fresh clientId 找一个可接管的断开残留会话（返回旧 id）。
@@ -11733,7 +14002,10 @@ export class AgentService {
 			return;
 		}
 		if (AgentService.isPseudoClientId(ownerId)) {
-			fail("定时任务/插件会话不支持过户", "Scheduler/plugin sessions cannot be taken over.");
+			fail(
+				"定时任务/插件会话不支持过户 —— 报告会自动落回绑定的对话，可在后台任务面板查看进度",
+				"Scheduler/plugin sessions cannot be taken over — reports are saved to the bound conversation automatically; check progress in the Background Tasks panel.",
+			);
 			return;
 		}
 		const source = this.clients.get(ownerId);
@@ -11761,14 +14033,14 @@ export class AgentService {
 		}
 		const moveIds = [convId, ...collectSubagentDescendantIds(briefs, convId)];
 		const moveSet = new Set(moveIds);
-		// 容量：与 switchSession 同口径（目标项目非子代理 8 个）。
-		const movedMains = briefs.filter((b) => moveSet.has(b.id) && !b.isSubagent).length;
+		// 容量：与 switchSession 同口径（目标项目非子代理且非临时会话 8 个）。
+		const movedMains = briefs.filter((b) => moveSet.has(b.id) && !b.isSubagent && !b.isEphemeral).length;
 		const openInProject =
-			target.takeoverBriefs().filter((b) => b.cwd === main.cwd && !b.isSubagent).length + movedMains;
+			target.takeoverBriefs().filter((b) => b.cwd === main.cwd && !b.isSubagent && !b.isEphemeral).length + movedMains;
 		if (openInProject > MAX_OPEN_CONVERSATIONS) {
 			fail(
-				`目标项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个），请先打开某个对话并离开（不继续对话）以移出列表`,
-				`This project already has the max open conversations (${MAX_OPEN_CONVERSATIONS}). Open one and leave it (without continuing) to remove it from the list.`,
+				`目标项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个），请先移出不需要的对话（打开后离开不继续对话即移出；钉住的对话需先取消钉住）`,
+				`This project already has the max open conversations (${MAX_OPEN_CONVERSATIONS}). Open one and leave it (without continuing) to remove it from the list; pinned chats must be unpinned first.`,
 			);
 			return;
 		}
@@ -11824,8 +14096,8 @@ export class AgentService {
 		if (ownerId === targetId) return; // 自己的问卷走本地通道，不需要预告
 		if (AgentService.isPseudoClientId(ownerId)) {
 			fail(
-				"定时任务/插件会话的问卷不支持跨页作答",
-				"Scheduler/plugin session questions cannot be answered cross-page.",
+				"定时任务/插件会话的问卷不支持跨页作答 —— 报告会自动落回绑定的对话，可在后台任务面板查看进度",
+				"Scheduler/plugin session questions cannot be answered cross-page — reports are saved to the bound conversation automatically; check progress in the Background Tasks panel.",
 			);
 			return;
 		}
@@ -11884,7 +14156,9 @@ export class AgentService {
 				// 流式增量经尾部 attachSink 直接推给新 socket）。
 				// 有其他在线标签时不认领（issue #10 隔离优先）；quiesce 排空期也放行
 				// （这是重连既有工作，不是新工作）。本段无 await，并发 attach 原子。
-				const orphan = this.findAdoptableOrphan(clientId);
+				// 伪客户端（scheduler:/plugin:，定时任务/插件的无头调用）绝不认领：
+				// 否则无头会话会改键劫持用户关浏览器留下的残会话。
+				const orphan = AgentService.isPseudoClientId(clientId) ? null : this.findAdoptableOrphan(clientId);
 				if (orphan) {
 					this.clients.delete(orphan.oldId);
 					this.clients.set(clientId, orphan.cs);

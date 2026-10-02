@@ -28,6 +28,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 // 冒烟测试离线确定性运行：禁用服务启动时的远程插件市场拉取（避免污染测试临时 dataDir 并消除外网依赖与时序竞态）
 process.env.PI_WEB_PLUGIN_CATALOG_URL = process.env.PI_WEB_PLUGIN_CATALOG_URL ?? "";
+// 测试内自建 upstream/mock 书源站监听 127.0.0.1，SSRF 防护对回环地址放行
+process.env.LEGADO_ALLOW_PRIVATE_HOSTS = process.env.LEGADO_ALLOW_PRIVATE_HOSTS ?? "127.0.0.1,localhost";
 
 // Windows 本机已知失败（非逻辑问题，ubuntu CI 正常）：
 //   - terminal-smoke-test：node-pty 在 ConPTY 下 shell 退出事件/控制台列表 agent
@@ -52,12 +54,20 @@ const ALL = [
 	"chat-abort-attachments-rollback-test",
 	// 临时对话（issue #285）：inMemory 不落盘 + 左栏 isEphemeral 标记 + 转正落盘（对照组验普通对话真落盘）。
 	"ephemeral-chat-test",
+	// issue #381 回归：助手气泡上的 fork/rollback 必须解析成功（mock LLM，tsx 起源码）。
+	"fork-assistant-bubble-test",
 	"dsh-smoke-test",
 	"dsh-stats-test",
 	"fetch-models-test",
 	"global-search-test",
 	"goal-prefs-test",
 	"goal-test",
+	// 目标模式 2.0「委托执行」（Plan A）：角色对话接线（拉起/左栏可见/清目标收回，零 token）。
+	"goal-delegated-test",
+	// 计划模式（只规划不实施）：开关快照 + 写类/非常规 bash 硬闸门 + 关闭后恢复（零 token）。
+	"plan-mode-test",
+	// 审查者模式（自动委派）：开关快照 + prompt 自动转给常驻执行对话 + 关闭后恢复（零 token）。
+	"delegate-mode-test",
 	"left-panel-delete-test",
 	"legado-web-engine-test",
 	"legado-web-test",

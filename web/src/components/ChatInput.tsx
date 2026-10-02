@@ -1,9 +1,9 @@
 import { Fragment, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { FiList, FiSquare, FiPaperclip, FiArrowUp, FiGrid, FiMic, FiCamera } from "react-icons/fi";
+import { FiList, FiSquare, FiPaperclip, FiArrowUp, FiBookOpen, FiMic, FiCamera } from "react-icons/fi";
 import type { FileSearchResult, ModelInfo, ProviderKeyInfo, SlashCommandInfo, UiMessage, UiState } from "../types";
 import { useT, useI18n } from "../i18n";
 import { appSend, useAppField, useIsDsh } from "../app-globals";
-import { mergeRecalledDraft, selectDraftToRestore } from "../composer-draft";
+import { mergeRecalledDraft, selectDraftToRestore, shouldCarryOverDraft } from "../composer-draft";
 import {
 	registerDraftSink,
 	registerFocusSink,
@@ -12,20 +12,32 @@ import {
 } from "../composer-bridge";
 import { caretVisualLineFlags } from "../caret-visual-line";
 import { isRasterImage } from "../image-paste";
+import { collectClipboardFiles } from "../clipboard-files";
 import { recordModelUsage } from "../model-usage";
 import { loadPromptHistory, pushPromptHistory } from "../prompt-history";
 import { filterSlashCommands } from "../slash-filter";
-import { mapFileHits, mapPageHits, matchAtToken, normalizeAtHits, type AtHit } from "../at-mention";
+import {
+	mapFileHits,
+	mapPageHits,
+	mapSkillHits,
+	matchAtToken,
+	mergeAtHits,
+	normalizeAtHits,
+	type AtHit,
+} from "../at-mention";
 import { getLastBrowserControlPages, pokeBrowserControl } from "../browser-control";
 import { getPluginComposerProvider, listPluginComposerProviders } from "../plugin-host";
 import { detectTouchFirstDevice } from "../touch-device";
+import { copyTextToClipboard } from "../use-copy-feedback";
 import { groupByAlign } from "../ui-slots";
+import { nextSearchReqId } from "../search-req-id";
 
 import { ModelThinking } from "./ModelThinking";
 import { DshPresetBar, type DshPresetInfo } from "./DshPresetBar";
 import { DshPermissionBar } from "./DshPermissionBar";
 import type { DshPermissionOption, UiAgentPreset } from "../types";
 import { useTemplates } from "./PromptTemplates";
+import { TextQuoteCard } from "./TextQuoteCard";
 
 /** True on touch-first devices (phones / tablets driven by a soft keyboard) —
  *  see `touch-device.ts` for the detection rules (Windows 触屏笔记本不算触屏，
@@ -74,7 +86,8 @@ interface ChatInputProps {
 		 *  （运行中，含子代理）或 sessionPath（历史转录）。
 		 *  "inline" = 旧版「全文注入」的遗留值（服务端按 reference 处理）。
 		 *  粘贴图片/上传文件没有 mode（path 为空）。 */
-		mode?: "inline" | "reference" | "lines" | "page" | "conversation";
+		mode?: "inline" | "reference" | "lines" | "page" | "conversation" | "quote";
+		quote?: import("../types").TextQuote;
 		/** mode "conversation" + 引用运行中对话的 id（如 "c3"）。 */
 		conversationId?: string;
 		/** mode "conversation" + 引用历史会话的转录文件 path。 */
@@ -136,6 +149,8 @@ interface ChatInputProps {
 	dshBlank?: boolean;
 	/** 会话 id（dsh 下拉切换会话时重置选中值）。 */
 	conversationId?: string;
+	/** 当前会话是否处于只读规划模式。 */
+	planMode?: boolean;
 	/** 服务端存过的未发送草稿（全量快照携带，issue #166 单中心文件方案；
 	 *  DSH 引擎不填，传了也忽略）。 */
 	sessionDraft?: { text: string; ts: number } | null;
@@ -145,6 +160,7 @@ interface ChatInputProps {
 
 export const ChatInput = memo(function ChatInput({
 	streaming,
+	planMode,
 	messages,
 	slashCommands,
 	modelState,
@@ -211,13 +227,12 @@ export const ChatInput = memo(function ChatInput({
 	const dragResizeRef = useRef<{ startY: number; startH: number; next: number | null } | null>(null);
 	/** 统一补全浮层：`/` 命令与 `@` 提及共用一个浮层，按 kind 换内容（互斥，
 	 *  同一时间只可能开一个：slash 优先全文匹配，否则看光标前的 @ 词元）。 */
-	type ComposerMenu = { kind: "slash"; items: SlashCommandInfo[] } | { kind: "at"; start: number; items: AtHit[] };
+	type ComposerMenu =
+		{ kind: "slash"; items: SlashCommandInfo[] } | { kind: "at"; start: number; end: number; items: AtHit[] };
 	const [menu, setMenu] = useState<ComposerMenu | null>(null);
 	const [menuIndex, setMenuIndex] = useState(0);
 	/** `@` 异步查询的竞态 guard：迟到响应直接丢弃。 */
 	const atReqRef = useRef(0);
-	/** 内置文件查询的 reqId（search_files 回填匹配用，与 GlobalSearchModal 各自计数）。 */
-	const fileReqRef = useRef(0);
 	/** 等 search_files 回填的 waiter（reqId → resolve；超时/命中即删）。 */
 	const fileWaiters = useRef(new Map<number, (v: unknown) => void>());
 	/** 最近一次 refreshMenus 的输入（迟到响应与快照不一致即丢弃）。 */
@@ -243,7 +258,12 @@ export const ChatInput = memo(function ChatInput({
 		const pending = recallDrafts.filter((d) => d.text && d.seq > lastRecallSeqRef.current);
 		if (pending.length === 0) return;
 		lastRecallSeqRef.current = pending[pending.length - 1].seq;
-		setText((prev) => pending.reduce((acc, d) => mergeRecalledDraft(acc, d.text), prev));
+		setMenu(null);
+		setText((prev) => {
+			const next = pending.reduce((acc, d) => mergeRecalledDraft(acc, d.text), prev);
+			menuTextRef.current = next;
+			return next;
+		});
 		// 与 prompt 历史导航状态解耦：撤回后从「当前草稿」重新开始。
 		historyIndexRef.current = -1;
 		draftRef.current = "";
@@ -260,7 +280,12 @@ export const ChatInput = memo(function ChatInput({
 	// 挂载时装一次：setText 是 useState 的稳定引用，不依赖任何会变的闭包。
 	useEffect(() => {
 		registerDraftSink((incoming) => {
-			setText((prev) => mergeRecalledDraft(prev, incoming));
+			setMenu(null);
+			setText((prev) => {
+				const next = mergeRecalledDraft(prev, incoming);
+				menuTextRef.current = next;
+				return next;
+			});
 			historyIndexRef.current = -1;
 			draftRef.current = "";
 			requestAnimationFrame(() => {
@@ -286,6 +311,10 @@ export const ChatInput = memo(function ChatInput({
 	}, []);
 
 	// 宿主触发在光标处插入文本（文件树/预览点击「引用路径」联动插入 @文件名）
+	// 审查 #15：正文走 textRef（effect 每键重注册会让宿主桥反复解绑/挂载，
+	// 且错过注册窗口的插入会丢）。textRef 在每次渲染同步最新正文，effect 依赖 []。
+	const textRef = useRef("");
+	textRef.current = text;
 	useEffect(() => {
 		registerInsertSink((textToInsert) => {
 			// 第二道防线：正文里已有同一 @提及（重复点同一文件等）→ 跳过不重复插。
@@ -298,7 +327,7 @@ export const ChatInput = memo(function ChatInput({
 					.map((ch) => (specials.has(ch) ? "\\" + ch : ch))
 					.join("");
 				const re = new RegExp("(^|[\\s(（\"'“‘[【])" + esc + "(?=[\\s,.;:!?，。！？)\\]】」]|$)");
-				if (core && re.test(text)) return;
+				if (core && re.test(textRef.current)) return;
 			}
 			const ta = taRef.current;
 			if (!ta) {
@@ -309,9 +338,9 @@ export const ChatInput = memo(function ChatInput({
 				});
 				return;
 			}
-			const start = ta.selectionStart ?? text.length;
-			const end = ta.selectionEnd ?? text.length;
-			const current = text;
+			const start = ta.selectionStart ?? textRef.current.length;
+			const end = ta.selectionEnd ?? textRef.current.length;
+			const current = textRef.current;
 			const needsPrefixSpace = start > 0 && !/[\s([{]$/.test(current.slice(0, start));
 			const prefix = needsPrefixSpace ? " " : "";
 			const insert = prefix + textToInsert;
@@ -325,7 +354,7 @@ export const ChatInput = memo(function ChatInput({
 			});
 		});
 		return () => registerInsertSink(null);
-	}, [text]);
+	}, []);
 
 	// 宿主触发移除特定提及（用户点击附件 chip 的 ✕ 时联动从正文中删除对应的 @文件名）
 	useEffect(() => {
@@ -379,6 +408,7 @@ export const ChatInput = memo(function ChatInput({
 	const appliedDraftTsRef = useRef(0);
 	const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const draftScopeRef = useRef<string | null>(null);
+	const pendingCarryOverRef = useRef<string | null>(null);
 	/** 最近一次 IME compositionend 的时间戳（issue #248：macOS 中文输入法下敲英文字母按 Enter 上屏时，
 	 *  浏览器会先派发 compositionend 再派发 keydown(Enter, isComposing=false)，需通过时间差拦截误发送）。 */
 	const compositionEndTimeRef = useRef(0);
@@ -457,7 +487,7 @@ export const ChatInput = memo(function ChatInput({
 	};
 
 	// 切会话（conversationId/sessionId 任一变）：旧会话 timer 里没发出去的先刷掉
-	//（cleanup 闭包里还是旧 sid/旧文本，key 不会写错），再清空输入框等恢复。
+	//（cleanup 闭包里还是旧 sid/旧文本，key 不会写错），并记下未发出的打字内容。
 	useEffect(() => {
 		const scope = draftSessionKey;
 		const sid = sessionId;
@@ -467,21 +497,49 @@ export const ChatInput = memo(function ChatInput({
 				clearTimeout(draftTimerRef.current);
 				draftTimerRef.current = null;
 			}
-			if (touchedRef.current && scope && sid && localKey && textMirrorRef.current.trim()) {
-				persistComposerDraft(sid, localKey, textMirrorRef.current, lastEditTsRef.current);
+			if (touchedRef.current && textMirrorRef.current.trim()) {
+				if (scope && sid && localKey) {
+					persistComposerDraft(sid, localKey, textMirrorRef.current, lastEditTsRef.current);
+				}
+				pendingCarryOverRef.current = textMirrorRef.current;
+			} else {
+				pendingCarryOverRef.current = null;
 			}
 		};
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [draftSessionKey]);
 
-	// 新会话就绪：重置追踪并清空（恢复 effect 在后面，同一 commit 内按声明顺序跑）。
+	// 新会话就绪：若切到全新空会话（messages 为空）且新会话无自身草稿，保留并承接用户未提交的正在输入内容。
 	useEffect(() => {
 		draftScopeRef.current = draftSessionKey;
-		touchedRef.current = false;
-		appliedDraftTsRef.current = 0;
-		textMirrorRef.current = "";
-		lastEditTsRef.current = 0;
-		setText("");
+		const carry = pendingCarryOverRef.current;
+		pendingCarryOverRef.current = null;
+
+		const existingLocal = draftLocalKey ? readLocalDraft(draftLocalKey) : null;
+		const hasExistingDraft = Boolean(
+			(sessionDraft && sessionDraft.text?.trim() && sessionDraft.ts > 0) ||
+			(existingLocal && existingLocal.text?.trim()),
+		);
+
+		if (
+			carry !== null &&
+			shouldCarryOverDraft(carry, messages.length, hasExistingDraft) &&
+			draftLocalKey &&
+			sessionId
+		) {
+			touchedRef.current = true;
+			appliedDraftTsRef.current = Date.now();
+			textMirrorRef.current = carry;
+			lastEditTsRef.current = appliedDraftTsRef.current;
+			setText(carry);
+			persistComposerDraft(sessionId, draftLocalKey, carry, lastEditTsRef.current);
+		} else {
+			touchedRef.current = false;
+			appliedDraftTsRef.current = 0;
+			textMirrorRef.current = "";
+			lastEditTsRef.current = 0;
+			setText("");
+		}
 		setMenu(null);
 		historyIndexRef.current = -1;
 	}, [draftSessionKey]);
@@ -564,6 +622,7 @@ export const ChatInput = memo(function ChatInput({
 		const snapshot = value;
 		const start = tok.start;
 		const query = tok.query;
+		const end = start + 1 + query.length;
 		const jobs: { id: string; label: string; run: () => Promise<unknown> }[] = ids.map((p) => ({
 			id: p.id,
 			label: p.label,
@@ -584,14 +643,23 @@ export const ChatInput = memo(function ChatInput({
 		// 内置页面提供方（page-picker 已授权页）：读缓存同步出结果，后台节流刷新
 		// （扩展在线才会问，桌面壳/未装扩展时缓存恒空，零打扰）。
 		pokeBrowserControl();
+		const immediatePages = mapPageHits(t("browserControl"), getLastBrowserControlPages(), query);
 		jobs.push({
 			id: "host:pages",
 			label: t("browserControl"),
-			run: () => Promise.resolve(mapPageHits(t("browserControl"), getLastBrowserControlPages(), query)),
+			run: () => Promise.resolve(immediatePages),
 		});
 		if (jobs.length === 0) {
 			setMenu(null);
 			return;
+		}
+		const skillItems = mapSkillHits(t("slashSkill"), slashCommands, query, 15, slashDesc);
+		const eagerItems = mergeAtHits({ pages: immediatePages, skills: skillItems }, query, 30);
+		let eagerRendered = false;
+		if (eagerItems.length > 0) {
+			eagerRendered = true;
+			setMenu({ kind: "at", start, end, items: eagerItems });
+			setMenuIndex(0);
 		}
 		void Promise.allSettled(
 			jobs.map((j) =>
@@ -602,25 +670,32 @@ export const ChatInput = memo(function ChatInput({
 			),
 		).then((results) => {
 			if (atReqRef.current !== req || menuTextRef.current !== snapshot) return;
-			// 页面置顶：`@page` 一打全是页面在前，不用记标题，文件与插件结果跟在后面。
 			const pageItems: AtHit[] = [];
-			const restItems: AtHit[] = [];
+			const fileItems: AtHit[] = [];
+			const pluginItems: AtHit[] = [];
 			results.forEach((r, i) => {
-				if (r.status !== "fulfilled" || pageItems.length + restItems.length >= 30) return;
+				if (r.status !== "fulfilled") return;
 				if (jobs[i].id === "host:pages" && Array.isArray(r.value)) pageItems.push(...(r.value as AtHit[]));
-				else if (jobs[i].id === "host:files") restItems.push(...mapFileHits(jobs[i].label, r.value));
-				else restItems.push(...normalizeAtHits(jobs[i].id, jobs[i].label, r.value));
+				else if (jobs[i].id === "host:files") fileItems.push(...mapFileHits(jobs[i].label, r.value));
+				else pluginItems.push(...normalizeAtHits(jobs[i].id, jobs[i].label, r.value));
 			});
-			const items = [...pageItems, ...restItems].slice(0, 30);
-			setMenu(items.length > 0 ? { kind: "at", start, items } : null);
-			setMenuIndex(0);
+			const items = mergeAtHits(
+				{ pages: pageItems, skills: skillItems, files: fileItems, plugins: pluginItems },
+				query,
+				30,
+			);
+			setMenu(items.length > 0 ? { kind: "at", start, end, items } : null);
+			// 仅在初次渲染浮层时重置高亮；若已展示过 eager 结果，保留用户已有键盘/鼠标选项目
+			if (!eagerRendered && items.length > 0) {
+				setMenuIndex(0);
+			}
 		});
 	};
 
 	/** 内置文件查询：发 search_files，命中回填时 resolve（超时 3s 回空）。 */
 	const searchBuiltinFiles = (query: string): Promise<unknown> => {
 		if (typeof onSearchFiles !== "function") return Promise.resolve([]);
-		const reqId = ++fileReqRef.current;
+		const reqId = nextSearchReqId();
 		return new Promise((resolve) => {
 			fileWaiters.current.set(reqId, resolve);
 			try {
@@ -675,6 +750,7 @@ export const ChatInput = memo(function ChatInput({
 		const next = `/${pick.name} ${rest}`;
 		menuTextRef.current = next;
 		setText(next);
+		noteComposerEdit(next);
 		setMenu(null);
 		taRef.current?.focus();
 	};
@@ -691,14 +767,16 @@ export const ChatInput = memo(function ChatInput({
 		}
 		const ta = taRef.current;
 		const cursor = ta ? (ta.selectionStart ?? text.length) : text.length;
+		const replaceEnd = cur?.end !== undefined && cur.end >= at ? cur.end : cursor;
 		const atts = pick.attachments ?? [];
 		const rawText = pick.text ?? pick.title;
 		// 附件型命中（文件/目录/页签…）统一插 `@提及` 形式：正文里的 `@x` 与附件 chip
 		// 双向联动（点 ✕ 双向删、退格整块删）；纯文本命中保持原样。
 		const insert = atts.length > 0 && !rawText.startsWith("@") ? `@${rawText} ` : `${rawText} `;
-		const next = `${text.slice(0, at)}${insert}${text.slice(cursor)}`;
+		const next = `${text.slice(0, at)}${insert}${text.slice(replaceEnd)}`;
 		menuTextRef.current = next;
 		setText(next);
+		noteComposerEdit(next);
 		setMenu(null);
 		for (const a of atts) {
 			try {
@@ -754,7 +832,7 @@ export const ChatInput = memo(function ChatInput({
 				title={h.hint ?? h.title}
 			>
 				<span className="slash-name">@{h.title}</span>
-				<span className="slash-source plugin">{h.providerLabel}</span>
+				<span className={`slash-source ${h.providerId === "host:skills" ? "skill" : "plugin"}`}>{h.providerLabel}</span>
 				{h.hint && <span className="slash-desc">{h.hint}</span>}
 			</button>
 		));
@@ -780,10 +858,10 @@ export const ChatInput = memo(function ChatInput({
 			onNotice("warning", t("slashCopyEmpty"));
 			return;
 		}
-		try {
-			await navigator.clipboard.writeText(textToCopy);
+		const ok = await copyTextToClipboard(textToCopy);
+		if (ok) {
 			onNotice("info", t("slashCopied"));
-		} catch {
+		} else {
 			onNotice("error", t("slashCopyFailed"));
 		}
 	};
@@ -807,24 +885,13 @@ export const ChatInput = memo(function ChatInput({
 	};
 
 	const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-		const items = e.clipboardData?.items;
-		if (!items) return;
-		const images: File[] = [];
-		for (const item of items) {
-			if (item.kind === "file" && isRasterImage(item.type)) {
-				const f = item.getAsFile();
-				if (f) images.push(f);
-			}
-		}
-		if (images.length === 0) return; // plain text paste — leave the default
+		// 粘贴板里带真文件（文件管理器复制 / 截图 / 混合内容）→ 当附件附加；
+		// 与拖拽同走 handleFiles：图片走视觉管线（含 noVision 拦截），其余走
+		// fileData 上传。拿不到文件就是纯文本粘贴，不 preventDefault。
+		const files = collectClipboardFiles(e.clipboardData?.items, e.clipboardData?.files);
+		if (files.length === 0) return; // plain text paste — leave the default
 		e.preventDefault();
-		// P1-7：当前模型明确不支持图片时拒绝粘贴并提示。
-		const noVision = currentModelNoVision();
-		if (noVision) {
-			onNotice("warning", noVision);
-			return;
-		}
-		onAddImageFiles(images);
+		handleFiles(files);
 	};
 
 	/** 当前模型在模型清单中标记为 text-only（vision === false）→ 返回提示文案。
@@ -853,6 +920,8 @@ export const ChatInput = memo(function ChatInput({
 	useEffect(() => {
 		const onFill = (e: Event) => {
 			const detail = (e as CustomEvent<string>).detail;
+			setMenu(null);
+			menuTextRef.current = detail;
 			setText(detail);
 			taRef.current?.focus();
 		};
@@ -916,6 +985,7 @@ export const ChatInput = memo(function ChatInput({
 	 *  submit 与快捷短语发送共用 —— 点短语时文件引用同样带上，不丢失。 */
 	const buildPromptAttachments = () =>
 		attachments.map((a) => {
+			if (a.mode === "quote") return { path: "", mode: "quote" as const, quote: a.quote };
 			if (a.imageData) {
 				return {
 					path: "",
@@ -952,8 +1022,8 @@ export const ChatInput = memo(function ChatInput({
 
 	const submit = (queue = false) => {
 		const trimmed = text.trim();
-		const hasRawAttach = attachments.some((a) => a.imageData || a.fileData || a.mode === "conversation");
-		if (!trimmed && !hasRawAttach) return;
+		const hasAttach = attachments.length > 0;
+		if (!trimmed && !hasAttach) return;
 		if (!connected) {
 			// 输入框在断连时不禁用（只有发送按钮禁用），Enter 仍进 submit：
 			// 别静默吞掉，文本保留并给出可见提示供重连后重发。
@@ -1237,10 +1307,8 @@ export const ChatInput = memo(function ChatInput({
 	};
 
 	// 有东西可发才允许提交（空文本 + 无附件时 submit() 直接 return）：
-	// 空闲态的发送按钮和运行中的对半胶囊共用这一个条件。
-	const canSubmit =
-		connected &&
-		(text.trim() !== "" || attachments.some((a) => a.imageData || a.fileData || a.mode === "conversation"));
+	// 空闲态的发送按钮和运行中的对半胶囊共用这一个条件。与 submit() 口径保持一致。
+	const canSubmit = connected && (text.trim() !== "" || attachments.length > 0);
 
 	// 插件输入框动作按 align 分组（未接线回落用；接线后统一走下面的 composerGroups）。
 	const pluginActions = useMemo(
@@ -1359,7 +1427,7 @@ export const ChatInput = memo(function ChatInput({
 		),
 		"host:composer-templates": (
 			<button type="button" className="btn tpl-open" title={t("tpl.openPicker")} onClick={openPicker}>
-				<FiGrid />
+				<FiBookOpen />
 			</button>
 		),
 		"host:composer-model": (
@@ -1432,71 +1500,75 @@ export const ChatInput = memo(function ChatInput({
 		>
 			{attachments.length > 0 && (
 				<div className="attach-row">
-					{attachments.map((a) => (
-						<span
-							key={
-								a.key ??
-								(a.mode === "conversation"
-									? `conv|${a.conversationId ?? ""}|${a.sessionPath ?? ""}`
-									: `${a.path}|${a.mode}|${a.lines ? `${a.lines.start}-${a.lines.end}` : ""}`)
-							}
-							className={`attach-chip ${a.imageData ? "image" : a.fileData ? "file" : a.mode}`}
-							title={
-								a.imageData
-									? t("attachImage", { name: a.name })
-									: a.fileData
-										? t("attachFile", { name: a.name })
-										: a.isDir
-											? t("folderRef", { path: a.path })
-											: a.mode === "page"
-												? t("attachPage", { name: a.name })
-												: a.mode === "conversation"
-													? t("attachConversation", { name: a.name })
-													: a.mode === "reference"
-														? t("refOnly", { path: a.path })
-														: a.mode === "lines" && a.lines
-															? t("attachLines", {
-																	path: a.path,
-																	start: a.lines.start,
-																	end: a.lines.end,
-																})
-															: t("attachContent", { path: a.path })
-							}
-						>
-							{a.imageData
-								? "🖼"
-								: a.fileData
-									? "📄"
-									: a.isDir
-										? "📁"
-										: a.mode === "page"
-											? "🌐"
-											: a.mode === "conversation"
-												? "💬"
-												: a.mode === "reference"
-													? "🔗"
-													: "📎"}
-							{a.name}
-							{a.mode === "lines" && a.lines && (
-								<span className="attach-range">
-									L{a.lines.start}-{a.lines.end}
-								</span>
-							)}
-							<button
-								type="button"
-								className="attach-remove"
-								title={t("removeAttachment")}
-								onClick={() =>
-									onRemoveAttachment(
-										a.key ??
-											(a.mode === "conversation" ? `conv|${a.conversationId ?? ""}|${a.sessionPath ?? ""}` : a.path),
-									)
+					{attachments.map((a) =>
+						a.mode === "quote" && a.quote ? (
+							<TextQuoteCard key={a.key} quote={a.quote} onRemove={() => onRemoveAttachment(a.key ?? "")} />
+						) : (
+							<span
+								key={
+									a.key ??
+									(a.mode === "conversation"
+										? `conv|${a.conversationId ?? ""}|${a.sessionPath ?? ""}`
+										: `${a.path}|${a.mode}|${a.lines ? `${a.lines.start}-${a.lines.end}` : ""}`)
+								}
+								className={`attach-chip ${a.imageData ? "image" : a.fileData ? "file" : a.mode}`}
+								title={
+									a.imageData
+										? t("attachImage", { name: a.name })
+										: a.fileData
+											? t("attachFile", { name: a.name })
+											: a.isDir
+												? t("folderRef", { path: a.path })
+												: a.mode === "page"
+													? t("attachPage", { name: a.name })
+													: a.mode === "conversation"
+														? t("attachConversation", { name: a.name })
+														: a.mode === "reference"
+															? t("refOnly", { path: a.path })
+															: a.mode === "lines" && a.lines
+																? t("attachLines", {
+																		path: a.path,
+																		start: a.lines.start,
+																		end: a.lines.end,
+																	})
+																: t("attachContent", { path: a.path })
 								}
 							>
-								×
-							</button>
-						</span>
-					))}
+								{a.imageData
+									? "🖼"
+									: a.fileData
+										? "📄"
+										: a.isDir
+											? "📁"
+											: a.mode === "page"
+												? "🌐"
+												: a.mode === "conversation"
+													? "💬"
+													: a.mode === "reference"
+														? "🔗"
+														: "📎"}
+								{a.name}
+								{a.mode === "lines" && a.lines && (
+									<span className="attach-range">
+										L{a.lines.start}-{a.lines.end}
+									</span>
+								)}
+								<button
+									type="button"
+									className="attach-remove"
+									title={t("removeAttachment")}
+									onClick={() =>
+										onRemoveAttachment(
+											a.key ??
+												(a.mode === "conversation" ? `conv|${a.conversationId ?? ""}|${a.sessionPath ?? ""}` : a.path),
+										)
+									}
+								>
+									×
+								</button>
+							</span>
+						),
+					)}
 					<span className="attach-hint">{t("attachHint")}</span>
 				</div>
 			)}
@@ -1646,12 +1718,22 @@ export const ChatInput = memo(function ChatInput({
 								? isDsh
 									? t("placeholderStreamingQueued")
 									: t("placeholderStreaming")
-								: t("placeholderIdle")
+								: planMode
+									? t("placeholderPlanMode")
+									: t("placeholderIdle")
 							: t("placeholderConnecting")
 					}
 					disabled={!connected}
 					onChange={(e) => {
 						handleTextChange(e.target.value, e.target.selectionStart ?? e.target.value.length);
+					}}
+					onSelect={(e) => {
+						if (menu?.kind === "at") {
+							const cur = (e.target as HTMLTextAreaElement).selectionStart;
+							if (cur < menu.start || cur > menu.end) {
+								setMenu(null);
+							}
+						}
 					}}
 					onCompositionEnd={() => {
 						compositionEndTimeRef.current = Date.now();
@@ -1660,6 +1742,31 @@ export const ChatInput = memo(function ChatInput({
 					onKeyDown={onKeyDown}
 					onPaste={onPaste}
 				/>
+				{planMode && (
+					<button
+						type="button"
+						style={{
+							display: "inline-flex",
+							alignItems: "center",
+							gap: 4,
+							fontSize: 11,
+							color: "var(--accent, #38bdf8)",
+							background: "var(--accent-soft, rgba(56, 189, 248, 0.1))",
+							padding: "2px 8px",
+							borderRadius: 12,
+							position: "absolute",
+							right: 12,
+							top: 8,
+							cursor: "pointer",
+							border: "1px solid var(--border, rgba(255, 255, 255, 0.1))",
+							zIndex: 2,
+						}}
+						onClick={() => appSend({ type: "set_plan_mode", enabled: false })}
+						title={t("planModeTip")}
+					>
+						📋 {t("planModeBadge")} <span style={{ marginLeft: 2, opacity: 0.7 }}>✕</span>
+					</button>
+				)}
 				{/* 底部工具条（ChatGPT 风格）：附件 / 模型 / 思考强度 在左，
 				    发送 / 停止 在右，全部收进输入框容器内。 */}
 				<div className="composer-tools">
@@ -1690,7 +1797,7 @@ export const ChatInput = memo(function ChatInput({
 								{/* 插件输入框动作（start 组）：紧跟文件上传右侧，与上传同一组线条图标风格。 */}
 								{pluginActions.start.map(renderPluginAction)}
 								<button type="button" className="btn tpl-open" title={t("tpl.openPicker")} onClick={openPicker}>
-									<FiGrid />
+									<FiBookOpen />
 								</button>
 								<ModelThinking
 									state={modelState}
