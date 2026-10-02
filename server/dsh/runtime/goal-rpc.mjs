@@ -870,10 +870,19 @@ class DshGoalJsonRpcServer extends HarnessSdkJsonRpcServer {
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				const queued = this.questionBridge.queue.findIndex((q) => q.qid === qid);
-				if (queued >= 0) this.questionBridge.queue.splice(queued, 1);
+				if (queued >= 0) {
+					this.questionBridge.queue.splice(queued, 1);
+					// #459：排队条目超时也必须 settle——此前只 splice 不 reject，
+					// 该 ask 的 Promise 永不落定，agent-loop 卡死在工具调用上。
+					reject(new Error("提问超时（等待回答过久）"));
+					return;
+				}
 				if (this.questionBridge.pending?.qid === qid) {
 					this.questionBridge.pending = null;
 					reject(new Error("提问超时（等待回答过久）"));
+					// #459：pending 腾出后必须派发下一个排队提问——否则队列无人派发，
+					// 后续条目只能等各自超时且永不 settle，整条提问桥永久停摆。
+					this.dispatchNextQuestion();
 				}
 			}, QUESTION_TIMEOUT_MS);
 			timer.unref?.();
@@ -939,6 +948,10 @@ class DshGoalJsonRpcServer extends HarnessSdkJsonRpcServer {
 		}
 		const bytes = new Uint8Array(Buffer.from(params.data, "base64"));
 		if (bytes.length === 0) throw new TypeError("attachment/save: empty image data");
+		const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // 20MB 上限
+		if (bytes.length > MAX_ATTACHMENT_BYTES) {
+			throw new RangeError(`attachment/save: image data exceeds 20MB limit (${bytes.length} bytes)`);
+		}
 		const ref = await this.ctx.attachments.saveImage({
 			data: bytes,
 			mediaType,

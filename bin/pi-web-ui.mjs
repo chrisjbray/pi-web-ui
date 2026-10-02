@@ -27,6 +27,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createConnection } from "node:net";
 import { get as httpGet } from "node:http";
+import { createInterface } from "node:readline/promises";
 import {
 	ensureBackup as ensurePluginBackup,
 	restoreBackup as restorePluginBackup,
@@ -108,8 +109,9 @@ server 选项:
   --engine <pi|dsh> 智能体引擎（默认 $PI_WEB_ENGINE 或 pi）
   --host <addr>     监听地址（默认 $PI_WEB_HOST 或 127.0.0.1；0.0.0.0 供局域网/容器）
   --agent-dir <dir> pi 配置目录（默认 $PI_CODING_AGENT_DIR 或 ~/.pi/agent）
-  --name <name>     服务名（默认 pi-web-ui；macOS 的 launchd label
-                    为 com.xingshuyin.pi-web-ui，自定义名时为 com.<name>.server）
+  --name <name>     服务名（默认 pi-web-ui；仅限字母/数字/-/_，字母或数字开头，
+                    最长 64 字符。macOS 的 launchd label 为 com.xingshuyin.pi-web-ui，
+                    自定义名时为 com.<name>.server）
   --print           只打印将生成的配置文件，不实际安装
 
 平台: macOS → launchd 用户代理 · Linux → systemd · Windows → 登录自启 Run 键
@@ -128,7 +130,8 @@ server 选项:
   install 选项: --name <id> 自定义插件目录名（默认取仓库名）
                 --data-dir <dir> 数据目录（默认 ~/.pi-web）
                 --force 目标已存在时覆盖
-                --build 强制源码构建（隔离目录编译，见下）
+                --build 强制源码构建（隔离目录编译，见下；不加 --build 时若插件只有
+                        源码，交互终端会询问是否构建并需输入 y 确认，非交互环境跳过）
                 --no-build 即使只有源码也不构建（产物缺失的插件装上后不加载）
                 --catalog <url> 目录同步模式：读目录文档 → 写可安装列表 → 逐条安装
                 --replace 配合 --catalog：整体替换列表（默认按 id 合并）
@@ -161,7 +164,8 @@ Server options:
   --engine <pi|dsh> Agent engine (default $PI_WEB_ENGINE or pi)
   --host <addr>     Listen address (default $PI_WEB_HOST or 127.0.0.1; 0.0.0.0 for LAN/containers)
   --agent-dir <dir> pi config directory (default $PI_CODING_AGENT_DIR or ~/.pi/agent)
-  --name <name>     Service name (default pi-web-ui; macOS launchd label is
+  --name <name>     Service name (default pi-web-ui; alphanumeric, "-" and "_" only,
+                    starting with a letter or digit, max 64 chars. macOS launchd label is
                     com.xingshuyin.pi-web-ui, or com.<name>.server for custom names)
   --print           Only print generated config files (no actual install)
 
@@ -181,7 +185,9 @@ UI plugins (installed into <data-dir>/plugins/; refresh browser to activate whil
   install options: --name <id>   Custom plugin directory name (default: repo name)
                    --data-dir <dir>  Data directory (default: ~/.pi-web)
                    --force       Overwrite if target already exists
-                   --build       Force a source build (isolated build, see below)
+                   --build       Force a source build (isolated build, see below). Without it,
+                                 a source-only plugin asks for confirmation on a TTY (answer y to
+                                 build) and skips the build in non-interactive environments
                    --no-build    Never build, even for source-only plugins
                    --catalog <url> Catalog mode: read a catalog document, write the
                                  installable list, then install every entry
@@ -540,6 +546,15 @@ function winWscript() {
 }
 
 /**
+ * The node binary the launcher scripts must bake in: the executable this
+ * process itself runs on. Under Bun this resolves to bun, so a Bun-hosted
+ * install never bakes in pi.exe.
+ */
+function resolveNode() {
+	return process.execPath;
+}
+
+/**
  * Resolve the real node binary. fnm/volta/nvm shims (e.g. fnm_multishells)
  * point into temp dirs that vanish when the installing shell exits — the
  * baked-in launcher scripts must use the stable real path instead.
@@ -651,7 +666,7 @@ function buildWinShortcutPs1(env, cwd, taskName, url, logPath, pidPath) {
 		"    try { if ((Invoke-WebRequest -Uri $h -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { Start-Process $u | Out-Null; break } } catch {}",
 		"  }",
 		"} -ArgumentList $url",
-		`& ${psQuote(node)} ${HAS_SDK_HOOK ? `--import ${psQuote(SDK_HOOK)} ` : ""}${psQuote(SERVER_ENTRY)} *>> $log`,
+		`& ${psQuote(node)} ${HAS_SDK_HOOK ? `--import ${psQuote(pathToFileURL(SDK_HOOK).href)} ` : ""}${psQuote(SERVER_ENTRY)} *>> $log`,
 		"Remove-Item $pidFile -ErrorAction SilentlyContinue",
 		"",
 	].join("\r\n");
@@ -975,7 +990,7 @@ function buildWinStartPs1(env, cwd, logPath, pidPath) {
 		`$PID | Out-File -Encoding ascii ${psQuote(pidPath)}`,
 		"try {",
 		"  while ($true) {",
-		`    & ${psQuote(realNode())} ${HAS_SDK_HOOK ? `--import ${psQuote(SDK_HOOK)} ` : ""}${psQuote(SERVER_ENTRY)} *>> ${psQuote(logPath)}`,
+		`    & ${psQuote(realNode())} ${HAS_SDK_HOOK ? `--import ${psQuote(pathToFileURL(SDK_HOOK).href)} ` : ""}${psQuote(SERVER_ENTRY)} *>> ${psQuote(logPath)}`,
 		"    Start-Sleep 10",
 		"  }",
 		"} finally {",
@@ -999,19 +1014,53 @@ function launchWinService(vbsPath) {
 	child.unref();
 }
 
+/**
+ * PID 文件记录的是看门狗 PowerShell 的 $PID（winPowershell() 可能选 pwsh.exe），
+ * node 是它的子进程 —— 这三者是本服务实例的合理映像名。taskkill /T /F 是树级强杀，
+ * PID 若已退出被系统复用就会误杀无辜进程，所以杀前必须核对映像名。
+ */
+const WIN_SERVICE_IMAGE_RE = /^(powershell|pwsh|node)\.exe$/i;
+
+/** tasklist 查询 PID 对应的进程映像名；查询失败/无此进程返回 null（无法核实）。 */
+function winPidImageName(pid) {
+	const res = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8" });
+	if (res.status !== 0) return null;
+	const line = (res.stdout ?? "").split(/\r?\n/).find((l) => l.trim());
+	if (!line) return null; // tasklist 的 "INFO: 无任务" 输出没有 CSV 行
+	return (line.match(/^"([^"]+)"/) ?? [])[1] ?? null;
+}
+
 /** Kill a running Windows instance via its PID file (whole tree). */
 function stopWinInstance(name) {
 	const pid = winReadPid(name);
 	if (pid) {
 		if (pidAlive(pid)) {
-			run("taskkill", ["/PID", String(pid), "/T", "/F"], {
-				ignoreError: true,
-				silent: true,
-			});
-			// taskkill /F 异步生效：等到进程树真正退出（restart 需要避免端口竞争）
-			const deadline = Date.now() + 5000;
-			while (Date.now() < deadline && pidAlive(pid)) {
-				spawnSync("ping", ["-n", "2", "127.0.0.1"], { stdio: "ignore" });
+			// PID 可能已退出并被系统复用给别的进程：杀前核对映像名，不符则警告并跳过，
+			// 绝不 taskkill /T /F 盲杀。macOS/Linux 无按 PID 杀的路径（launchctl/systemctl
+			// 按服务单元管理），只有 Windows 需要这道核对。
+			const image = winPidImageName(pid);
+			if (image === null) {
+				console.warn(
+					ZH
+						? `⚠ 无法核实 PID ${pid} 的进程映像名（tasklist 不可用或进程已消失），跳过强制结束以防误杀`
+						: `⚠ Cannot verify the image name of PID ${pid} (tasklist unavailable or process gone), skipping force-kill to avoid killing an unrelated process`,
+				);
+			} else if (!WIN_SERVICE_IMAGE_RE.test(image)) {
+				console.warn(
+					ZH
+						? `⚠ PID ${pid} 现在是 ${image}，不是本服务的进程（PID 可能已被复用），跳过强制结束`
+						: `⚠ PID ${pid} is now ${image}, not a pi-web-ui process (PID may have been reused), skipping force-kill`,
+				);
+			} else {
+				run("taskkill", ["/PID", String(pid), "/T", "/F"], {
+					ignoreError: true,
+					silent: true,
+				});
+				// taskkill /F 异步生效：等到进程树真正退出（restart 需要避免端口竞争）
+				const deadline = Date.now() + 5000;
+				while (Date.now() < deadline && pidAlive(pid)) {
+					spawnSync("ping", ["-n", "2", "127.0.0.1"], { stdio: "ignore" });
+				}
 			}
 		}
 		rmSync(winPidFilePath(name), { force: true });
@@ -1123,9 +1172,27 @@ function effectivePort(opts) {
 	return String(opts.port ?? process.env.PI_WEB_PORT ?? "8787");
 }
 
+/**
+ * 服务名（--name）统一校验。name 会被原样拼进 systemd unit 文件名
+ * (/etc/systemd/system/<name>.service)、Windows 启动脚本/PID 文件路径
+ * (%APPDATA%\pi-web-ui\<name>.ps1) 与 HKCU Run 键值名 —— 不限字符集时，
+ * 路径分隔符/引号/空格都能进这些拼接点（路径穿越或 unit 内容注入）。
+ * 收紧为：字母或数字开头，仅字母/数字/-/_，最长 64 字符。
+ */
+function serviceName(opts) {
+	const name = opts.name ?? "pi-web-ui";
+	if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name))
+		fail(
+			ZH
+				? `无效服务名 "${name}"（仅限字母/数字/-/_，字母或数字开头，最长 64 字符）`
+				: `Invalid service name "${name}" (alphanumeric, "-" and "_" only; must start with a letter or digit; max 64 chars)`,
+		);
+	return name;
+}
+
 /** Shared option normalization for install. */
 function serviceOptions(opts) {
-	const name = opts.name ?? "pi-web-ui";
+	const name = serviceName(opts);
 	const port = effectivePort(opts);
 	if (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
 		fail(ZH ? `无效端口: ${port}` : `Invalid port: ${port}`);
@@ -1280,7 +1347,7 @@ function installSystemd(opts) {
 }
 
 function uninstallLaunchd(opts) {
-	const name = opts.name ?? "pi-web-ui";
+	const name = serviceName(opts);
 	const label = serviceLabel(name);
 	const plist = launchAgentPlist(name);
 	run("launchctl", ["bootout", `gui/${uid()}/${label}`], {
@@ -1298,7 +1365,7 @@ function uninstallLaunchd(opts) {
 }
 
 function uninstallSystemd(opts) {
-	const name = opts.name ?? "pi-web-ui";
+	const name = serviceName(opts);
 	ensureRootForSystemctl();
 	run("systemctl", ["disable", "--now", `${name}.service`], {
 		ignoreError: true,
@@ -1381,7 +1448,7 @@ function installWindows(opts) {
 }
 
 function uninstallWindows(opts) {
-	const name = opts.name ?? "pi-web-ui";
+	const name = serviceName(opts);
 	winRunKeyDelete(name);
 	// 历史计划任务（旧版本 install 可能注册过）
 	if (winTaskExists(name)) {
@@ -1516,7 +1583,7 @@ async function setQuiesce(opts, on) {
 }
 
 function controlService(action, opts) {
-	const name = opts.name ?? "pi-web-ui";
+	const name = serviceName(opts);
 
 	if (isMac) {
 		const label = serviceLabel(name);
@@ -1876,19 +1943,40 @@ function parsePluginSource(rawSpec) {
 	return { owner, repo, ref, subpath, cloneUrl: `https://github.com/${owner}/${repo}.git` };
 }
 
+/** 清理临时目录下残留超过 1 小时的 pi-web-ui-plugin-* 安装目录。 */
+function cleanStalePluginTmpDirs() {
+	try {
+		const base = tmpdir();
+		const entries = readdirSync(base);
+		const now = Date.now();
+		for (const name of entries) {
+			if (name.startsWith("pi-web-ui-plugin-")) {
+				try {
+					const p = join(base, name);
+					const st = statSync(p);
+					if (now - st.mtimeMs > 3600_000) {
+						rmSync(p, { recursive: true, force: true });
+					}
+				} catch {}
+			}
+		}
+	} catch {}
+}
+
 /** 把仓库拉到 tmpDir 并返回检出根目录。优先 git clone --depth 1，失败回退 codeload tarball + 系统 tar。 */
 async function acquireRepo(src, tmpDir) {
 	const dst = join(tmpDir, "src");
 	const hasGit = spawnSync("git", ["--version"], { stdio: "ignore", timeout: 10_000 }).status === 0;
 	if (hasGit) {
-		const args = ["clone", "--depth", "1", "--single-branch"];
+		const gitTimeout = Number(process.env.PI_WEB_GIT_TIMEOUT_MS) || 45_000;
+		const args = ["-c", "connect.timeout=15", "clone", "--depth", "1", "--single-branch"];
 		if (src.ref) args.push("--branch", src.ref);
 		args.push(src.cloneUrl, dst);
 		console.log(`· git clone --depth 1 ${src.cloneUrl}${src.ref ? ` (${src.ref})` : ""}`);
 		const res = spawnSync("git", args, {
 			stdio: "inherit",
 			env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
-			timeout: 300_000,
+			timeout: gitTimeout,
 		});
 		if (res.status === 0 && existsSync(dst)) return dst;
 		console.log(
@@ -1902,26 +1990,28 @@ async function acquireRepo(src, tmpDir) {
 	// 注意：这里不用 fail()/process.exit —— async 上下文里还有未关闭的 socket 时
 	// 直接退出会触发 Windows libuv "UV_HANDLE_CLOSING" 断言崩溃；改为 throw，
 	// 由 pluginInstallCmd 捕获后设 exitCode 让事件循环自然排空。
-	let res;
+	let buf;
 	try {
-		res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(120_000) });
+		const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(120_000) });
+		if (!res.ok) {
+			throw new Error(
+				(ZH ? `HTTP 状态码 ${res.status}` : `HTTP status ${res.status}`) +
+					(res.status === 404
+						? ZH
+							? "\n  仓库/分支不存在，或为私有仓库（私有仓库请先在本机配置好 git 凭据再重试，会优先走 git clone）。"
+							: "\n  Repository/branch does not exist, or is private (for private repos, configure git credentials locally first and retry; git clone will be tried first)."
+						: ""),
+			);
+		}
+		buf = Buffer.from(await res.arrayBuffer());
 	} catch (err) {
 		throw new Error(
 			ZH
-				? `下载失败：${err?.message ?? err}\n  请检查网络/代理后重试。`
-				: `Download failed: ${err?.message ?? err}\n  Check your network/proxy and retry.`,
+				? `下载失败 (${url})：${err?.message ?? err}\n  请检查网络/代理后重试（可配置 HTTP_PROXY / HTTPS_PROXY 环境变量，或为 git/npm 配置代理）。`
+				: `Download failed (${url}): ${err?.message ?? err}\n  Check your network/proxy and retry (consider configuring HTTP_PROXY/HTTPS_PROXY or git/npm proxy).`,
 		);
 	}
-	if (!res.ok)
-		throw new Error(
-			(ZH ? `下载失败 HTTP ${res.status}：${url}` : `Download failed HTTP ${res.status}: ${url}`) +
-				(res.status === 404
-					? ZH
-						? "\n  仓库/分支不存在，或为私有仓库（私有仓库请先在本机配置好 git 凭据再重试，会优先走 git clone）。"
-						: "\n  Repository/branch does not exist, or is private (for private repos, configure git credentials locally first and retry; git clone will be tried first)."
-					: ""),
-		);
-	writeFileSync(join(tmpDir, "src.tar.gz"), Buffer.from(await res.arrayBuffer()));
+	writeFileSync(join(tmpDir, "src.tar.gz"), buf);
 	const extractTo = join(tmpDir, "tar");
 	mkdirSync(extractTo, { recursive: true });
 	// 相对路径解压：win32 的 GNU tar 会把 "C:\..." 里的 C: 当远程主机（Cannot connect to C:）
@@ -2085,11 +2175,13 @@ function buildPluginSource(pluginRoot, tmpDir, manifest) {
  * 构建决策（issue #165：--build 自动推断）。
  *
  * 只有源码、没有产物（index.mjs 与 client/entry.mjs 都缺）且存在可解析的构建声明 =
- * “不构建这次安装必死”，此时默认直接构建（ previously 只打印一行提示，等用户滚回去重加
- * --build）。产物已提交的仓库不受影响（mode=none，什么都不跑）。
+ * “不构建这次安装必死”，此前会直接自动构建；但构建命令来自远端 manifest/package.json，
+ * 经 shell:true 执行属于任意命令执行面，非交互环境下静默跑等于替用户放行。
+ * 收紧后（审计修复）：mode=auto 只表示“有构建声明且必要”，是否真正执行由
+ * installOnePlugin 二次把关 —— 交互 TTY 且用户输入 y 才跑，否则跳过并警告。
  * --no-build 保留旧的“装个空目录”行为（脚本化镜像/检查用），并明确打印跳过原因。
  */
-function decideBuildAction({ pluginRoot, manifest, build, noBuild }) {
+function decideBuildAction({ pluginRoot, manifest, build, noBuild, isCatalog = false }) {
 	if (build && noBuild)
 		throw new Error(
 			ZH ? "--build 与 --no-build 不能同时用（二选一）" : "--build and --no-build cannot be used together (pick one)",
@@ -2098,12 +2190,14 @@ function decideBuildAction({ pluginRoot, manifest, build, noBuild }) {
 	const artifactsMissing =
 		!existsSync(join(pluginRoot, "index.mjs")) && !existsSync(join(pluginRoot, "client", "entry.mjs"));
 	if (build) {
-		if (!plan)
+		if (!plan) {
+			if (isCatalog) return { mode: "none", plan };
 			throw new Error(
 				ZH
 					? "插件没有声明构建方式：请在 manifest.json 里加 build.command（或 package.json 的 scripts.build），或去掉 --build"
 					: "Plugin has no build declaration: add build.command to manifest.json (or scripts.build in package.json), or remove --build",
 			);
+		}
 		return { mode: "explicit", plan };
 	}
 	if (plan && artifactsMissing) {
@@ -2114,11 +2208,31 @@ function decideBuildAction({ pluginRoot, manifest, build, noBuild }) {
 }
 
 /**
+ * 交互确认：插件声明的构建命令将经 shell 在本机执行（install + command 都来自
+ * 远端 manifest/package.json），必须用户显式输入 y 才跑。仅 TTY 下会被调用。
+ */
+async function confirmSourceBuild(plan) {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		const answer = await rl.question(
+			ZH
+				? `⚠ 插件声明了以下构建命令，将在本机以 shell 执行：\n    1) ${plan.install}\n    2) ${plan.command}\n  确认执行？输入 y 继续，其他任意键跳过构建: `
+				: `⚠ The plugin declares the following build commands, which will run through a shell on this machine:\n    1) ${plan.install}\n    2) ${plan.command}\n  Proceed? Enter y to run, anything else to skip the build: `,
+		);
+		const normalized = answer.trim().toLowerCase();
+		return normalized === "y" || normalized === "yes";
+	} finally {
+		rl.close();
+	}
+}
+
+/**
  * 装一个插件（单源模式与目录模式共用）：拉取/定位 → 读 manifest → 构建决策 →
  * 覆盖（备份+保留 config.json）→ 落盘 → 记录来源/sha。
  * 失败抛 Error（目录模式逐条 try/catch 继续下一条，单源模式由调用方转 fail）。
  */
-async function installOnePlugin({ rawSpec, name, force, build, noBuild, dataDir }) {
+async function installOnePlugin({ rawSpec, name, force, build, noBuild, dataDir, isCatalog = false }) {
+	cleanStalePluginTmpDirs();
 	const pluginsDir = join(dataDir, "plugins");
 	const localCandidate = resolve(rawSpec.replace(/^file:\/\//, ""));
 	const isLocal = existsSync(localCandidate);
@@ -2145,9 +2259,36 @@ async function installOnePlugin({ rawSpec, name, force, build, noBuild, dataDir 
 		}
 		// 构建决策（issue #150 的 --build + issue #165 的自动推断）：构建在临时目录里完成，
 		// 成功后才进入覆盖流程——构建失败 = 目标目录完全没被动过（上一版插件照常可用）。
-		const decision = decideBuildAction({ pluginRoot, manifest, build: build === true, noBuild: noBuild === true });
+		const decision = decideBuildAction({
+			pluginRoot,
+			manifest,
+			build: build === true,
+			noBuild: noBuild === true,
+			isCatalog,
+		});
+		// 授权把关（审计修复）：--build 显式传参行为不变；mode=auto 的构建命令来自
+		// 远端 manifest/package.json 且经 shell:true 执行 —— 非交互环境绝不自动跑
+		// （跳过并警告），交互 TTY 也要用户显式输入 y 才执行。
+		let authorized = decision.mode === "explicit";
+		if (decision.mode === "auto") {
+			if (!process.stdin.isTTY) {
+				console.warn(
+					ZH
+						? "⚠ 插件声明了构建命令但未授权执行，已跳过构建 —— 传 --build 或手动构建后再安装"
+						: "⚠ Plugin declares build commands but they were not authorized; skipping the build — pass --build or build manually before installing",
+				);
+			} else {
+				authorized = await confirmSourceBuild(decision.plan);
+				if (!authorized)
+					console.warn(
+						ZH
+							? "⚠ 未确认执行构建命令，已跳过构建 —— 需要时传 --build 或手动构建后再安装"
+							: "⚠ Build commands not confirmed; skipping the build — pass --build or build manually if needed",
+					);
+			}
+		}
 		let installRoot = pluginRoot;
-		if (decision.mode === "explicit" || decision.mode === "auto") {
+		if (authorized) {
 			console.log(
 				ZH
 					? `· 源码构建（${decision.mode === "auto" ? "自动推断：有构建声明但无产物" : "--build"}）：先 ${decision.plan.install}，再 ${decision.plan.command}`
@@ -2163,6 +2304,12 @@ async function installOnePlugin({ rawSpec, name, force, build, noBuild, dataDir 
 				ZH
 					? "· 跳过构建（--no-build）：目录里没有产物，装上后该插件不会被加载"
 					: "· Skipping build (--no-build): no artifacts in directory, plugin will not load after install",
+			);
+		} else if (decision.mode === "auto") {
+			console.log(
+				ZH
+					? "· 已跳过构建：目录里没有产物，装上后该插件不会被加载（授权后重装可补产物）"
+					: "· Build skipped: no artifacts in directory, plugin will not load after install (re-install with authorization to build)",
 			);
 		}
 		// 默认 id：子目录名 > 仓库名 > 本地目录名
@@ -2237,7 +2384,11 @@ async function installOnePlugin({ rawSpec, name, force, build, noBuild, dataDir 
 		}
 		return { id, target, manifest, buildMode: decision.mode };
 	} finally {
-		rmSync(tmp, { recursive: true, force: true });
+		try {
+			rmSync(tmp, { recursive: true, force: true });
+		} catch {
+			/* Windows 等平台杀毒/进程占用可能抛 EBUSY，不应翻转已成功的安装 */
+		}
 	}
 }
 
@@ -2443,6 +2594,7 @@ async function installCatalogCmd(opts) {
 				build: opts.build === true,
 				noBuild: opts.noBuild === true,
 				dataDir,
+				isCatalog: true,
 			});
 			console.log(ZH ? `✔ ${e.id} 安装成功` : `✔ ${e.id} installed`);
 			okCount++;

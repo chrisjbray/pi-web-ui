@@ -5,6 +5,7 @@ import {
 	FiCode,
 	FiCornerDownLeft,
 	FiEdit3,
+	FiExternalLink,
 	FiEye,
 	FiLink,
 	FiMaximize,
@@ -23,6 +24,7 @@ import { getClientId } from "../use-chat";
 import { withToken } from "../auth-token";
 import { appUrl } from "../base-url";
 import { appSend } from "../app-globals";
+import { formatSize } from "../format-bytes";
 
 /** Cap rendered lines so a pathological file can't freeze the modal. */
 const MAX_PREVIEW_LINES = 5000;
@@ -88,6 +90,22 @@ export function FilePreview({
 	const anchorRef = useRef(0);
 	const draggingRef = useRef(false);
 	const addedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// 保存回执（审查 #1）：write_file 发出后进入 saving 态，服务端保存成功会
+	// 立即对该路径重读并推回 file_content（见 server/files-service.ts writeFile），
+	// content prop 更新即确认；5s 未确认按「结果未知」处理。
+	const [saving, setSaving] = useState(false);
+	const [saveUnknown, setSaveUnknown] = useState(false);
+	// effect 里只看 ref（saving 不进 deps，避免旧 content 触发假确认）。
+	const savingRef = useRef(false);
+	const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// 卸载时清掉未触发的定时器（审查 #5）：added 提示与保存超时都不该再回调 setState。
+	useEffect(
+		() => () => {
+			if (addedTimer.current) clearTimeout(addedTimer.current);
+			if (saveTimer.current) clearTimeout(saveTimer.current);
+		},
+		[],
+	);
 
 	// Request content on open / file change (mount included).
 	useEffect(() => {
@@ -100,6 +118,11 @@ export function FilePreview({
 		setHtmlPreview(true);
 		setAllowJs(false);
 		editViewRef.current = false;
+		// 换文件：放弃上一个文件未确认的保存等待（回包会被 path 校验丢弃）。
+		savingRef.current = false;
+		setSaving(false);
+		setSaveUnknown(false);
+		if (saveTimer.current) clearTimeout(saveTimer.current);
 		appSend({ type: "read_file", path: file.path });
 	}, [file.path]);
 
@@ -110,6 +133,21 @@ export function FilePreview({
 			setLoaded(content);
 			if (!editing) setDraft(content.text);
 			setLoading(false);
+			// 保存确认（审查 #1）：该路径的重读回包到达 → 按已确认内容退出编辑态。
+			// saving 走 ref：它不在 deps 里，同一次 content 变化不会因 saving 翻转重跑。
+			if (savingRef.current) {
+				savingRef.current = false;
+				if (saveTimer.current) clearTimeout(saveTimer.current);
+				setSaving(false);
+				setSaveUnknown(false);
+				setEditing(false);
+				setDraft(content.text);
+				if (editViewRef.current) {
+					if (isMarkdownFile(file.name)) setMarkdownPreview(true);
+					if (isHtmlFile(file.name)) setHtmlPreview(true);
+				}
+				setSel(null);
+			}
 		}
 	}, [content, editing, file.path]);
 
@@ -191,6 +229,12 @@ export function FilePreview({
 		loaded !== null && loaded.kind === "text" && !loaded.binary && !loaded.truncated && !isOfficeFile(file.name);
 
 	const cancelEditing = () => {
+		// 取消编辑同时放弃未确认的保存等待（若服务端实际写成功，回包到达时
+		// savingRef 已退出，只会静默刷新正文）。
+		savingRef.current = false;
+		if (saveTimer.current) clearTimeout(saveTimer.current);
+		setSaving(false);
+		setSaveUnknown(false);
 		setDraft(loaded?.text ?? "");
 		setEditing(false);
 		if (editViewRef.current) {
@@ -219,12 +263,18 @@ export function FilePreview({
 	const saveEditing = () => {
 		if (!editing || !loaded || !canEdit) return;
 		if (!appSend({ type: "write_file", path: file.path, text: draft })) return;
-		setEditing(false);
-		if (editViewRef.current) {
-			if (isMarkdownFile(file.name)) setMarkdownPreview(true);
-			if (isHtmlFile(file.name)) setHtmlPreview(true);
-		}
-		setSel(null);
+		// 审查 #1：发出即进入 saving（不再「发出即关编辑态」）。编辑器保持打开，
+		// 等该路径重读回包确认（见 content effect）；5s 未确认提示结果未知。
+		savingRef.current = true;
+		setSaveUnknown(false);
+		setSaving(true);
+		if (saveTimer.current) clearTimeout(saveTimer.current);
+		saveTimer.current = setTimeout(() => {
+			// 超时未确认：退出 saving，留在编辑态让用户重试或取消（输入不丢）。
+			savingRef.current = false;
+			setSaving(false);
+			setSaveUnknown(true);
+		}, 5000);
 	};
 
 	const handleClose = () => {
@@ -344,13 +394,9 @@ export function FilePreview({
 				{fullscreen ? <FiMinimize /> : <FiMaximize />}
 			</button>
 		),
-		"host:fp-close": (
-			<button type="button" className="fp-close" title={t("close")} onClick={handleClose}>
-				<FiX />
-			</button>
-		),
+		"host:fp-close": null,
 	};
-	/** 头栏顺序：接线时（App 传全量）宿主+插件按槽位顺序交错；未接线回落旧硬编码顺序。 */
+	/** 头栏顺序：接线时（App 传全量）宿主+插件按槽位顺序交错；未接线回落旧硬编码顺序。关闭按钮统一固定在头栏最右侧，不占工具条流动位。 */
 	const fpEntries: UiSlotEntry[] =
 		uiFilePreviewToolbar === undefined
 			? [
@@ -361,9 +407,8 @@ export function FilePreview({
 					"host:fp-zoom",
 					"host:fp-ref",
 					"host:fp-full",
-					"host:fp-close",
 				].map((id) => ({ id, source: "host" }) as UiSlotEntry)
-			: uiFilePreviewToolbar.filter((e) => !e.hidden);
+			: uiFilePreviewToolbar.filter((e) => !e.hidden && e.id !== "host:fp-close");
 	// /api/file resolves against the requesting client's workspace (the opened
 	// project), not the server's startup cwd — pass clientId so they can differ.
 	const mediaUrl = (p: string) =>
@@ -392,7 +437,15 @@ export function FilePreview({
 			}}
 		>
 			<div className={`fp ${fullscreen ? "fullscreen" : ""}`} style={{ "--fp-zoom": zoom / 100 } as CSSProperties}>
-				<div className="fp-head">
+				<div
+					className="fp-head"
+					onDoubleClick={(e) => {
+						const target = e.target as HTMLElement | null;
+						if (target && !target.closest("button, a, input")) {
+							setFullscreen((f) => !f);
+						}
+					}}
+				>
 					<span className="fp-name" title={file.path}>
 						{file.name}
 					</span>
@@ -405,6 +458,9 @@ export function FilePreview({
 						{/* 宿主 chrome + 插件条目按槽位顺序交错（显隐/顺序走布局页，类型条件见 fpHostNodes）。 */}
 						{renderMergedToolbar(fpEntries, fpHostNodes, onUiAction)}
 					</span>
+					<button type="button" className="fp-close" title={t("close")} aria-label={t("close")} onClick={handleClose}>
+						<FiX />
+					</button>
 				</div>
 
 				{truncated && kind === "text" && !isBinary && (
@@ -418,8 +474,14 @@ export function FilePreview({
 				{!loading && kind === "none" && !isBinary && <div className="fp-empty">{t("previewNotSupported")}</div>}
 
 				{!loading && kind === "image" && (
-					<div className="fp-media-wrap">
-						<img className="fp-media" src={mediaUrl(file.path)} alt={file.name} />
+					<div className="fp-media-wrap clickable" onClick={handleClose} title={t("clickToCloseImage")}>
+						<img
+							className="fp-media fp-media-clickable"
+							src={mediaUrl(file.path)}
+							alt={file.name}
+							onClick={handleClose}
+							title={t("clickToCloseImage")}
+						/>
 					</div>
 				)}
 
@@ -443,6 +505,16 @@ export function FilePreview({
 							>
 								{allowJs ? t("htmlDisableJs") : t("htmlEnableJs")}
 							</button>
+							<a
+								className="fp-html-btn fp-html-external"
+								href={htmlUrl(file.path)}
+								target="_blank"
+								rel="noopener noreferrer"
+								title={t("openInNewTab")}
+							>
+								<FiExternalLink />
+								<span>{t("openInNewTab")}</span>
+							</a>
 						</div>
 						<iframe
 							// key forces a reload when the gate flips (script blocking is
@@ -480,14 +552,21 @@ export function FilePreview({
 				)}
 
 				{!loading && editing && kind === "text" && !isBinary && loaded && (
-					<textarea
-						className={`fp-editor ${wrap ? "" : "no-wrap"}`}
-						value={draft}
-						onChange={(e) => setDraft(e.target.value)}
-						wrap={wrap ? "soft" : "off"}
-						spellCheck={false}
-						autoFocus
-					/>
+					<>
+						<textarea
+							className={`fp-editor ${wrap ? "" : "no-wrap"}`}
+							value={draft}
+							onChange={(e) => setDraft(e.target.value)}
+							wrap={wrap ? "soft" : "off"}
+							spellCheck={false}
+							autoFocus
+						/>
+						{saveUnknown && (
+							<div className="fp-notice" role="alert">
+								{t("saveResultUnknown")}
+							</div>
+						)}
+					</>
 				)}
 
 				{!loading &&
@@ -535,28 +614,26 @@ export function FilePreview({
 					</div>
 				)}
 
-				<div className="fp-foot">
-					{editing ? (
-						<>
-							<span className="fp-hint">{t("editFile")}</span>
-							<div className="fp-actions">
-								<button type="button" className="btn" onClick={toggleEditing}>
-									{t("cancel")}
-								</button>
-								<button
-									type="button"
-									className="btn primary"
-									disabled={draft === (loaded?.text ?? "")}
-									onClick={saveEditing}
-								>
-									<FiSave /> {t("saveFile")}
-								</button>
-							</div>
-						</>
-					) : (
-						!showMarkdown &&
-						!showHtml &&
-						kind === "text" && (
+				{(editing || (!showMarkdown && !showHtml && kind === "text")) && (
+					<div className="fp-foot">
+						{editing ? (
+							<>
+								<span className="fp-hint">{t("editFile")}</span>
+								<div className="fp-actions">
+									<button type="button" className="btn" onClick={toggleEditing}>
+										{t("cancel")}
+									</button>
+									<button
+										type="button"
+										className="btn primary"
+										disabled={saving || draft === (loaded?.text ?? "")}
+										onClick={saveEditing}
+									>
+										<FiSave /> {t("saveFile")}
+									</button>
+								</div>
+							</>
+						) : (
 							<>
 								<span className="fp-hint">
 									{sel
@@ -580,9 +657,9 @@ export function FilePreview({
 									</button>
 								</div>
 							</>
-						)
-					)}
-				</div>
+						)}
+					</div>
+				)}
 			</div>
 		</div>
 	);
@@ -602,10 +679,4 @@ function isOfficeFile(name: string): boolean {
 function isHtmlFile(name: string): boolean {
 	const lower = name.toLowerCase();
 	return lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml");
-}
-
-function formatSize(bytes: number): string {
-	if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-	if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-	return `${bytes} B`;
 }

@@ -60,7 +60,7 @@ export const zh = {
 	globalDefaultBadge: "全局默认",
 	thinkingLevel: "思考强度",
 	thinking: "思考",
-	thinkingChip: "思考：{level}",
+	thinkingChip: "{level}",
 	sound: "声音",
 	theme: "主题",
 	themeDefault: "深色（默认）",
@@ -205,7 +205,9 @@ export const zh = {
 	recentProjects: "最近项目",
 	runningConversations: "运行的对话",
 	elsewhereBadge: "另一处",
+	elsewherePseudoBadge: "无头任务",
 	elsewhereTip: "在其他标签页 / 设备上打开的对话（运行中或已结束未关闭，右键可过户到本页查看）",
+	elsewherePseudoTip: "定时任务/插件正在后台会话中执行，报告会自动落回绑定的对话；不支持过户到当前页面",
 	elsewhereActions: "操作（过户到本页 / 复制 id…）",
 	takeoverConversation: "过户到当前页面",
 	takeoverConfirm: "确认过户到当前页面？",
@@ -232,6 +234,9 @@ export const zh = {
 	renameSessionConfirm: "重命名",
 	dismissConversation: "从运行列表移出（历史记录保留）",
 	dismissConversationConfirm: "确认移出",
+	pinConversation: "钉住（切换其他对话也不移出）",
+	unpinConversation: "取消钉住",
+	pinnedConversation: "已钉住：切换到其他对话时，本对话会一直留在「运行的对话」里，直到被手动移出",
 	dismissFinishedSubagents: "关闭已结束的子代理（{n} 个）",
 	dismissFinishedSubagentsScoped: "关闭该对话下已结束的子代理（含嵌套，{n} 个）",
 	dismissConversationWithSubagents: "同时关闭已结束的子代理（{n} 个）？请确认其结果已不再需要，再点一次确认",
@@ -251,6 +256,8 @@ export const zh = {
 	emptyChat: "空对话",
 
 	/* message edit */
+	reaskDirectly: "直接重问",
+	reaskDirectlyTip: "直接从这里重新提问（不修改内容，新建分支对话，原对话保留）",
 	editReask: "编辑重问",
 	editReaskTip: "修改此问题，并从这里重新提问（会新建一个分支对话，原对话保留）",
 	forkSession: "派生分支",
@@ -317,7 +324,7 @@ export const zh = {
 	approvalRuleEmpty: "当前没有审批规则。点击右上角「+ 新增规则」添加自定义拦截与放行策略。",
 	approvalRuleMoveUp: "上移",
 	approvalRuleMoveDown: "下移",
-	planBoardTitle: "任务执行看板 (Plan Mode)",
+	planBoardTitle: "任务看板",
 	planBoardSteps: "步骤清单",
 	planBoardProgress: "总体进度",
 	planBoardNoPlan: "暂无任务计划",
@@ -325,6 +332,24 @@ export const zh = {
 	planBoardInProgress: "进行中",
 	planBoardPending: "待执行",
 	planBoardFailed: "失败",
+	/* 计划看板里的「开始实施」：计划模式下计划已出，这里是**唯一**的出口 ——
+	   关掉服务端闸门（set_plan_mode false）+ 拿当前计划发起实施轮。 */
+	planImplementBtn: "开始实施",
+	planImplementTip: "关掉只规划闸门，按上面的计划开始写代码",
+	planImplementRequest: "按计划看板上的计划开始实施。",
+	planBoardExportMarkdown: "复制为 Markdown",
+	planBoardExportSuccess: "计划已复制为 Markdown",
+	planCleanHandoffBtn: "✨ 净室执行",
+	planCleanHandoffTip: "在新会话中开始实施（带走目标与计划，避免历史探索上下文干扰）",
+	planCleanHandoffPrompt:
+		"我们已在规划期制定了如下任务计划。这是一个全新的净室执行会话，请专注于按照计划步骤推进实施：",
+	planBoardAddStep: "添加步骤",
+	planBoardEditStep: "编辑步骤",
+	planBoardDeleteStep: "删除步骤",
+	planBoardStepTitlePlaceholder: "步骤标题…",
+	planBoardStepDescPlaceholder: "步骤描述/验收要求（可选）…",
+	placeholderPlanMode: "📋 计划模式：只调研与制定计划，代码写入操作将被拦截…",
+	planModeBadge: "只读规划中",
 	clear: "清空",
 	confirm: "确定",
 	forkBadge: "分支",
@@ -375,6 +400,12 @@ export const zh = {
 	kindPiCore: "核心",
 	kindPackage: "组件",
 	kindGitExtension: "Git 组件",
+	kindPlugin: "插件",
+	pluginCheckUpdates: "检查插件更新",
+	pluginCheckUpdatesHint: "检查已安装界面插件是否有新版本（对比远端版本与 commit）",
+	pluginUpdateAvailableBadge: "可更新",
+	pluginUpdateAvailableDetail: "可更新：{version}",
+	pluginAllUpToDate: "所有插件均为最新版本",
 	updatesAllRefresh: "重新检查全部",
 	updateCheckFailed: "检查失败",
 	updateBtn: "更新",
@@ -483,6 +514,7 @@ export const zh = {
 	saveFile: "保存文件",
 	discardFileChanges: "放弃未保存的修改？",
 	fileSaved: "已保存",
+	saveResultUnknown: "保存结果未知，请重试",
 	fileEditTruncated: "文件过大，预览不完整，无法编辑",
 	showMarkdownSource: "显示 Markdown 原文",
 	showMarkdownPreview: "显示 Markdown 预览",
@@ -495,6 +527,8 @@ export const zh = {
 		"页面里的 JavaScript 正在运行。它仍碰不到本应用（无同源、无表单、无顶层跳转），但可能产生网络请求或挖矿等行为，仅用于你信任的文件。",
 	htmlEnableJs: "启用脚本",
 	htmlDisableJs: "禁用脚本",
+	openInNewTab: "在新标签页打开",
+	clickToCloseImage: "点击图片关闭预览",
 	fullscreen: "全屏",
 	exitFullscreen: "退出全屏",
 	zoomIn: "放大字号",
@@ -514,6 +548,7 @@ export const zh = {
 	inputPlaceholder: "输入内容",
 	questionTimeout: "⏳ 剩余 {s} 秒，超时将自动取消",
 	questionTimeoutExpired: "提问已超时，正在恢复对话…",
+	questionNoneAvailable: "当前条件下没有可回答的问题",
 	modelNoVision: "当前模型 {name} 不支持图片，请切换到 DeepSeek V4 Flash Vision (exp)",
 	dshSkillsNote: "DSH 引擎使用运行时内置技能（dsh-skill），暂不支持在设置面板启停",
 	dshExtensionsNote: "DSH 引擎无 pi 扩展体系，能力由运行时内置（MCP/subagent/goal/plan/skill 等）",
@@ -554,6 +589,9 @@ export const zh = {
 	notifyQuestionBody: "pi 正在等你回答一个问题。",
 	notifyErrorTitle: "出错了",
 	notifyErrorBody: "一个会话报告了错误。",
+	notifyApprovalTitle: "等待审批",
+	notifyApprovalBody: "AI 请求执行工具，等待你的批准。",
+	notifyApprovalBodyTool: "AI 想执行 {tool}，等待你的批准。",
 	"sound.question": "问卷弹出",
 	"sound.question.desc": "ask_user_question 出现时",
 	"sound.done": "回复结束",
@@ -562,6 +600,28 @@ export const zh = {
 	"sound.start.desc": "智能体开始新一轮时",
 	"sound.error": "出错",
 	"sound.error.desc": "出现错误提示时",
+	"sound.approval": "等待审批",
+	"sound.approval.desc": "AI 请求执行工具等待批准时",
+
+	/* sound & voice settings (TTS) */
+	settingsSoundVoice: "声音与语音",
+	ttsHeader: "语音播报（本地 TTS）",
+	ttsEnable: "启用语音播报",
+	ttsEnableDesc: "使用浏览器内置语音合成，无需联网与密钥",
+	ttsAnnounce: "播报事件",
+	ttsAnnounceDesc: "完成 / 等待输入 / 出错 / 等待审批时念短句（仅当你没在看页面）",
+	ttsReadReplies: "朗读回复内容",
+	ttsReadRepliesDesc: "回合结束时朗读 AI 的最终回复（剥离 Markdown，最长 600 字）",
+	ttsRate: "语速",
+	ttsVoice: "语音",
+	ttsVoiceAuto: "自动（跟随界面语言）",
+	ttsVoiceOnline: "在线",
+	ttsUnavailable: "当前浏览器不支持语音合成",
+	ttsPreviewLine: "你好，这是 pi-web-ui 的语音播报试听。",
+	ttsAnnounceDone: "任务已完成",
+	ttsAnnounceQuestion: "等待你的输入",
+	ttsAnnounceError: "出现错误",
+	ttsAnnounceApproval: "等待审批",
 
 	/* pi setup modal */
 	setupTitle: "未检测到 pi agent 配置",
@@ -633,6 +693,13 @@ export const zh = {
 	compactingReasonOverflow: "上下文溢出，自动触发",
 	compactionFrom: "从 {tokens} tokens 压缩",
 	compactionKeptHint: "此前历史已折叠为该摘要，上下文中仅保留最近消息",
+	viewCompactedHistory: "展开查看被折叠的历史",
+	hideCompactedHistory: "收起被折叠的历史",
+	compactedHistoryLoading: "正在从会话中提取被折叠的历史消息…",
+	compactedHistoryEmpty: "未在会话中找到被此节点折叠的历史消息",
+	compactedHistoryNotFound: "未在会话中找到该压缩记录或已被后续压缩覆盖",
+	compactedHistoryBadge: "已压缩 · 历史只读流",
+	compactedHistoryTurns: "共 {count} 条消息",
 	backToBottom: "回到底部",
 	questionNavTitle: "问题列表",
 	searchPlaceholder: "在对话中搜索…",
@@ -668,6 +735,14 @@ export const zh = {
 	"tpl.clickCard": "点击填入输入框",
 	"tpl.editTpl": "编辑 / 删除模板",
 	"tpl.openPicker": "提示词模板（常用提示词，随时取用）",
+	/* 计划模式：只规划不实施（服务端会话级硬闸门）。
+	   目标条上的「计划」是一次性动作（开闸门 + 直接发送输入），不是开关；
+	   开关语义已删除，退出走计划看板里的「开始实施」。 */
+	planMode: "计划模式",
+	planActionBtn: "计划",
+	planActionTip: "按当前目标出一份实施计划（只规划不写代码，写操作会被服务端拒绝）",
+	planModeTip: "计划模式：只调研与出计划，不实施（写操作会被服务端拒绝）",
+	planModeTipOn: "计划模式已开：这一轮只出计划；实施请用计划看板里的「开始实施」",
 	"tpl.pickerTitle": "提示词模板",
 	"tpl.pickerHint": "点击卡片直接填入输入框，✏️ 可编辑或删除 · 也能新增自己的模板",
 	"tpl.add": "新建模板",
@@ -811,6 +886,8 @@ export const zh = {
 	copyText: "复制纯文本",
 	copyMarkdown: "复制 Markdown",
 	copyImage: "复制为图片",
+	speakMsg: "朗读",
+	stopSpeakingMsg: "停止朗读",
 	copyFailed: "复制失败",
 	saveAsImage: "保存为图片",
 	copyImageBtn: "复制图片",
@@ -996,6 +1073,7 @@ export const zh = {
 	apiType: "API 类型",
 	baseUrlHint: "（OpenAI 兼容端点）",
 	apiKeyHint: "sk-…（可留空，用 auth.json 的密钥）",
+	apiKeySavedHint: "已保存，留空不修改",
 	authHeader: "自动添加 Authorization 请求头",
 	modelsTitle: "模型",
 	modelIdReq: "模型 ID（必填）",
@@ -1033,25 +1111,35 @@ export const zh = {
 
 	/* goal / review */
 	goalBarTitle: "目标",
-	goalBarPlaceholder: "设定一个目标，agent 完成后自动审查…",
-	goalBarSet: "开始",
+	goalBarPlaceholder: "输入要达成的目标…",
+	/* 「发送」而非「开始」：目标条这一排（提炼 / 计划 / 发送）都是「点一下直接
+	   发出去」的动作按钮，没有一个是开关。 */
+	goalBarSet: "发送",
 	goalBarClear: "取消",
 	goalBarLocked: "锁定：应用到后续所有回合",
 	goalBarUnlocked: "仅本回合（改完自动清除）",
-	goalBarReviewModel: "审查模型",
+	goalBarReviewModel: "调研模型",
 	goalBarUseMainModel: "使用主模型",
 	goalBarMaxRounds: "最大轮数",
-	goalBarMaxRoundsTip: "最大审查重改轮数；0 或不填 = 不限（持续改到通过）",
+	goalBarMaxRoundsTip: "最大执行/重审轮数；0 或不填 = 不限（持续改到通过）",
 	goalBarUnlimitedShort: "不限",
+	goalBarExecModel: "执行模型",
+	goalBarExecModelTip: "执行对话的模型；空 = 跟随当前对话",
+	goalBarOpenExec: "执行对话",
+	goalBarOpenExecTip: "打开执行者对话（左栏可随时点开）",
+	goalBarStaleBackend: "⚠️ 服务端版本较旧（进程未重启）：目标模式 2.0 不会生效，请重启 pi-web-ui 服务",
+	goalBarStop: "停止目标（并停掉执行对话）",
 
 	goalBarReviewing: "审查中…",
+	goalBarExecuting: "执行中…",
+	goalHistory: "历史",
 	goalBarRound: "第 {n} 轮",
 	goalBarActive: "目标生效中",
 	goalBarPassed: "已通过",
 	goalBarFailed: "未通过",
 	goalBarBlocked: "⚠️ 受阻",
 	goalBarStatusPending: "等待生成…",
-	goalWizardBtn: "AI 提炼",
+	goalWizardBtn: "提炼",
 	goalWizardTip: "让 AI 通过问卷调研细化需求，收敛为目标",
 	goalWizardRunning: "目标调研中",
 	goalWizardAnswer: "回答",
@@ -1129,13 +1217,15 @@ export const zh = {
 	promptTok_cwd: "工作目录行",
 	promptTok_cwd_desc: "Current working directory 行",
 	settingsViewPrompt: "查看当前完整提示词",
+	settingsViewPromptTokens: "{n} tokens",
 	settingsViewPromptHint:
 		"当前会话实际生效的完整系统提示词（含自定义追加/替换内容、项目上下文、技能说明与工具引导），只读。",
 	settingsViewPromptEmpty: "会话尚未就绪，暂无系统提示词。",
-	settingsViewToolsSchema: "工具 schema",
+	settingsViewToolsSchema: "查看工具 schema",
 	settingsViewToolsSchemaHint:
 		"发给模型的 function-calling 工具定义（name / description / parameters），与系统提示词正文拼成完整初始上下文，只读。",
 	settingsViewToolsSchemaEmpty: "会话尚未就绪，暂无工具 schema。",
+	settingsPromptContextTotal: "合计: {n} tokens",
 	settingsSkills: "技能",
 	settingsReview: "目标审查",
 	settingsReviewDesc: "为独立的目标审查会话配置额外提示词和技能；不会改变主会话设置。",
@@ -1146,6 +1236,14 @@ export const zh = {
 	goalModeEnabledDesc:
 		"目标条 / 目标调研向导 / 审查循环的总开关（默认开）。关闭后目标条隐藏，无法设置目标、启动调研或触发审查。",
 	goalModeOffHint: "目标模式已关闭：目标条已隐藏，已有的目标将不再触发审查。",
+	/* 审查者模式（自动委派）：会话级，默认关。开启后本对话只审阅不施工。 */
+	delegateMode: "审查者模式（自动委派）",
+	delegateModeDesc:
+		"开启后本对话**只审阅不施工**：你发的每条请求由服务端自动转给一个常驻的落盘执行对话去干活，本对话负责看结果、提要求。写文件/跑命令/再派子代理会被服务端硬闸门拒绝。",
+	delegateModeOffHint: "审查者模式已关闭：恢复普通对话，本对话可以直接改代码。",
+	delegateModeBadge: "审查者",
+	delegateModeBadgeTip: "审查者模式已开：活由常驻执行对话执行（还没派过活）",
+	delegateModeOpenTip: "打开常驻执行对话，看它干了什么",
 	settingsVisionBridge: "视觉桥",
 	settingsVisionBridgeDesc: "当前模型不支持识图时，把图片交给已配置的视觉模型转写为文字证据，再让模型回答",
 	visionBridgeEnabled: "启用视觉桥",
@@ -1232,6 +1330,17 @@ export const zh = {
 	attachPage: "网页引用：{name}（AI 已获授权操作这个页面）",
 	attachPageShort: "网页",
 	settingsTools: "工具",
+	toolsSectionCore: "核心工具",
+	toolsCoreHint:
+		"bash / read / edit / write / powershell 是模型干活的基本盘，不在下方目录开关里。关闭后模型无法执行对应操作：关 bash 不能跑命令，关 read 不能读文件，关 edit / write 不能改文件，关 powershell 不能跑 PowerShell 命令（仅 Windows）。",
+	toolCoreBashDesc: "执行 shell 命令。关闭后模型不能跑命令、装依赖、跑测试。",
+	toolCoreReadDesc: "读取文件与目录。关闭后模型只能靠对话里已有的内容干活。",
+	toolCoreEditDesc: "精确编辑文件。关闭后模型不能局部修改代码。",
+	toolCoreWriteDesc: "新建或整写文件。关闭后模型不能创建、覆盖文件。",
+	toolCorePowershellDesc: "执行 PowerShell 命令（仅 Windows 有效）。关闭后模型不能运行 PowerShell 命令。",
+	toolCoreLsDesc: "列出目录内容。关闭后模型无法调用 ls 列目录（可被 read 目录模式完全替代）。",
+	toolCoreGrepDesc: "正则搜索文件内容，返回匹配行与行号。关闭后模型不能直接调 grep（可用 bash 命令替代）。",
+	toolCoreFindDesc: "按 glob 规则搜索文件名与相对路径。关闭后模型不能直接调 find（可用 bash 命令替代）。",
 	toolsSectionTerminal: "持久终端",
 	toolsSectionSubagent: "子代理",
 	toolsSectionOther: "其他工具",
@@ -1244,14 +1353,18 @@ export const zh = {
 	toolsPresetBanner: "默认预设「{name}」正在过滤工具：新对话有 {count} 个工具开关暂不生效（切回全功能即恢复）",
 	toolsBackToStandard: "切回全功能",
 	toolsBlockedByPreset: "当前默认预设「{name}」下不可用，切回「全功能」恢复",
+	pluginToolsDisabledByPlugin: "所属插件已在「界面插件」中禁用，重新启用插件后恢复",
+	pluginDisabledInPlugins: "插件已禁用",
 	skillsHiddenByPreset: "技能名录被默认预设「{name}」隐藏（skill 加载工具不可用时不同步展示），切回全功能恢复",
 	toolsSubagentDepHint:
-		"逐个开关：关闭 subagent_spawn 后其余（等待/查询/改向/停止）无会话可管，只会返回空列表或“未找到”；delegate_task 走 spawn 通道，spawn 关了它也派不出去。",
+		"子代理统一入口：合并 spawn/wait/get/steer/stop/list/templates/handoff；delegate_task 走 spawn 通道，关闭子代理后 delegate_task 也无法派单。",
 	delegateTaskEnabledDesc:
 		"把定义清楚的任务派给 specialist 子代理模板：六段派单（TASK/EXPECTED OUTCOME/REQUIRED TOOLS/MUST DO/MUST NOT DO/CONTEXT）在服务端校验，缺段或含糊直接报错打回。执行体复用子代理 spawn 通道。",
-	delegateTaskOffHint: "已关闭：AI 无法使用 delegate_task 派单（可用 subagent_spawn 自由派单，不带六段校验）",
+	delegateTaskOffHint: "已关闭：AI 无法使用 delegate_task 派单（可用 subagent 自由派单，不带六段校验）",
 	todoListEnabledDesc: "只读查询当前任务列表，删除项需显式传参；写操作不走工具，直接写内联标记。",
 	todoListOffHint: "已关闭：AI 不能再调查询工具（内联标记的写入不受影响）",
+	toolDescSubagent:
+		"后台子代理对话管理（左栏可见）：统一支持 spawn（派发）、wait_all（等待收口）、get_result（查询结果）、steer（改向追加）、stop（中止）、list（运行态）、templates（模板名录）、handoff（同行协作）。",
 	toolDescSubagentSpawn: "后台起独立子代理对话（左栏可见），做可独立交付的任务；可并行多个。",
 	toolDescSubagentGetResult: "取单个子代理的结果或当前进度；未完成返回现状和部分输出。",
 	toolDescSubagentSteer: "向运行中的子代理注入消息，改向或补充要求。",
@@ -1303,6 +1416,13 @@ export const zh = {
 	scmCommitMsgPromptPlaceholder: "输入自定义提示词…（留空 = 使用内置默认提示词，失焦后自动应用）",
 	scmCommitMsgSettingsHint:
 		"追加模式把自定义内容拼在内置提示词末尾；替换模式完全使用自定义内容（切换后输入框会显示内置默认，可直接修改，不改动失焦则仍使用默认）",
+	planModePromptSettingsTitle: "计划模式提示词",
+	planModePromptSettingsDesc:
+		"计划模式（目标条里的「计划」按钮）开启时追加给模型的提示词：只调研 + 出计划，不实施。内置默认含「禁止把实现代码写进回复」「小需求可跳过计划看板走短计划」两条硬规则",
+	planModePromptMode: "计划模式提示词",
+	planModePromptPlaceholder: "输入自定义提示词…（留空 = 使用内置默认提示词，失焦后自动应用）",
+	planModePromptSettingsHint:
+		"追加模式把自定义内容拼在内置提示词末尾；替换模式完全使用自定义内容（切换后输入框会显示内置默认，可直接修改，不改动失焦则仍使用默认）。仅影响提示词，服务端的只读硬闸门始终生效",
 	uninstallExt: "卸载",
 	uninstallConfirm: "确认卸载？",
 	uninstallConfirmHint: "再次点击确认，将在终端执行 pi remove",
@@ -1384,6 +1504,13 @@ export const zh = {
 	uiLayoutScm: "SCM 工具条",
 	uiLayoutGoalbar: "目标条动作",
 	uiLayoutNotice: "通知条动作",
+	uiLayoutSidebarLeft: "左侧悬浮栏",
+	uiLayoutSidebarRight: "右侧悬浮栏",
+	uiLayoutPosition: "位置",
+	uiLayoutPosTop: "顶部",
+	uiLayoutPosBottom: "底部",
+	uiLayoutPosLeft: "左侧悬浮",
+	uiLayoutPosRight: "右侧悬浮",
 	uiLayoutSearch: "搜索条目…",
 	uiLayoutMovedFrom: "移自",
 	uiLayoutAlign: "对齐",
@@ -1392,6 +1519,12 @@ export const zh = {
 	uiLayoutRestoreAll: "全部恢复默认",
 	uiLayoutArranged: "插件调整过",
 	uiLayoutEmpty: "（无）",
+	moveToTop: "移到顶部",
+	moveToBottom: "移到底部",
+	moveToLeft: "移到左侧悬浮",
+	moveToRight: "移到右侧悬浮",
+	sideDockCollapse: "收起悬浮栏",
+	sideDockExpand: "展开悬浮栏",
 	pluginGrantsTitle: "已授权目录",
 	pluginGrantsHint: "插件要访问工作区之外的目录时必须先经你确认（确认过的会记在这里，可随时撤销）。",
 	pluginGrantsEmpty: "还没有插件获得过工作区外的目录授权",
@@ -1444,6 +1577,18 @@ export const zh = {
 	dshDefaultPreset: "默认预设",
 	dshDefaultPresetDesc: "新对话使用的预设；空白会话可随时切换，首轮发言后锁定",
 	dshPresetUserNote: "自建预设来自用户预设目录（与 shell 同等信任）；用裸包名的自建组合在此无法挂载（已知限制）",
+	/* pi 引擎内置五档预设：文案随界面语言定，译文不再由服务端单方面下发。
+	   键名与预设 id 同名（非内置预设回落服务端文案 nameEn ?? name）。 */
+	"preset.standard": "全功能",
+	"preset.minimal": "极简模式",
+	"preset.code": "代码开发",
+	"preset.reader": "只读分析",
+	"preset.ask": "纯对话",
+	"preset.standardDesc": "提供全部可用工具与扩展能力（默认）",
+	"preset.minimalDesc": "仅保留 bash 与 read；插件工具、技能名录与终端引导同步隐藏",
+	"preset.codeDesc": "专注于代码读写与执行（bash, read, edit, write, edit_soft）；插件工具与技能名录同步隐藏",
+	"preset.readerDesc": "仅保留只读工具，禁止写操作；插件工具同步隐藏（读写未知，保守处理）",
+	"preset.askDesc": "无工具问答模式，模型不调用任何工具；插件工具与技能名录同步隐藏",
 	dshPerm: "权限",
 	dshPermReadOnly: "仅可查看",
 	dshPermReadOnlyDesc: "只能读文件、跑只读命令；写操作一律拒绝，不弹确认",
@@ -1620,6 +1765,10 @@ export const zh = {
 	quoteConversationShort: "引用",
 	attachConversation: "对话引用：{name}（AI 经 conversation_read 按需读取）",
 	attachConversationShort: "对话",
+	quoteSelection: "引用",
+	quoteText: "文字引用",
+	quoteSource: "来源消息：{id}",
+	removeQuote: "移除引用",
 	/* Present files（present_files 工具卡片） */
 	presentOpenLocal: "本地打开",
 	presentMissing: "文件不存在或不可读（可能已被移动、删除或超出工作区）",
@@ -1649,7 +1798,7 @@ export const zh = {
 		"高可靠结构化行补丁工具（Hashline）：基于内容哈希锚点与语法块（AST Block）替换代码，支持剪切/粘贴寄存器；文件被外部改动时自动执行三方合并（3-Way Merge）冲突自愈，避免大文件编辑幻觉与行号漂移。",
 	patchToolOffHint: "已关闭：AI 只能使用基础 edit 工具进行纯文本精确字符串替换",
 	lspToolEnabledDesc:
-		"原生语言服务器协议（LSP）工具：为 AI 提供 IDE 级的代码语义智能（支持定义跳转 definition、引用查询 references、类型悬停 hover、编译诊断 diagnostics），多子代理共享项目后台守护进程，零外部插件开箱即用。",
+		"原生语言服务器协议（LSP）工具：为 AI 提供 IDE 级的代码语义智能（支持定义跳转、引用查询、类型悬停、编译诊断、符号大纲 documentSymbol、精确符号代码切片 read_symbol、工作区全局符号搜索 workspaceSymbol、编辑影响级联诊断 cascade），多子代理共享进程池与闲置休眠，免外部插件开箱即用。",
 	lspToolOffHint: "已关闭：AI 将无法主动调用 LSP 语义工具，依赖全局搜索或文本匹配定位符号",
 	/* 工具定义说明弹窗（工具卡右键 → 显示工具详细信息；定义走 get_tool_info 现取） */
 	toolInfoMenuLabel: "显示工具详细信息",
@@ -1676,7 +1825,7 @@ export const zh = {
 /* en                                                                  */
 /* ------------------------------------------------------------------ */
 
-const en: Record<keyof typeof zh, string> = {
+export const en: Record<keyof typeof zh, string> = {
 	/* common */
 	docTitle: "pi-web-ui — pi coding agent",
 	cancel: "Cancel",
@@ -1724,7 +1873,7 @@ const en: Record<keyof typeof zh, string> = {
 	globalDefaultBadge: "Global default",
 	thinkingLevel: "Thinking level",
 	thinking: "Thinking",
-	thinkingChip: "Thinking: {level}",
+	thinkingChip: "{level}",
 	sound: "Sound",
 	theme: "Theme",
 	themeDefault: "Dark (default)",
@@ -1875,8 +2024,11 @@ const en: Record<keyof typeof zh, string> = {
 	recentProjects: "Recent projects",
 	runningConversations: "Running chats",
 	elsewhereBadge: "Elsewhere",
+	elsewherePseudoBadge: "Background task",
 	elsewhereTip:
 		"Conversation open in another tab / device (running, or finished but still held there; right-click to take over and view it here)",
+	elsewherePseudoTip:
+		"A scheduler/plugin background task is running here. Reports are saved to the bound conversation automatically; this session cannot be taken over",
 	elsewhereActions: "Actions (take over here, copy id…)",
 	takeoverConversation: "Take over to this page",
 	takeoverConfirm: "Confirm take over to this page?",
@@ -1903,6 +2055,9 @@ const en: Record<keyof typeof zh, string> = {
 	renameSessionConfirm: "Rename",
 	dismissConversation: "Dismiss from running (keep in history)",
 	dismissConversationConfirm: "Confirm dismiss",
+	pinConversation: "Pin to running list (keep across switches)",
+	unpinConversation: "Unpin",
+	pinnedConversation: "Pinned: stays in Running chats when you switch away, until you explicitly dismiss it",
 	dismissFinishedSubagents: "Dismiss finished subagents ({n})",
 	dismissFinishedSubagentsScoped: "Dismiss finished subagents under this chat, incl. nested ({n})",
 	dismissConversationWithSubagents:
@@ -1923,6 +2078,8 @@ const en: Record<keyof typeof zh, string> = {
 	emptyChat: "Empty chat",
 
 	/* message edit */
+	reaskDirectly: "Re-ask",
+	reaskDirectlyTip: "Re-ask from here directly without editing (forks a new conversation; original kept)",
 	editReask: "Edit & re-ask",
 	editReaskTip: "Edit this question and re-ask from here (forks a new conversation; the original is kept)",
 	forkSession: "Fork branch",
@@ -1993,7 +2150,7 @@ const en: Record<keyof typeof zh, string> = {
 	approvalRuleEmpty: "No approval rules configured. Click '+ Add Rule' to add custom policies.",
 	approvalRuleMoveUp: "Move Up",
 	approvalRuleMoveDown: "Move Down",
-	planBoardTitle: "Task Plan Board (Plan Mode)",
+	planBoardTitle: "Task Board",
 	planBoardSteps: "Step List",
 	planBoardProgress: "Overall Progress",
 	planBoardNoPlan: "No active plan",
@@ -2001,6 +2158,24 @@ const en: Record<keyof typeof zh, string> = {
 	planBoardInProgress: "In Progress",
 	planBoardPending: "Pending",
 	planBoardFailed: "Failed",
+	/* The one and only way out of plan mode now that the composer switch is gone:
+	   turn the server gate off (set_plan_mode false) and start implementing. */
+	planImplementBtn: "Start implementing",
+	planImplementTip: "Turn off the planning-only gate and start writing code per the plan",
+	planImplementRequest: "Start implementing the plan on the task board.",
+	planBoardExportMarkdown: "Copy as Markdown",
+	planBoardExportSuccess: "Plan copied as Markdown",
+	planCleanHandoffBtn: "✨ Clean Handoff",
+	planCleanHandoffTip: "Execute in a fresh session (carries over plan steps, free of exploration noise)",
+	planCleanHandoffPrompt:
+		"We developed the following task plan during the planning phase. This is a clean execution session — focus on implementing and advancing these steps:",
+	planBoardAddStep: "Add step",
+	planBoardEditStep: "Edit step",
+	planBoardDeleteStep: "Delete step",
+	planBoardStepTitlePlaceholder: "Step title…",
+	planBoardStepDescPlaceholder: "Step description / acceptance checks (optional)…",
+	placeholderPlanMode: "📋 Plan mode: research and planning only — code writes will be blocked…",
+	planModeBadge: "Planning Only",
 	clear: "Clear",
 	confirm: "Confirm",
 	forkBadge: "Branch",
@@ -2053,6 +2228,12 @@ const en: Record<keyof typeof zh, string> = {
 	kindPiCore: "Core",
 	kindPackage: "Package",
 	kindGitExtension: "Git package",
+	kindPlugin: "Plugin",
+	pluginCheckUpdates: "Check plugin updates",
+	pluginCheckUpdatesHint: "Check if installed UI plugins have updates (compares remote versions and commits)",
+	pluginUpdateAvailableBadge: "Updatable",
+	pluginUpdateAvailableDetail: "Update available: {version}",
+	pluginAllUpToDate: "All plugins are up to date",
 	updatesAllRefresh: "Re-check all",
 	updateCheckFailed: "Check failed",
 	updateBtn: "Update",
@@ -2164,6 +2345,7 @@ const en: Record<keyof typeof zh, string> = {
 	saveFile: "Save file",
 	discardFileChanges: "Discard unsaved changes?",
 	fileSaved: "Saved",
+	saveResultUnknown: "Save result unknown — please retry",
 	fileEditTruncated: "The preview is incomplete, so this file can't be edited",
 	showMarkdownSource: "Show Markdown source",
 	showMarkdownPreview: "Show Markdown preview",
@@ -2176,6 +2358,8 @@ const en: Record<keyof typeof zh, string> = {
 		"JavaScript in the page is running. It still cannot reach this app (no same-origin, no forms, no top navigation), but it may make network requests or mine crypto — only for files you trust.",
 	htmlEnableJs: "Enable scripts",
 	htmlDisableJs: "Disable scripts",
+	openInNewTab: "Open in new tab",
+	clickToCloseImage: "Click image to close preview",
 	fullscreen: "Fullscreen",
 	exitFullscreen: "Exit fullscreen",
 	zoomIn: "Increase font size",
@@ -2193,6 +2377,7 @@ const en: Record<keyof typeof zh, string> = {
 	optionPreview: "Option preview",
 	questionTimeout: "⏳ {s}s left — auto-cancels on timeout",
 	questionTimeoutExpired: "Question timed out, resuming conversation…",
+	questionNoneAvailable: "No answerable questions under the current conditions",
 	modelNoVision: "Current model {name} doesn't support images — switch to DeepSeek V4 Flash Vision (exp)",
 	dshSkillsNote: "DSH uses runtime-built-in skills (dsh-skill); toggling is not supported in settings yet",
 	dshExtensionsNote:
@@ -2238,6 +2423,9 @@ const en: Record<keyof typeof zh, string> = {
 	notifyQuestionBody: "pi is waiting for your answer to a question.",
 	notifyErrorTitle: "Something went wrong",
 	notifyErrorBody: "A session reported an error.",
+	notifyApprovalTitle: "Approval needed",
+	notifyApprovalBody: "The agent wants to run a tool and needs your approval.",
+	notifyApprovalBodyTool: "The agent wants to run {tool} and needs your approval.",
 	"sound.question": "Question popup",
 	"sound.question.desc": "When ask_user_question appears",
 	"sound.done": "Reply finished",
@@ -2246,6 +2434,28 @@ const en: Record<keyof typeof zh, string> = {
 	"sound.start.desc": "When the agent starts a new turn",
 	"sound.error": "Error",
 	"sound.error.desc": "When an error notice appears",
+	"sound.approval": "Approval needed",
+	"sound.approval.desc": "When the agent requests tool approval",
+
+	/* sound & voice settings (TTS) */
+	settingsSoundVoice: "Sound & Voice",
+	ttsHeader: "Voice announcements (local TTS)",
+	ttsEnable: "Enable voice announcements",
+	ttsEnableDesc: "Uses your browser's built-in speech synthesis — no network, no keys",
+	ttsAnnounce: "Announce events",
+	ttsAnnounceDesc: "Speaks a short line on finish / input / error / approval (only while you're away)",
+	ttsReadReplies: "Read reply content",
+	ttsReadRepliesDesc: "Reads the assistant's final reply when a turn ends (markdown stripped, 600 chars max)",
+	ttsRate: "Rate",
+	ttsVoice: "Voice",
+	ttsVoiceAuto: "Auto (follow UI language)",
+	ttsVoiceOnline: "online",
+	ttsUnavailable: "Speech synthesis is not supported in this browser",
+	ttsPreviewLine: "Hello, this is the pi-web-ui voice preview.",
+	ttsAnnounceDone: "Task finished",
+	ttsAnnounceQuestion: "Waiting for your input",
+	ttsAnnounceError: "An error occurred",
+	ttsAnnounceApproval: "Approval needed",
 
 	/* pi setup modal */
 	setupTitle: "pi agent config not detected",
@@ -2317,6 +2527,13 @@ const en: Record<keyof typeof zh, string> = {
 	compactingReasonOverflow: "Auto-triggered by context overflow",
 	compactionFrom: "Compacted from {tokens} tokens",
 	compactionKeptHint: "Earlier history is folded into this summary; only recent messages stay in context",
+	viewCompactedHistory: "View folded history",
+	hideCompactedHistory: "Hide folded history",
+	compactedHistoryLoading: "Extracting folded history messages…",
+	compactedHistoryEmpty: "No folded history messages found for this compaction",
+	compactedHistoryNotFound: "Compaction entry not found or superseded",
+	compactedHistoryBadge: "Compacted · Read-only stream",
+	compactedHistoryTurns: "{count} messages",
 	backToBottom: "Back to bottom",
 	questionNavTitle: "Questions",
 	searchPlaceholder: "Search in conversation…",
@@ -2353,6 +2570,12 @@ const en: Record<keyof typeof zh, string> = {
 	"tpl.clickCard": "Click to fill the input",
 	"tpl.editTpl": "Edit / delete template",
 	"tpl.openPicker": "Prompt templates (reusable prompts, anytime)",
+	/* plan mode: research + plan only, no implementation */
+	planMode: "Plan mode",
+	planActionBtn: "Plan",
+	planActionTip: "Draft an implementation plan for this goal (planning only — the server blocks writes)",
+	planModeTip: "Plan mode: research and plan only — writes are blocked by the server",
+	planModeTipOn: "Plan mode is on: this turn plans only; use “Start implementing” on the task board",
 	"tpl.pickerTitle": "Prompt templates",
 	"tpl.pickerHint": "Click a card to fill the input; ✏️ to edit or delete; add your own too",
 	"tpl.add": "New template",
@@ -2496,6 +2719,8 @@ const en: Record<keyof typeof zh, string> = {
 	copyText: "Copy as text",
 	copyMarkdown: "Copy as Markdown",
 	copyImage: "Copy as image",
+	speakMsg: "Read aloud",
+	stopSpeakingMsg: "Stop reading",
 	copyFailed: "Copy failed",
 	saveAsImage: "Save as image",
 	copyImageBtn: "Copy image",
@@ -2686,6 +2911,7 @@ const en: Record<keyof typeof zh, string> = {
 	apiType: "API type",
 	baseUrlHint: "(OpenAI-compatible endpoint)",
 	apiKeyHint: "sk-… (optional — uses the auth.json key)",
+	apiKeySavedHint: "Saved — leave blank to keep unchanged",
 	authHeader: "Auto-add Authorization header",
 	modelsTitle: "Models",
 	modelIdReq: "Model ID (required)",
@@ -2724,24 +2950,35 @@ const en: Record<keyof typeof zh, string> = {
 
 	/* goal / review */
 	goalBarTitle: "Goal",
-	goalBarPlaceholder: "Set a goal; the agent's output is auto-reviewed…",
-	goalBarSet: "Start",
+	goalBarPlaceholder: "Enter the goal to achieve…",
+	/* "Send", not "Start": every button in this row (Refine / Plan / Send) is a
+	   click-to-send action — none of them is a toggle. */
+	goalBarSet: "Send",
 	goalBarClear: "Cancel",
 	goalBarLocked: "Locked: applies to every later turn",
 	goalBarUnlocked: "This turn only (cleared afterwards)",
-	goalBarReviewModel: "Review model",
+	goalBarReviewModel: "Scoping model",
 	goalBarUseMainModel: "Use the main model",
 	goalBarMaxRounds: "Max rounds",
-	goalBarMaxRoundsTip: "Max review-revision rounds; 0 or empty = unlimited (keep revising until it passes)",
+	goalBarMaxRoundsTip: "Max execution/review rounds; 0 or empty = unlimited (keep revising until it passes)",
 	goalBarUnlimitedShort: "Unlimited",
+	goalBarExecModel: "Executor model",
+	goalBarExecModelTip: "Model for the executor conversation; empty = follow the main conversation",
+	goalBarOpenExec: "Executor chat",
+	goalBarOpenExecTip: "Open the executor conversation (also reachable from the left panel)",
+	goalBarStaleBackend:
+		"⚠️ Stale server build (process not restarted): goal mode 2.0 will not take effect — restart the pi-web-ui service",
+	goalBarStop: "Stop goal (also stops the executor conversation)",
 	goalBarReviewing: "Reviewing…",
+	goalBarExecuting: "Executing…",
+	goalHistory: "History",
 	goalBarRound: "Round {n}",
 	goalBarActive: "Goal active",
 	goalBarPassed: "Passed",
 	goalBarFailed: "Failed",
 	goalBarBlocked: "⚠️ Blocked",
 	goalBarStatusPending: "Waiting to generate…",
-	goalWizardBtn: "AI Scrape",
+	goalWizardBtn: "Refine",
 	goalWizardTip: "Let AI refine the requirement into a goal via a Q&A survey",
 	goalWizardRunning: "Scoping the goal",
 	goalWizardAnswer: "Answer",
@@ -2821,13 +3058,15 @@ const en: Record<keyof typeof zh, string> = {
 	promptTok_cwd: "Working dir line",
 	promptTok_cwd_desc: "the Current working directory line",
 	settingsViewPrompt: "View the current full prompt",
+	settingsViewPromptTokens: "{n} tokens",
 	settingsViewPromptHint:
 		"The full system prompt actually in effect for this conversation (custom append/replace text, project context, skills and tool guidance). Read-only.",
 	settingsViewPromptEmpty: "Session not ready yet — no system prompt available.",
-	settingsViewToolsSchema: "Tools schema",
+	settingsViewToolsSchema: "View tools schema",
 	settingsViewToolsSchemaHint:
 		"The function-calling tool definitions sent to the model (name / description / parameters), combining with the system prompt text to form the full initial context. Read-only.",
 	settingsViewToolsSchemaEmpty: "Session not ready yet — no tools schema available.",
+	settingsPromptContextTotal: "Total: {n} tokens",
 	settingsSkills: "Skills",
 	settingsReview: "Goal review",
 	settingsReviewDesc:
@@ -2840,6 +3079,15 @@ const en: Record<keyof typeof zh, string> = {
 	goalModeEnabledDesc:
 		"Master switch for the goal bar, the goal wizard and the review loop (on by default). When off, the goal bar is hidden and you cannot set a goal, run the wizard, or trigger reviews.",
 	goalModeOffHint: "Goal mode is off: the goal bar is hidden and existing goals no longer trigger reviews.",
+	/* Reviewer mode (auto-delegation): per conversation, off by default. */
+	delegateMode: "Reviewer mode (auto-delegate)",
+	delegateModeDesc:
+		"When on, this conversation reviews instead of building: the server forwards every request you send to one persistent executor conversation that does the work, and this conversation inspects the result and states follow-ups. Writing files, running commands and dispatching more subagents are blocked by a server-side gate.",
+	delegateModeOffHint: "Reviewer mode is off: back to a normal conversation — this one can change code again.",
+	delegateModeBadge: "Reviewer",
+	delegateModeBadgeTip:
+		"Reviewer mode is on: work runs in the persistent executor conversation (nothing dispatched yet)",
+	delegateModeOpenTip: "Open the persistent executor conversation to see what it did",
 	settingsVisionBridge: "Vision bridge",
 	settingsVisionBridgeDesc:
 		"When the current model can't see images, send them to a configured vision model and transcribe into text evidence first",
@@ -2914,7 +3162,7 @@ const en: Record<keyof typeof zh, string> = {
 	browserControlPageClosed: "not open",
 	browserControlExamples: "You can ask for things like",
 	browserControlExample1: '"Read the orders on that page and sort them by amount"',
-	browserControlExample2: '"Type 张三 in the search box, click search, and tell me the first result"',
+	browserControlExample2: '"Type John Doe in the search box, click search, and tell me the first result"',
 	browserControlOpenOptions: "Open extension options",
 	browserControlRefresh: "Refresh status",
 	browserControlCite: "Mention in chat",
@@ -2932,6 +3180,23 @@ const en: Record<keyof typeof zh, string> = {
 	attachPage: "Page reference: {name} (the AI is granted access to this page)",
 	attachPageShort: "page",
 	settingsTools: "Tools",
+	toolsSectionCore: "Core tools",
+	toolsCoreHint:
+		"bash / read / edit / write / powershell are the model's basic toolkit and are not part of the catalog toggles below. Turning one off removes that ability: no bash = no command execution, no read = no file reading, no edit / write = no file modification, no powershell = no PowerShell command execution (Windows only).",
+	toolCoreBashDesc:
+		"Run shell commands. When off, the model cannot execute commands, install dependencies, or run tests.",
+	toolCoreReadDesc:
+		"Read files and directories. When off, the model can only work with content already in the conversation.",
+	toolCoreEditDesc: "Make precise file edits. When off, the model cannot modify code in place.",
+	toolCoreWriteDesc: "Create or overwrite files. When off, the model cannot create or overwrite files.",
+	toolCorePowershellDesc:
+		"Run PowerShell commands (Windows only). When off, the model cannot execute PowerShell commands.",
+	toolCoreLsDesc:
+		"List directory contents. When off, the model cannot call ls (fully substituted by read directory mode).",
+	toolCoreGrepDesc:
+		"Search file contents by regex. When off, the model cannot call grep (substitutable by bash commands).",
+	toolCoreFindDesc:
+		"Search files by glob pattern. When off, the model cannot call find (substitutable by bash commands).",
 	toolsSectionTerminal: "Persistent terminal",
 	toolsSectionSubagent: "Subagents",
 	toolsSectionOther: "Other tools",
@@ -2945,17 +3210,22 @@ const en: Record<keyof typeof zh, string> = {
 		"Default preset “{name}” is filtering tools: {count} tool switches have no effect on new conversations until you switch back to full features",
 	toolsBackToStandard: "Back to full features",
 	toolsBlockedByPreset: "Unavailable under default preset “{name}”; switch back to full features to restore",
+	pluginToolsDisabledByPlugin:
+		"Disabled because the owning plugin is disabled in “Plugins”; re-enable the plugin to restore",
+	pluginDisabledInPlugins: "Plugin disabled",
 	skillsHiddenByPreset:
 		"Skill catalog hidden by default preset “{name}” (not shown while the skill loader is unavailable); switch back to full features to restore",
 	toolsSubagentDepHint:
-		"Toggled individually: with subagent_spawn off, the rest (wait/get/steer/stop) have no sessions to manage and only return empty lists or “not found”; delegate_task rides the spawn channel, so it cannot dispatch with spawn off.",
+		"Unified subagent entrypoint combining spawn/wait/get/steer/stop/list/templates/handoff; delegate_task rides the spawn channel, so it cannot dispatch if subagents are disabled.",
 	delegateTaskEnabledDesc:
 		"Delegate a well-defined task to a specialist subagent template: the six-section brief (TASK/EXPECTED OUTCOME/REQUIRED TOOLS/MUST DO/MUST NOT DO/CONTEXT) is validated server-side; missing or vague sections are rejected. Runs on the subagent spawn channel.",
 	delegateTaskOffHint:
-		"Disabled: the AI cannot delegate via delegate_task (free-form delegation via subagent_spawn still works, without six-section validation)",
+		"Disabled: the AI cannot delegate via delegate_task (free-form delegation via subagent still works, without six-section validation)",
 	todoListEnabledDesc:
 		"Read-only query of the current task list (deleted items need an explicit flag); writes never go through tools — use inline markers.",
 	todoListOffHint: "Disabled: the AI can no longer call the query tool (inline-marker writes are unaffected)",
+	toolDescSubagent:
+		"Background subagent management (visible in the left panel): unifies spawn (dispatch), wait_all (collect), get_result (inspect), steer (redirect), stop (abort), list (status), templates (catalog), and handoff (peer collaboration).",
 	toolDescSubagentSpawn:
 		"Spawn an independent background subagent conversation (visible on the left) for a self-contained task; several may run in parallel.",
 	toolDescSubagentGetResult:
@@ -3013,6 +3283,13 @@ const en: Record<keyof typeof zh, string> = {
 	scmCommitMsgPromptPlaceholder: "Type a custom prompt… (empty = built-in default prompt, applied on blur)",
 	scmCommitMsgSettingsHint:
 		"Append mode adds custom text after the built-in prompt; replace mode uses the custom text entirely (after switching, the editor shows the built-in default ready to edit — blurring without changes keeps the default)",
+	planModePromptSettingsTitle: "Plan mode prompt",
+	planModePromptSettingsDesc:
+		"Prompt appended to the model while plan mode is on (the Plan button in the goal bar): research and plan only, no implementation. The built-in default carries two hard rules — never paste the implementation into the reply, and skip the plan board for small unambiguous requests",
+	planModePromptMode: "Plan mode prompt",
+	planModePromptPlaceholder: "Type a custom prompt… (empty = built-in default prompt, applied on blur)",
+	planModePromptSettingsHint:
+		"Append mode adds custom text after the built-in prompt; replace mode uses the custom text entirely (after switching, the editor shows the built-in default ready to edit — blurring without changes keeps the default). Prompt only — the server-side read-only gate always applies",
 	uninstallExt: "Uninstall",
 	uninstallConfirm: "Confirm?",
 	uninstallConfirmHint: "Click again to confirm — runs pi remove in the terminal",
@@ -3100,6 +3377,13 @@ const en: Record<keyof typeof zh, string> = {
 	uiLayoutScm: "SCM toolbar",
 	uiLayoutGoalbar: "Goal-bar actions",
 	uiLayoutNotice: "Notice actions",
+	uiLayoutSidebarLeft: "Left floating dock",
+	uiLayoutSidebarRight: "Right floating dock",
+	uiLayoutPosition: "Position",
+	uiLayoutPosTop: "Top",
+	uiLayoutPosBottom: "Bottom",
+	uiLayoutPosLeft: "Left dock",
+	uiLayoutPosRight: "Right dock",
 	uiLayoutSearch: "Filter entries…",
 	uiLayoutMovedFrom: "moved from",
 	uiLayoutAlign: "Align",
@@ -3108,6 +3392,12 @@ const en: Record<keyof typeof zh, string> = {
 	uiLayoutRestoreAll: "Restore all",
 	uiLayoutArranged: "Changed by a plugin",
 	uiLayoutEmpty: "(none)",
+	moveToTop: "Move to top",
+	moveToBottom: "Move to bottom",
+	moveToLeft: "Move to left dock",
+	moveToRight: "Move to right dock",
+	sideDockCollapse: "Collapse dock",
+	sideDockExpand: "Expand dock",
 	pluginGrantsTitle: "Granted directories",
 	pluginGrantsHint:
 		"Plugins must ask before touching directories outside the workspace. Approved ones are listed here and can be revoked at any time.",
@@ -3165,6 +3455,18 @@ const en: Record<keyof typeof zh, string> = {
 	dshDefaultPresetDesc: "Preset for new chats; blank sessions can switch anytime, locked after the first message",
 	dshPresetUserNote:
 		"Custom presets come from the user preset directory (trusted like shell access); compositions using bare package names cannot mount here (known limitation)",
+	"preset.standard": "Full access",
+	"preset.minimal": "Minimal",
+	"preset.code": "Code development",
+	"preset.reader": "Read-only analysis",
+	"preset.ask": "Chat only",
+	"preset.standardDesc": "All available tools and extension capabilities (default)",
+	"preset.minimalDesc": "Keeps only bash and read; plugin tools, skill catalog and terminal guidance are hidden too",
+	"preset.codeDesc":
+		"Focused on reading, writing and running code (bash, read, edit, write, edit_soft); plugin tools and skill catalog are hidden too",
+	"preset.readerDesc":
+		"Keeps only read-only tools and forbids writes; plugin tools are hidden too (read/write unknown, handled conservatively)",
+	"preset.askDesc": "No-tools Q&A: the model never calls a tool; plugin tools and skill catalog are hidden too",
 	dshPerm: "Permissions",
 	dshPermReadOnly: "Read Only",
 	dshPermReadOnlyDesc: "Read files and run read-only commands; writes are always denied, no prompts",
@@ -3348,6 +3650,10 @@ const en: Record<keyof typeof zh, string> = {
 	quoteConversationShort: "Quote",
 	attachConversation: "Conversation reference: {name} (the AI reads it via conversation_read on demand)",
 	attachConversationShort: "conversation",
+	quoteSelection: "Quote",
+	quoteText: "Text quote",
+	quoteSource: "Source message: {id}",
+	removeQuote: "Remove quote",
 	/* Present files (present_files tool cards) */
 	presentOpenLocal: "Open locally",
 	presentMissing: "File missing or unreadable (moved, deleted, or outside the workspace?)",
@@ -3379,7 +3685,7 @@ const en: Record<keyof typeof zh, string> = {
 		"High-reliability structural patch tool (Hashline): line-anchored editing with 4-hex content hashes, syntactic AST block matching, and clipboard registers. Automatically attempts 3-way merge conflict recovery if files diverged.",
 	patchToolOffHint: "Disabled: AI falls back to basic string replacement via edit",
 	lspToolEnabledDesc:
-		"Native Language Server Protocol (LSP) tool: provides IDE-grade semantic code intelligence (definition jump, references, hover docstrings, and diagnostics) with cross-subagent daemon pooling.",
+		"Native Language Server Protocol (LSP) tool: IDE-grade semantic code intelligence (definition, references, hover, diagnostics, documentSymbol outline, read_symbol precise slicing, workspaceSymbol search, and cascade impact diagnostics). Multi-agent shared process pool with idle sleep, zero external dependencies.",
 	lspToolOffHint: "Disabled: AI cannot query LSP semantics and falls back to text search",
 	/* Tool definition dialog (tool-card right-click → show tool details; the definition comes from get_tool_info) */
 	toolInfoMenuLabel: "Show tool details",
@@ -3602,7 +3908,12 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
 	const t = useCallback<Translate>(
 		(key, vars) => {
 			// Pack strings are best-effort: missing keys fall back to English.
-			let str: string = PACK_REGISTRY[locale]?.strings[key] ?? (locale === "zh" ? zh[key] : en[key]);
+			let raw: string | undefined = PACK_REGISTRY[locale]?.strings[key];
+			// 假翻译防护（issue #502）：非中日语言包若包含中文汉字，说明该 key 尚未真正本地化，安全回退到英文
+			if (raw && locale !== "zh" && locale !== "ja" && /[\u4e00-\u9fff]/.test(raw)) {
+				raw = undefined;
+			}
+			let str: string = raw ?? (locale === "zh" ? zh[key] : en[key]);
 			if (vars) {
 				for (const [k, v] of Object.entries(vars)) {
 					str = str.replaceAll(`{${k}}`, String(v));

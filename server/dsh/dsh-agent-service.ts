@@ -25,8 +25,9 @@
  * BgServerTracker（后台任务）、TerminalManager（PTY）、uploads.ts。
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { writeJsonAtomicSync } from "../atomic-file.js";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { BgServerTracker } from "../bg-servers.js";
@@ -37,6 +38,7 @@ import {
 	normalizeToolWatchdogTimeoutMs,
 } from "../client-state.js";
 import { normalizeUiLayout } from "../client-state.js";
+import { PLAN_MODE_SYSTEM_PROMPT } from "../plan-mode.js";
 import { FilesService, workspacePath, desktopDirWire } from "../files-service.js";
 import { QuiesceRejectedError } from "../agent-service.js";
 
@@ -72,6 +74,7 @@ import type {
 } from "../protocol.js";
 import { launchOrigin, toServiceInfo } from "../launch-origin.js";
 import { DshRuntime, loadDeepSeekKey, type DshAgentPreset } from "./dsh-client.js";
+import { formatTextQuote, readTextQuote, messageTextWithQuotes } from "../text-quote.js";
 import {
 	DshStreamAccumulator,
 	assistantMessageEventToUiMessage,
@@ -542,6 +545,7 @@ export class DshClientSession {
 			// 直播帧能力跟着运行时进程走：重启后重新探测（换运行时版本也能回落到持久 assistant/chunk）。
 			conv.liveChunks = false;
 		}
+		this.emitConversations();
 		const now = Date.now();
 		if (now - this.runtimeRestart.windowStart > DshClientSession.RUNTIME_RESTART_WINDOW_MS) {
 			this.runtimeRestart.windowStart = now;
@@ -1100,13 +1104,8 @@ export class DshClientSession {
 				if (srcKind === "agent-instructions" || srcKind === "plugin") break;
 				const msg = userMessageEventToUiMessage(ev.data as never);
 				// 重复文本（DSH 有时重放同一用户消息）→ 去重。
-				const text = msg.content.map((c) => ("text" in c ? c.text : "")).join("");
-				if (
-					text &&
-					conv.messages.some(
-						(m) => m.role === "user" && m.content.map((c) => ("text" in c ? c.text : "")).join("") === text,
-					)
-				) {
+				const text = messageTextWithQuotes(msg);
+				if (text && conv.messages.some((m) => m.role === "user" && messageTextWithQuotes(m) === text)) {
 					break;
 				}
 				this.appendMessage(conv, msg);
@@ -1342,6 +1341,7 @@ export class DshClientSession {
 			conv.streaming = null;
 			this.refreshConversationTitle(conv);
 			this.scheduleSessionsRefresh();
+			this.emitConversations();
 		}
 		this.flushSnapshot();
 	}
@@ -1630,7 +1630,10 @@ export class DshClientSession {
 		const active = this.conv;
 		if (active.messages.length === 0 && active.terminals.list().length === 0) {
 			if (preset) await this.selectAgentPreset(preset);
-			else this.flushSnapshot();
+			else {
+				this.pushSettings();
+				this.flushSnapshot();
+			}
 			return true;
 		}
 		for (const conv of this.convs.values()) {
@@ -1661,6 +1664,7 @@ export class DshClientSession {
 		this.emitConversations();
 		this.emitGoalStatus();
 		this.pushTerminals();
+		this.pushSettings();
 		this.flushSnapshot();
 		void this.refreshActivePermission().catch(() => {});
 		return true;
@@ -1695,6 +1699,7 @@ export class DshClientSession {
 		this.emitConversations();
 		this.emitGoalStatus();
 		this.pushTerminals();
+		this.pushSettings();
 		this.flushSnapshot(true);
 		// 切会话带上权限值（cwd 变化走运行时重启，onStarted 会重拉）。
 		void this.refreshActivePermission().catch(() => {});
@@ -1712,6 +1717,19 @@ export class DshClientSession {
 	// -----------------------------------------------------------------------
 
 	async prompt(text: string, attachments?: PromptAttachment[], queue = false): Promise<void> {
+		const trimmedText = (text ?? "").trim();
+		const hasAttachments = Boolean(attachments && attachments.length > 0);
+		if (!trimmedText && !hasAttachments) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "发送已忽略：提示词为空且未附带文件或上下文引用。",
+				textEn: "Prompt ignored: text is empty and no attachments were provided.",
+			});
+			this.flushSnapshot();
+			return;
+		}
+
 		// 斜杠命令拦截（内置 NATIVE + 插件 registerCommand）；带附件时不拦截。
 		const parsed = parseSlash(text);
 		if (parsed && !attachments?.length) {
@@ -1774,7 +1792,7 @@ export class DshClientSession {
 		// 磁盘回放会话（switch_session）没有 live runtime session —— DSH 的
 		// JSON-RPC 面不支持恢复（id collision），自动 fork 新会话继续：把历史
 		// 作为上下文注入首条 prompt，前端提示。
-		if (conv.fromDisk && text.trim()) {
+		if (conv.fromDisk && (text.trim() || attachments?.some((a) => a.mode === "quote" && readTextQuote(a.quote)))) {
 			const histText = this.histToContext(conv);
 			conv = this.forkConversation(conv);
 			if (histText.trim()) {
@@ -1889,6 +1907,12 @@ export class DshClientSession {
 						: []),
 				],
 				timestamp: Date.now(),
+				details: {
+					quotes: (attachments ?? [])
+						.filter((a) => a.mode === "quote")
+						.map((a) => readTextQuote(a.quote))
+						.filter((q) => q !== null),
+				},
 			};
 			this.appendMessage(conv, optimistic);
 			this.flushSnapshot();
@@ -1921,7 +1945,7 @@ export class DshClientSession {
 	private histToContext(conv: DshConversation): string {
 		return conv.messages
 			.map((m) => {
-				const blocks = m.content.map((c) => ("text" in c ? c.text : "")).join("\n");
+				const blocks = messageTextWithQuotes(m);
 				return blocks ? `[${m.role === "assistant" ? "AI" : m.role}] ${blocks}` : "";
 			})
 			.filter(Boolean)
@@ -1957,10 +1981,7 @@ export class DshClientSession {
 		for (let i = conv.messages.length - 1; i >= 0; i--) {
 			const m = conv.messages[i]!;
 			if (m.role === "user") {
-				lastUser = m.content
-					.map((c) => ("text" in c ? c.text : ""))
-					.join("")
-					.trim();
+				lastUser = messageTextWithQuotes(m).trim();
 				if (lastUser) break;
 			}
 		}
@@ -1994,6 +2015,18 @@ export class DshClientSession {
 		const lang = this.getLang();
 		if (!Array.isArray(attachments)) return blocks;
 		for (const a of attachments) {
+			if (a.mode === "quote") {
+				const quote = readTextQuote(a.quote);
+				if (quote) blocks.push({ type: "text", text: formatTextQuote(quote) });
+				else
+					this.emit({
+						type: "notice",
+						level: "warning",
+						text: "引用内容无效，请重新选择文字",
+						textEn: "Select the text again to add a quote.",
+					});
+				continue;
+			}
 			const resolved = a.path ? workspacePath(this.cwd, a.path) : null;
 			if (a.imageData) {
 				// 视觉桥：base64 图片 → attachment store → 真 image 块（模型可看图）。
@@ -2102,6 +2135,7 @@ export class DshClientSession {
 		const conv = this.conv;
 		conv.isStreaming = false;
 		conv.streaming = null;
+		this.emitConversations();
 		// 手动停止 → 清当前会话的 DSH 原生目标（半成品运行不该继续被轮次驱动）。
 		// 旧进程还活着，先 goal/clear 落盘，再重启运行时。
 		if (conv.dsGoal || conv.goal.goal) {
@@ -2451,6 +2485,7 @@ export class DshClientSession {
 			this.activeId = conv.id;
 			this.emitConversations();
 			this.pushTerminals();
+			this.pushSettings();
 			this.flushSnapshot(true);
 		} catch (err) {
 			this.emit({
@@ -2529,10 +2564,10 @@ export class DshClientSession {
 	// -----------------------------------------------------------------------
 
 	async pushProjects(): Promise<void> {
-		const saved = this.stateStore.get(this.clientId);
+		const recent = await this.stateStore.getRecentProjects(this.clientId);
 		const removedKeys = new Set(this.stateStore.getRemovedProjects(this.clientId).map(normalizePathKey));
 		const projects = new Map<string, number>();
-		for (const p of saved.projects ?? []) {
+		for (const p of recent) {
 			if (!removedKeys.has(normalizePathKey(p.path))) {
 				projects.set(p.path, p.lastUsed);
 			}
@@ -2899,6 +2934,10 @@ export class DshClientSession {
 			// DSH 无「AI 生成提交信息」（scm_commitmsg 分发处直接报错），保协议完整。
 			scmCommitMsgPromptMode: "append",
 			scmCommitMsgPrompt: "",
+			// DSH 引擎不渲染计划按钮（无 customTools 注册面），保协议完整。
+			planModePromptMode: "append",
+			planModePrompt: "",
+			planModeDefaultPrompt: PLAN_MODE_SYSTEM_PROMPT,
 			reviewPrompt: this.settings.reviewPrompt,
 			reviewDisabledSkills: [],
 			disabledPlugins: this.settings.disabledPlugins,
@@ -3174,6 +3213,7 @@ export class DshClientSession {
 			}
 			conv.agentPreset = res.preset ?? target;
 			this.emitConversations();
+			this.pushSettings();
 			this.flushSnapshot();
 		} catch (err) {
 			this.emit({
@@ -3313,6 +3353,22 @@ export class DshClientSession {
 				textEn: `Permission switch failed: ${(err as Error).message}`,
 			});
 		}
+	}
+
+	/**
+	 * 审查者模式：DSH 不支持（无 customTools 注册面 → 工具硬闸门无处可挂，
+	 * 自动路由也没有可派发的会话通道）。明确回报而不是静默失败 ——
+	 * “点了没反应”比“用不了”更让人怀疑是不是页面坏了。
+	 */
+	async setDelegateMode(enabled: boolean): Promise<void> {
+		if (!enabled) return;
+		this.emit({
+			type: "notice",
+			level: "warning",
+			text: "审查者模式仅支持 pi 引擎（DSH 没有工具硬闸门的注册面），未开启。",
+			textEn: "Reviewer mode needs the pi engine (DSH has no tool-gate registration surface); not enabled.",
+		});
+		this.flushSnapshot();
 	}
 
 	async savePreset(name: string): Promise<void> {
@@ -3536,6 +3592,8 @@ export class DshClientSession {
 			reviewModel?: string;
 			maxRounds?: number;
 			locked?: boolean;
+			/** 目标模式 2.0 的委托执行仅 pi 引擎支持，DSH 忽略这个字段。 */
+			execModel?: string;
 		},
 	): Promise<void> {
 		if (goal.trim() === "") {
@@ -3771,7 +3829,7 @@ export class DshClientSession {
 			`# User's raw requirement`,
 			draft,
 			``,
-			`Use the ask_user_question tool to ask the user focused questions to pin down the essential, ambiguous details. Ask ONE question at a time, usually 2 to 4 questions total: what exactly to build/do, scope boundaries (what NOT to do), acceptance criteria / done-definition, and any constraints (style, performance, environment). Prefer multiple-choice questions (options) when you can offer clear choices.`,
+			`Use the ask_user_question tool to ask the user focused questions to pin down the essential, ambiguous details. Ask ONE question at a time, strictly 1 to 3 questions total: what exactly to build/do, scope boundaries (what NOT to do), acceptance criteria / done-definition, and any constraints (style, performance, environment). Prefer 2 to 4 mutually exclusive options with the recommended choice placed FIRST, and explain the tradeoff in description.`,
 			`Once you have enough to write an unambiguous, reviewable goal, STOP asking and reply with EXACTLY this format and nothing else (no preamble, no bullets):`,
 			`GOAL: <one concrete, verifiable sentence describing the deliverable and its acceptance criteria>`,
 			`Do NOT call create_goal or update_goal — just output the GOAL: line. If the user cancels or stops answering, still produce a sensible best-effort GOAL from what you already know.`,
@@ -3789,7 +3847,13 @@ export class DshClientSession {
 		return "";
 	}
 
-	async setGoalPrefs(opts?: { reviewModel?: string; maxRounds?: number; locked?: boolean }): Promise<void> {
+	async setGoalPrefs(opts?: {
+		reviewModel?: string;
+		maxRounds?: number;
+		locked?: boolean;
+		/** 目标模式 2.0 的委托执行仅 pi 引擎支持，DSH 忽略（GoalBar 对 DSH 隐藏该控件）。 */
+		execModel?: string;
+	}): Promise<void> {
 		const g = this.conv.goal;
 		if (opts?.reviewModel !== undefined) g.reviewModel = opts.reviewModel;
 		if (opts?.maxRounds !== undefined) g.maxRounds = opts.maxRounds;
@@ -4087,8 +4151,7 @@ export class DshClientSession {
 				/* new file */
 			}
 			auth[this.normalizeDshProvider(provider)] = { type: "api_key", key };
-			mkdirSync(dirname(authPath), { recursive: true });
-			writeFileSync(authPath, JSON.stringify(auth, null, 2) + "\n");
+			writeJsonAtomicSync(authPath, auth);
 			this.emit({
 				type: "notice",
 				level: "info",
@@ -4117,7 +4180,7 @@ export class DshClientSession {
 				return;
 			}
 			delete auth[pid];
-			writeFileSync(authPath, JSON.stringify(auth, null, 2) + "\n");
+			writeJsonAtomicSync(authPath, auth);
 			this.emit({
 				type: "notice",
 				level: "info",
@@ -4354,11 +4417,11 @@ export class DshClientSession {
 			const fresh = this.addConversation(newSessionId, this.cwd, false);
 			// 回放编辑点之前的消息（作为会话初始上下文：DSH 无 seed 机制，v1 用
 			// 简化——直接把历史作为一条提示词说明附上）。
-			const head = conv.messages.slice(0, idx + 1);
+			const head = conv.messages.slice(0, idx);
 			// 把编辑前的对话内容写进新会话的 prompt（尽力保留上下文）。
 			const contextNote = head
 				.map((m) => {
-					const blocks = m.content.map((c) => ("text" in c ? c.text : "")).join("\n");
+					const blocks = messageTextWithQuotes(m);
 					return `[${m.role}] ${blocks}`;
 				})
 				.join("\n");
@@ -4472,6 +4535,7 @@ export class DshClientSession {
 			// 文件树跟随新项目（服务端原生 watcher 自动重挂）。
 			void this.listFiles(undefined);
 			this.pushTerminals();
+			this.pushSettings();
 			this.flushSnapshot(true);
 		} catch (err) {
 			this.emit({

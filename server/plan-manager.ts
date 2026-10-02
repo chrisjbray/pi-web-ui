@@ -65,11 +65,19 @@ export class PlanManager {
 		const currentStep = current.steps[idx];
 		const nextStatus = patch.status && VALID_STATUSES.has(patch.status) ? patch.status : currentStep.status;
 
+		// patch 里剥掉 id：步骤 id 是 activeStepId / first-match 推进的锚点，
+		// 被改掉会让 activeStepId 悬空（指向不存在的步骤）。
+		const { id: _ignored, ...rest } = patch;
 		const nextStep: PlanStep = {
 			...currentStep,
-			...patch,
+			...rest,
 			status: nextStatus,
+			// title/description 与 setPlan 同口径截断（200/1000），防超长内容撑爆快照。
+			title: String(rest.title ?? currentStep.title ?? "").slice(0, 200),
 		};
+		const description = String(rest.description ?? currentStep.description ?? "").slice(0, 1000);
+		if (description) nextStep.description = description;
+		else delete nextStep.description;
 
 		const nextSteps = [...current.steps];
 		nextSteps[idx] = nextStep;
@@ -81,6 +89,71 @@ export class PlanManager {
 			// 当前活动步骤已完成或失败，自动推进到下一个待执行步骤
 			const nextPending = nextSteps.find((s) => s.status === "pending" || s.status === "in_progress");
 			nextActive = nextPending ? nextPending.id : null;
+		}
+
+		const nextState: PlanState = {
+			steps: nextSteps,
+			activeStepId: nextActive,
+			updatedAt: Date.now(),
+		};
+
+		this.plans.set(conversationId, nextState);
+		return nextState;
+	}
+
+	/** 增量删除单个步骤。 */
+	deleteStep(conversationId: string, stepId: string): PlanState | null {
+		const current = this.plans.get(conversationId);
+		if (!current) return null;
+
+		const idx = current.steps.findIndex((s) => s.id === stepId);
+		if (idx === -1) return current;
+
+		const nextSteps = current.steps.filter((s) => s.id !== stepId);
+		let nextActive = current.activeStepId;
+		if (current.activeStepId === stepId) {
+			const nextPending = nextSteps.find((s) => s.status === "pending" || s.status === "in_progress");
+			nextActive = nextPending ? nextPending.id : null;
+		}
+
+		const nextState: PlanState = {
+			steps: nextSteps,
+			activeStepId: nextActive,
+			updatedAt: Date.now(),
+		};
+
+		this.plans.set(conversationId, nextState);
+		return nextState;
+	}
+
+	/** 增量新增步骤。 */
+	addStep(conversationId: string, step: PlanStep, afterStepId?: string): PlanState | null {
+		const current = this.plans.get(conversationId);
+		const existingSteps = current?.steps ?? [];
+
+		const normalized: PlanStep = {
+			id: String(step.id ?? `step-${Date.now()}`),
+			title: String(step.title ?? "").slice(0, 200),
+			status: step.status && VALID_STATUSES.has(step.status) ? step.status : "pending",
+		};
+		const description = String(step.description ?? "").slice(0, 1000);
+		if (description) normalized.description = description;
+
+		let nextSteps: PlanStep[];
+		if (afterStepId) {
+			const idx = existingSteps.findIndex((s) => s.id === afterStepId);
+			if (idx !== -1) {
+				nextSteps = [...existingSteps.slice(0, idx + 1), normalized, ...existingSteps.slice(idx + 1)];
+			} else {
+				nextSteps = [...existingSteps, normalized];
+			}
+		} else {
+			nextSteps = [...existingSteps, normalized];
+		}
+
+		let nextActive = current?.activeStepId ?? null;
+		if (!nextActive && normalized.status === "in_progress") {
+			nextActive = normalized.id;
 		}
 
 		const nextState: PlanState = {

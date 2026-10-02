@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
 	FiActivity,
 	FiCheck,
+	FiCopy,
 	FiCpu,
 	FiDownload,
 	FiPlus,
@@ -67,6 +68,14 @@ interface ModelConfigModalProps {
 	refreshBuiltinResult?: {
 		reqId: number;
 		ok: boolean;
+		error?: string;
+	} | null;
+	/** Last refresh_provider_models result (saved-provider list refresh). */
+	refreshProviderResult?: {
+		reqId: number;
+		ok: boolean;
+		added?: number;
+		total?: number;
 		error?: string;
 	} | null;
 	/** Last append_builtin_model result (one model appended to a built-in
@@ -209,7 +218,10 @@ interface Draft {
 	name: string;
 	api: string;
 	baseUrl: string;
+	/** 输入缓冲：服务端不再下发明文 apiKey，非空才随 save_model_config 上送。 */
 	apiKey: string;
+	/** 服务端是否已保存密钥（决定 placeholder 与留空语义：留空 = 保持不变）。 */
+	hasApiKey: boolean;
 	authHeader: boolean;
 	models: DraftModel[];
 }
@@ -229,6 +241,7 @@ const emptyDraft = (): Draft => ({
 	api: "openai-completions",
 	baseUrl: "",
 	apiKey: "",
+	hasApiKey: false,
 	authHeader: true,
 	models: [emptyModel()],
 });
@@ -239,7 +252,8 @@ function toDraft(p: UiProviderConfig): Draft {
 		name: p.name ?? "",
 		api: p.api ?? "openai-completions",
 		baseUrl: p.baseUrl ?? "",
-		apiKey: p.apiKey ?? "",
+		apiKey: "",
+		hasApiKey: p.hasApiKey ?? false,
 		authHeader: p.authHeader ?? false,
 		models: (p.models.length ? p.models : [emptyModel()]).map((m) => ({
 			id: m.id,
@@ -441,6 +455,7 @@ export function ModelConfigModal({
 	enrichModelsProgress: _enrichModelsProgress,
 	cloneProviderResult,
 	refreshBuiltinResult,
+	refreshProviderResult,
 	appendBuiltinResult,
 	defaultModel,
 	onClose,
@@ -474,6 +489,30 @@ export function ModelConfigModal({
 	const [addKeys, setAddKeys] = useState<Record<string, string>>({});
 	const [addKeyNames, setAddKeyNames] = useState<Record<string, string>>({});
 	const [addKeyBusy, setAddKeyBusy] = useState<string | null>(null);
+	// 审查 #13：添加密钥改为事件驱动收尾 —— 服务端 addProviderKey 成功后会主动
+	// listProviders()/listProviderKeys()（见 server/model-admin.ts），providerKeys
+	// 回包里对应 provider 的键列表引用变化即视为确认；1.5s 盲刷既有竞态（慢时
+	// 提前收尾丢更新）也从不校验结果。定时器只作 10s 超时兜底（复位 busy、
+	// 保留输入供重试，重复密钥/失败时服务端不推新列表正好落到这里）。
+	const addKeyPrevKeysRef = useRef(providerKeys);
+	const addKeyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	useEffect(() => {
+		const busy = addKeyBusy;
+		if (busy && providerKeys[busy] !== addKeyPrevKeysRef.current[busy]) {
+			setAddKeyBusy(null);
+			setAddKeys((k) => ({ ...k, [busy]: "" }));
+			setAddKeyNames((n) => ({ ...n, [busy]: "" }));
+			if (addKeyTimerRef.current) clearTimeout(addKeyTimerRef.current);
+		}
+		addKeyPrevKeysRef.current = providerKeys;
+	}, [providerKeys, addKeyBusy]);
+	// 卸载清理兜底定时器（审查 #5 同源）。
+	useEffect(
+		() => () => {
+			if (addKeyTimerRef.current) clearTimeout(addKeyTimerRef.current);
+		},
+		[],
+	);
 
 	// 获取模型列表状态
 	const [fetching, setFetching] = useState(false);
@@ -511,6 +550,41 @@ export function ModelConfigModal({
 	const [_batch, setBatch] = useState<Draft[] | null>(null);
 	const [_batchKey, setBatchKey] = useState("");
 	const [_addKeyDraft, setAddKeyDraft] = useState<Draft | null>(null);
+
+	/** Saved-provider list refresh: in-flight flags per providerId + reqId echo. */
+	const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
+	const refreshReqId = useRef(0);
+	const handledRefreshReq = useRef(0);
+	/** Clone built-in → custom draft: in-flight flag + reqId echo. */
+	const [cloning, setCloning] = useState<string | null>(null);
+	const cloneReqId = useRef(0);
+	const handledCloneReq = useRef(0);
+
+	/** Re-fetch the SAVED provider's model list server-side (credentials stay
+	 *  on the server) and merge into its models.json entry. */
+	const refreshProvider = (providerId: string) => {
+		if (refreshing[providerId]) return;
+		const reqId = ++refreshReqId.current + Date.now();
+		setRefreshing((m) => ({ ...m, [providerId]: true }));
+		appSend({ type: "refresh_provider_models", providerId, reqId });
+	};
+
+	useEffect(() => {
+		if (!refreshProviderResult || refreshProviderResult.reqId === handledRefreshReq.current) return;
+		handledRefreshReq.current = refreshProviderResult.reqId;
+		setRefreshing({});
+	}, [refreshProviderResult]);
+
+	/** Ask the server to copy a built-in provider (baseUrl + model catalog) into an editable custom draft. */
+	const cloneBuiltin = (p: ProviderStatus) => {
+		if (cloning) return;
+		setCloning(p.id);
+		const reqId = ++cloneReqId.current + Date.now();
+		const ok = appSend({ type: "clone_provider", provider: p.id, reqId });
+		if (!ok) {
+			setCloning(null);
+		}
+	};
 
 	// 打开弹窗时刷新数据
 	useEffect(() => {
@@ -620,16 +694,19 @@ export function ModelConfigModal({
 
 	// 处理克隆结果
 	useEffect(() => {
-		if (!cloneProviderResult) return;
+		if (!cloneProviderResult || cloneProviderResult.reqId === handledCloneReq.current) return;
+		handledCloneReq.current = cloneProviderResult.reqId;
+		setCloning(null);
 		if (cloneProviderResult.ok) {
 			const cs = (cloneProviderResult as { configs?: UiProviderConfig[] }).configs;
 			if (cs && cs.length > 1) {
-				setBatch(cs.map((c) => toDraft({ ...c, apiKey: "" })));
+				// 克隆草稿不带凭据（服务端保证），apiKey 缓冲天然为空、hasApiKey=false。
+				setBatch(cs.map((c) => toDraft(c)));
 				setBatchKey("");
 				return;
 			}
 			if (cloneProviderResult.config) {
-				setAddKeyDraft(toDraft({ ...cloneProviderResult.config, apiKey: "" }));
+				setAddKeyDraft(toDraft(cloneProviderResult.config));
 			}
 		}
 	}, [cloneProviderResult]);
@@ -651,6 +728,8 @@ export function ModelConfigModal({
 			reqId,
 			baseUrl: base,
 			apiKey: editing.apiKey.trim() || undefined,
+			// 留空且已存有密钥：带上 providerId 让服务端用保存的密钥探测
+			...(editing.apiKey.trim() ? {} : editing.hasApiKey ? { providerId: editing.providerId.trim() } : {}),
 			authHeader: editing.authHeader,
 			api: editing.api,
 		});
@@ -674,6 +753,8 @@ export function ModelConfigModal({
 			reqId,
 			baseUrl: base,
 			apiKey: editing.apiKey.trim() || undefined,
+			// 留空且已存有密钥：带上 providerId 让服务端用保存的密钥探测
+			...(editing.apiKey.trim() ? {} : editing.hasApiKey ? { providerId: editing.providerId.trim() } : {}),
 			authHeader: editing.authHeader,
 			api: editing.api,
 		});
@@ -737,6 +818,7 @@ export function ModelConfigModal({
 				api: preset.api,
 				baseUrl: preset.baseUrl,
 				apiKey: prev?.apiKey || "",
+				hasApiKey: prev?.hasApiKey ?? false,
 				authHeader: preset.authHeader,
 				models: prev?.models.length ? prev.models : [emptyModel()],
 			};
@@ -765,7 +847,9 @@ export function ModelConfigModal({
 			name: editing.name.trim() || undefined,
 			api: editing.api.trim() || undefined,
 			baseUrl: editing.baseUrl.trim() || undefined,
-			apiKey: editing.apiKey.trim() || undefined,
+			// 明文只在用户真的输入了新值时上送；留空 = 不带字段 = 服务端保留旧值
+			//（协议层面显式空串仍是"清除"，但表单留空语义是"保持不变"）。
+			...(editing.apiKey.trim() ? { apiKey: editing.apiKey.trim() } : {}),
 			authHeader: editing.authHeader || undefined,
 			models,
 		};
@@ -808,13 +892,12 @@ export function ModelConfigModal({
 			apiKey: key,
 			name: (addKeyNames[p.id] ?? "").trim() || undefined,
 		});
-		setTimeout(() => {
-			setAddKeyBusy(null);
-			setAddKeys((k) => ({ ...k, [p.id]: "" }));
-			setAddKeyNames((n) => ({ ...n, [p.id]: "" }));
-			appSend({ type: "list_providers" });
-			appSend({ type: "list_provider_keys" });
-		}, 1500);
+		// 10s 超时兜底：正常收尾由 providerKeys 回包驱动（见上方 effect）；
+		// 超时只复位 busy，不清输入 —— 用户可直接重试。
+		if (addKeyTimerRef.current) clearTimeout(addKeyTimerRef.current);
+		addKeyTimerRef.current = setTimeout(() => {
+			setAddKeyBusy((cur) => (cur === p.id ? null : cur));
+		}, 10000);
 	};
 
 	const activateKey = (providerId: string, keyName: string) => {
@@ -1072,17 +1155,28 @@ export function ModelConfigModal({
 									<div className="studio-card-title">
 										<span>{editing.providerId ? `编辑服务商：${editing.providerId}` : "新建自定义服务商"}</span>
 										{editing.providerId && providers.some((p) => p.providerId === editing.providerId) && (
-											<button
-												type="button"
-												className="iconbtn danger sm"
-												title="删除此服务商"
-												onClick={() => {
-													const target = providers.find((p) => p.providerId === editing.providerId);
-													if (target) removeProvider(target);
-												}}
-											>
-												<FiTrash2 />
-											</button>
+											<>
+												<button
+													type="button"
+													className="iconbtn sm"
+													title={t("refreshModels")}
+													disabled={refreshing[editing.providerId]}
+													onClick={() => refreshProvider(editing.providerId)}
+												>
+													<FiRefreshCw className={refreshing[editing.providerId] ? "spin" : ""} />
+												</button>
+												<button
+													type="button"
+													className="iconbtn danger sm"
+													title="删除此服务商"
+													onClick={() => {
+														const target = providers.find((p) => p.providerId === editing.providerId);
+														if (target) removeProvider(target);
+													}}
+												>
+													<FiTrash2 />
+												</button>
+											</>
 										)}
 									</div>
 									<div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1177,7 +1271,8 @@ export function ModelConfigModal({
 											type="password"
 											value={editing.apiKey}
 											onChange={(e) => setEditing({ ...editing, apiKey: e.target.value })}
-											placeholder={t("apiKeyHint")}
+											// 明文不再回显：已保存时留空 = 保持不变
+											placeholder={editing.hasApiKey ? t("apiKeySavedHint") : t("apiKeyHint")}
 										/>
 									</label>
 									<label className="field check" style={{ alignSelf: "center", paddingTop: 16 }}>
@@ -1435,6 +1530,15 @@ export function ModelConfigModal({
 												{p.source && !p.configured && <span className="auth-badge dim">{p.source}</span>}
 											</div>
 											<div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+												<button
+													type="button"
+													className="btn sm"
+													title={t("cloneProvider")}
+													disabled={cloning === p.id}
+													onClick={() => cloneBuiltin(p)}
+												>
+													<FiCopy /> {t("cloneProvider")}
+												</button>
 												<button
 													type="button"
 													className="btn sm"

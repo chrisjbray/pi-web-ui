@@ -32,12 +32,18 @@ export function ToolApprovalDialog({ approval }: ToolApprovalDialogProps) {
 
 	useEffect(() => {
 		if (approval) {
-			try {
-				setParamsText(JSON.stringify(approval.params ?? {}, null, 2));
-				setParseError(null);
-			} catch {
-				setParamsText(String(approval.params ?? ""));
+			// 审查 #8：显示与提交保持同一形态 —— 对象参数 pretty JSON（提交时 parse），
+			// 空/缺失参数统一显示 "{}"（提交即 {}），字符串等原始值原样展示（提交时
+			// 原样回传），避免 JSON.stringify 给字符串套引号造成「看到的不等于提交的」。
+			const p = approval.params;
+			if (p !== null && p !== undefined && typeof p === "object") {
+				setParamsText(JSON.stringify(p, null, 2));
+			} else if (p === null || p === undefined) {
+				setParamsText("{}");
+			} else {
+				setParamsText(String(p));
 			}
+			setParseError(null);
 		}
 	}, [approval]);
 
@@ -63,8 +69,15 @@ export function ToolApprovalDialog({ approval }: ToolApprovalDialogProps) {
 
 	const handleEditAndRun = () => {
 		try {
+			// 审查 #8：提交形态与显示形态一一对应。服务端把 editedParams 当 unknown
+			// 直接作为 effectiveParams 执行（server/agent-service.ts `res.editedParams ?? params`），
+			// 字符串原样回传、空参数提交 {} 均兼容。
+			const p = approval.params;
 			let edited: unknown;
-			if (typeof approval.params === "object" && approval.params !== null) {
+			if (p !== null && p !== undefined && typeof p === "object") {
+				edited = JSON.parse(paramsText);
+			} else if (p === null || p === undefined) {
+				// 显示为 "{}"（JSON 对象），未改动提交即 {}；用户改动按解析结果提交。
 				edited = JSON.parse(paramsText);
 			} else {
 				edited = paramsText;
@@ -122,7 +135,10 @@ export function ToolApprovalDialog({ approval }: ToolApprovalDialogProps) {
 							}}
 						>
 							<div style={{ fontWeight: 600, marginBottom: 2 }}>{t("toolApprovalRiskAlert")}:</div>
-							<div>{approval.reason || approval.reasonEn}</div>
+							{/* 文案随界面语言定：服务端两种语言都带（reason/reasonEn），中文界面用
+							    reason、其它语言用 reasonEn。之前写的是 `reason || reasonEn`，
+							    reason 恒存在 → 非中文界面也显示中文风险说明。 */}
+							<div>{locale === "zh" ? approval.reason || approval.reasonEn : approval.reasonEn || approval.reason}</div>
 							{approval.category && (
 								<div style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}>
 									{t("toolApprovalCategory")}：{locale === "zh" ? approval.category.label : approval.category.labelEn}

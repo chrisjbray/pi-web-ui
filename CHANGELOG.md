@@ -10,10 +10,132 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **系统提示词不再吞掉其他扩展的增补** — 自定义了提示词模板/覆盖、或使用非 standard 预设、或禁用了工具时，内置的提示词组装曾整体替换该轮系统提示词，把别的扩展前置/后置注入的内容（如 `<invoked_skill>` 块）一起丢掉。现在会先把扩展的首尾增补摘出来，渲染完再原样套回去；子代理模板 replace 同样不再丢掉前置增补。
+- **已钉住的对话跨服务重启持久化**（#433）— 钉住状态持久化至 `client-state.json`，服务重启后自动恢复常驻运行列表，历史会话列表同步展示 📌 置顶标记并支持右键切换钉住状态。
+- **计划模式净室执行（Clean Handoff）原子化**（#434）— 修复净室执行前端四发消息由于服务端异步分发导致的竞态，提供原子协议通道 `plan_clean_handoff`，确保旧会话计划闸门关闭、新隔离会话原子就绪并承接计划步骤与目标后再发起实施。
+- **压缩历史展开区只读防护与序号对齐**（#437）— 压缩历史展开视窗右键菜单禁用派生分支、回滚与生成长图等写/非会话操作，序列化复用全局序号生成器，杜绝序号重计与碰撞。
+- **PlanBoard 任务看板并发编辑防范**（#444）— 看板步骤状态切换、内容修改、增量新增与删除改走单步骤级增量协议（`plan_step_update`、`plan_step_delete`、`plan_step_add`），解决快速连点与模型流式更新互相整组清改问题，前端即时响应 `plan_updated` 广播。
+- **多轮压缩历史折叠卡片链式展示与错误本地化**（#448）— 多次压缩的会话按分支链完整展示前序历史压缩卡片，各卡片按链式切分边界独立展开早期折叠内容；优化压缩记录未找到时的错误提示并接入多语言。
+- **第三方 subagent 扩展同名工具透传支持**（#481）— 修复内置 `subagent` 工具与第三方扩展（如 `pi-subagents`）同名冲突问题；当第三方扩展注册了同名工具且内置 `subagent` 被关闭/禁用时，自动透传扩展工具，不再强制顶替或剔除。
+- **作为 Pi 扩展包安装时宿主 SDK 识别与加载器告警修复**（#482）— 声明可选 `peerDependencies` 解决扩展加载器告警；`/webui` 子进程显式透传宿主 SDK 路径并加载 `resolve-global-sdk` 钩子，使服务准确跟随宿主 SDK 版本。
+- **恢复模型管理中的第二把密钥与刷新模型功能**（#456）— 恢复模型管理面板中克隆内置提供商添加第二把密钥与刷新已存提供商模型列表的功能与按钮。
+- **防止会话交接记录与展开历史无界内存增长**（#465）— `subagentHandoffs` 增加上限容量保护，前端被折叠压缩历史展开缓存改用 LRU 淘汰机制，防止长时间会话内存泄漏。
+- **目标审查循环状态机健壮性强化**（#464, #457）— `goal_ask` 超时定时器保证在 `finally` 中清理，避免残留定时器误杀后续调研；`stopDelegated` 异步等待执行者完全移出，消除容量误判；会话过户时主动唤醒等待者并清理目标审查阻塞态。
+- **工具参数 TypeBox 约束与运行时一致性校准**（#462）— `eval` 工具在执行 TypeScript 代码时启用原生类型剥离（`--experimental-strip-types`）；`lsp`、`terminals`、`compact_context`、`patch` 工具参数范围严格钳制与上下限校准。
+
+### Added
+
+- **聊天内容引用** — 选中消息中的文字或代码后点击引用，将原文添加到输入框。支持展开、移除、多条引用和重复引用去重，发送后的引用可在历史消息中查看，编辑重问时保留。
+- **侧边贴边悬浮栏与按钮上下左右移动** — 顶栏、底栏条目支持右键移至顶部、底部、左侧侧边栏、右侧侧边栏，支持左右侧边停靠栏折叠展开与偏好持久化。
+
 <!-- auto-i18n:start -->
 ### i18n
 
-- 前端新增 key（5）：`piCoreSplitRun`、`piSdkSplitNote`、`piSdkBundledNote`、`installGlobalEngineBtn`、`installGlobalEngineTabTitle`
+- 前端新增 key（20）：`openInNewTab`、`clickToCloseImage`、`compactedHistoryNotFound`、`uiLayoutSidebarLeft`、`uiLayoutSidebarRight`、`uiLayoutPosition`、`uiLayoutPosTop`、`uiLayoutPosBottom`、`uiLayoutPosLeft`、`uiLayoutPosRight`、`moveToTop`、`moveToBottom`、`moveToLeft`、`moveToRight`、`sideDockCollapse`、`sideDockExpand`、`quoteSelection`、`quoteText`、`quoteSource`、`removeQuote`
+- 前端英文变更（1）：`browserControlExample2`
+- 服务端文案变更（2）：`markers.todo.dep.blocks.updated`、`subagents.wait.pending`
+<!-- auto-i18n:end -->
+
+## [0.97.0] — 2026-09-26
+
+### Added
+
+- **左侧边栏历史会话置顶（#388）** —— 支持置顶/取消置顶历史会话，置顶项目始终固定在会话历史列表顶端，配合本地客户端状态持久化，多窗口即时同步；优化磁盘扫描算法，仅按需快速探测头部读取元数据，大幅提升大历史会话加载响应速度。回归：`tests/unit/client-state-recent-projects.test.ts`。
+
+- **规划门禁与净室交接范式升级（#389）** —— 吸收主流规划与看板范式（DSH / narumitw / plannotator），全面升级「计划与目标」联动架构：
+  - **只读规划门禁（Plan Gate）与状态机**：开启计划模式后自动剥离写类工具及旁路工具，物理级杜绝代码倾倒；
+  - **净室新会话交接（Clean Handoff）**：支持一键将规划好的目标与步骤交接至全新隔离会话中施工，避免长推理上下文污染；
+  - **可视化编辑与导出**：任务看板支持 Markdown 一键复制/导出，步骤支持内联编辑、新增、删除与状态切换；
+  - **目标审查深度联动**：审查指令自动附带任务看板步骤推进状态，核验计划真实完成度。
+    回归：`tests/plan-mode-test.mjs`、`tests/unit/goal-delegated.test.ts`。
+
+- **对话可「钉住」常驻运行列表** —— 左栏「运行的对话」右键新增「钉住」：被钉的对话切到别的对话也不释放运行时（空闲、无存活终端、无后台任务时同样保留，优先级高于「打开未继续即移出」等所有自动规则），直到显式移出或强行关闭；取消钉住后立即恢复原有释放策略。进程内有效、不落盘。回归：`tests/unit/conv-pin.test.ts`、`tests/unit/wait-subscription-scan.test.ts`、`tests/conv-pin-browser-test.mjs`（真浏览器右键 → 钉住/取消钉住 → 切走仍留存 / 对照移出）。
+
+- **上下文压缩后支持展开/查看被折叠的历史对话（#398）** —— 严格解耦「UI 展示流」与「LLM 推理视窗」：触发压缩（Compaction）后，在 `CompactionCard` 底部提供「展开查看被折叠的历史」操作栏，按需（On-demand）从会话 DAG 祖先链中还原被该节点折叠的原始历史消息（含提问、回答与工具输出），并以只读流视窗呈现，不占用后续推理 Token，解决长对话截断后无法回溯方案与日志的痛点。回归：`tests/unit/compacted-history.test.ts`。
+
+- **粘贴任意文件直接附加** —— 在输入框粘贴从文件管理器复制的文件（文本、PDF、压缩包等）会像拖拽一样变成待发附件，不再只能贴图片：粘贴与拖拽现在共用同一条分流逻辑（图片走视觉管线并保留 text-only 模型的拦截，其余走 fileData 上传，20MB 上限同口径），纯文本粘贴完全不受影响。回归：`tests/unit/clipboard-files.test.ts` + `tests/file-paste-browser-test.mjs`。
+
+- **语音输入可主动选识别方式（#383）** —— 麦克风浮层新增常驻的「切换识别方式」面板（浏览器联网识别 / 本地 Whisper / 远端接口），选中即用并写回插件设置，下次点 🎤 直接走这一档；「转写引擎」设为本地或远端时，点 🎤 直接走对应引擎（本地没装就直接弹一键安装，不必再干等浏览器联网失败几秒）。
+
+### Fixed
+
+- **任务看板 / 目标条窄屏排版协调** — 手机宽度下任务看板的「任务看板」「0/6 (0%)」被当前步骤挤成逐字竖排（行内 flex 子项默认 `min-width: auto` 且允许收缩，CJK 逐字断行），目标条的「最大轮数」标签同样竖排、「锁定：应用到后续所有回合」被挤成两行。现改为：看板标题与计数钉死不收缩、当前步骤 chip 放不下就整块换到第二行（宽屏仍同行）；目标条输入框独占一行、按钮组换行右对齐，偏好行允许整块换行、模型长 id 断行不外溢，锁定说明与标签不再被压扁。回归：`tests/unit/text-wrap.test.ts`、`tests/unit/css-tokens.test.ts`、`tests/chat-column-align-test.mjs`。
+- **本地语音运行时「装成功却报没装上」（#383）** —— 修复安装本地 Whisper 后仍报「npm install 没跑通」：Node 的 CJS 解析会把 `package.json` 不存在的负结果缓存整个进程，装完复查永远命中它。依赖探测改为「解析失败再看文件是否已落盘」，插件侧也改为直接按 `package.json` 定位 transformers.js 入口，不再依赖被污染的解析缓存（非重启服务即可恢复）。
+- **模型下载源可配（#383）** —— 新增「模型下载源」设置（也认环境变量 `HF_ENDPOINT`），国内直连 huggingface.co 超时时可填 `https://hf-mirror.com`。
+- **语音浮层计时器泄漏** —— 切换识别方式时上一个浮层的计时器不再残留（此前每切一次泄一个 500ms 定时器）。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端新增 key（67）：`elsewherePseudoBadge`、`elsewherePseudoTip`、`pinConversation`、`unpinConversation`、`pinnedConversation`、`planImplementBtn`、`planImplementTip`、`planImplementRequest`、`planBoardExportMarkdown`、`planBoardExportSuccess`、`planCleanHandoffBtn`、`planCleanHandoffTip`、`planCleanHandoffPrompt`、`planBoardAddStep`、`planBoardEditStep`、`planBoardDeleteStep`、`planBoardStepTitlePlaceholder`、`planBoardStepDescPlaceholder`、`placeholderPlanMode`、`planModeBadge`、`viewCompactedHistory`、`hideCompactedHistory`、`compactedHistoryLoading`、`compactedHistoryEmpty`、`compactedHistoryBadge`、`compactedHistoryTurns`、`planMode`、`planActionBtn`、`planActionTip`、`planModeTip`、`planModeTipOn`、`goalBarExecModel`、`goalBarExecModelTip`、`goalBarOpenExec`、`goalBarOpenExecTip`、`goalBarStaleBackend`、`goalBarStop`、`goalBarExecuting`、`goalHistory`、`delegateMode`、`delegateModeDesc`、`delegateModeOffHint`、`delegateModeBadge`、`delegateModeBadgeTip`、`delegateModeOpenTip`、`toolCorePowershellDesc`、`toolCoreLsDesc`、`toolCoreGrepDesc`、`toolCoreFindDesc`、`pluginToolsDisabledByPlugin`、`pluginDisabledInPlugins`、`toolDescSubagent`、`planModePromptSettingsTitle`、`planModePromptSettingsDesc`、`planModePromptMode`、`planModePromptPlaceholder`、`planModePromptSettingsHint`、`preset.standard`、`preset.minimal`、`preset.code`、`preset.reader`、`preset.ask`、`preset.standardDesc`、`preset.minimalDesc`、`preset.codeDesc`、`preset.readerDesc`、`preset.askDesc`
+- 前端中文变更（9）：`planBoardTitle`、`goalBarPlaceholder`、`goalBarSet`、`goalBarReviewModel`、`goalBarMaxRoundsTip`、`goalWizardBtn`、`toolsCoreHint`、`toolsSubagentDepHint`、`delegateTaskOffHint`
+- 前端英文变更（9）：`planBoardTitle`、`goalBarPlaceholder`、`goalBarSet`、`goalBarReviewModel`、`goalBarMaxRoundsTip`、`goalWizardBtn`、`toolsCoreHint`、`toolsSubagentDepHint`、`delegateTaskOffHint`
+- 服务端新增 key（18）：`agent.role.stop`、`goal.role.blocked`、`goal.role.conv_title`、`goal.role.exec`、`goal.role.card.start`、`goal.role.card.result`、`goal.role.review`、`goal.role.review.retry`、`subagents.action.missing`、`subagents.spawn.missing.prompt`、`subagents.get.missing.runId`、`subagents.steer.missing.runId`、`subagents.steer.missing.message`、`subagents.stop.missing.runId`、`subagents.wait.item.missing`、`subagents.handoff.missing.toRunId`、`subagents.handoff.missing.payload`、`subagents.action.unknown`
+- 服务端文案变更（10）：`delegate.validate.agent`、`delegate.validate.short`、`delegate.started`、`subagents.spawn.template.unavailable`、`subagents.spawn.started`、`subagents.steer.not.found`、`subagents.stop.not.found`、`subagents.wait.empty`、`subagents.templates.list`、`subagents.handoff.not.found`
+- 服务端删除 key（9）：`goal.set.kick`、`goal.wizard.kick`、`goal.review.incomplete`、`goal.autonomous.pass`、`goal.review.blocked`、`goal.autonomous.continue`、`goal.review.error`、`goal.review.blocked_msg`、`goal.review.revise`
+
+<!-- auto-i18n:end -->
+
+## [0.96.1] — 2026-09-26
+
+### Fixed
+
+- **插件安装审批弹窗层级提升与进度反馈补齐（#382）** —— 将能力与目录访问审批弹窗提升至高于设置弹窗的顶层浮层（`z-index: 350`），无需关闭设置页；修复「记住并允许」未持久化问题，授权写入 `plugin-permissions.json` 并在再次安装时直接放行；点击安装即刻反馈等待确认/执行中状态，已安装列表补挂进度条，关闭弹窗后主界面提供全局进度指示。
+- **顶栏全部居中对齐时偏右修复** —— 修复当顶栏条目全部设为居中时，因右侧缺失占位弹簧（`tb-spacer`）导致条目被左侧单个弹簧推向最右侧的问题，确保中间条目精准水平居中。
+- **设置保存回执时序修复** —— 确保 `set_settings` 在触发 `needsReload` 重启前先行持久化并推送状态回执。
+
+### Changed
+
+- **朱批与朱批·夜主题界面精细化** —— 顶栏控件全面素色化（透明底、无边框，悬停现 hairline）；消息折叠条内边距清零，折叠指示三角光学对齐左侧墨线；输入框边框微调，发送/停止按钮微调为圆形；输入框底部模型选择、思考强度、预设等按钮去边框透明底，悬停显示细边框。
+- **输入框与顶栏控件排版微调** —— 顶栏 chip 统一幽灵化；输入框底部模型与思考强度 chip 尺寸微调收紧；思考强度 Chip 文案精简为 `{level}`，保留 tooltip 说明；预设选择器图标优化为 `FiSliders`。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端中文变更（1）：`thinkingChip`
+- 前端英文变更（1）：`thinkingChip`
+
+<!-- auto-i18n:end -->
+
+## [0.96.0] — 2026-09-26
+
+### Added
+
+- **内置 LSP 工具新增四个语义动作（#331 Phase 1）** —— `documentSymbol`（分层符号大纲，带行跨度与 300 条防洪截断）、`read_symbol`（按符号名/点分路径精准读取实现体，双遍扫描精确匹配优先、400 行截断、未命中时自愈提示可用符号）、`workspaceSymbol`（工作区全局符号搜索，100 条上限，可不传 `path` 自动探测主文件路由语言服务）、`cascade`（编辑影响级联：查引用方文件并聚合其编译诊断，改坏签名当轮即暴露）。提示词开销保持 ~350 tokens；设置页工具说明中英文同步。
+- **系统提示词与工具 schema token 占用实时估算** —— 设置面板「系统提示词」支持直接查看当前会话实际生效的完整系统提示词与工具 schema 定义，并展示粗略 token 估算值与上下文总占用；工作区与活跃会话切换时主动同步最新设置快照，避免提示词上下文陈旧。
+- **核心内置工具独立开关与运行时门控** —— 设置页新增「核心工具」配置区，支持独立开启/禁用 `bash`、`read`、`edit`、`write` 原生核心工具；工具禁用状态随会话即时生效，并在系统提示词与 tools schema 中同步过滤与剔除，杜绝无效工具调用。
+- **新增内置主题** —— 新增三款内置现代与古典主题：赛博科幻暗色 HUD 风格「以太座舱 (Aetheris HUD)」、古籍朱印浅色风「朱批 (Vermilion Manuscript)」与深色夜读风「朱批·夜 (Vermilion Night)」。
+- **消息气泡复制菜单与直接重问增强** —— 消息底栏复制按钮升级为下拉菜单，支持一键复制 Markdown、纯文本或生成长图 PNG；新增「直接重问」快捷按钮，无需重新聚焦编辑框即可立即复用上一条指令；消息气泡增加右键上下文菜单，支持快速复制、编辑/直接重问、派生分支、回滚到此与语音朗读。
+- **TTS 语音朗读与流式生成提示音** —— 助手消息气泡支持单条 TTS 语音朗读与停止；新增流式开始与完成提示音，后台生成完毕及时提醒。
+
+### Fixed
+
+- **非全功能预设（如代码开发/极简/纯对话）下提示词泄露已禁用工具指南修复** —— `before_agent_start` 提示词组装现在严格按会话当前真正处于活跃状态的工具集合（`activeTools`）过滤 Guidelines 与 Snippets，防止未启用的工具（如 `plan_update`、`ask_user_question`、`subagent_*` 等）的提示词指南被无差别注入到给模型的系统提示词中；彻底解决在「代码开发」预设下 AI 因收到动代码前调用 `plan_update` 的硬性指令而误调用未激活工具导致报错无效的问题；会话创建（`makeRuntimeFactory`）与重载（`reloadSession`）全生命周期对齐当前会话预设门控。
+- **助手气泡 Fork / 回滚无法解析修复（#381）** —— 统一 `server/serialize.ts` 的 `uiMessageId` 与 `findEntryByUiId` 算法为单一事实源，彻底修复从助手气泡触发分支派生（Fork）或回滚到此消息时因 ID 生成算法漂移导致的解析失败问题。
+- **悬空工具调用修复收紧分支与上线检查（#332）** —— `healDanglingToolCallFile` 与 `findDanglingToolCalls` 现在严格过滤 `stopReason` 为 `error` 或 `aborted` 的 assistant（不上线幽灵调用，避免在文件尾补合成结果构造出孤儿 `role: "tool"` 导致 DeepSeek/OpenAI 400 报错），且文件落盘修复仅沿活跃分支 `lastId` 向上回溯当前尾部生效 assistant，彻底跳过老分支遗留的悬空调用，防止跨分支污染。
+- **微信通道插件问题修复（#345）** —— 微信回包自动剥离内部控制标记（如 `[[plan:...]]`、`[[todo:...]]`、`[[conv:...]]`、`[[notify:...]]` 等），仅向微信发送用户可见正文；按微信用户 ID 隔离 `accountId`（`wx_${hash}`），为每个用户分配独立的伪客户端与会话，防止上下文串扰与关闭冲突；增加 `earlyRuns` 机制妥善承接极快完成的运行事件，消除回包竞态。
+- **SoL-Pi 节能看板弹窗展示优化** —— 扩展运行与配置区域默认采用折叠组件收拢，避免未折叠时挤占弹窗主视区。
+
+### Changed
+
+- **输入框 `@` 提及支持技能（skills）自动补全** —— 在消息文本任意位置键入 `@` 或 `@skill:` 即可弹出技能候选列表（名称匹配优先于描述匹配，支持中英文双语描述检索与 `@page` 页面置顶防挤占）；点选后自动在光标处插入 `@skill:<name>` 词元，与 Pi 运行时的技能提升扩展无缝联动。
+- **收敛型澄清提问与决策就绪型计划规范（#330）** —— `ask_user_question` 现在单次严格限制 1~~3 个问题（优先 1 个，超过 3 个直接报错阻断，防止问卷轰炸），选项 schema 收紧为 2~~4 个互斥选项且推荐方案置顶，选项 description 要求一句话说明影响与权衡；`plan_update` 提示词升级为「决策就绪型」规划：动代码前先在步骤中落实排查发现（Discovery）、受影响文件清单（File Touch List）与风险回滚预案（Rollback），并随执行实时流转步骤状态。目标向导（`goal_ask` / wizardPrompt）与 DSH 澄清提示词同步对齐收敛型交互。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端新增 key（49）：`reaskDirectly`、`reaskDirectlyTip`、`kindPlugin`、`pluginCheckUpdates`、`pluginCheckUpdatesHint`、`pluginUpdateAvailableBadge`、`pluginUpdateAvailableDetail`、`pluginAllUpToDate`、`piCoreSplitRun`、`piSdkSplitNote`、`piSdkBundledNote`、`installGlobalEngineBtn`、`installGlobalEngineTabTitle`、`saveResultUnknown`、`questionNoneAvailable`、`notifyApprovalTitle`、`notifyApprovalBody`、`notifyApprovalBodyTool`、`sound.approval`、`sound.approval.desc`、`settingsSoundVoice`、`ttsHeader`、`ttsEnable`、`ttsEnableDesc`、`ttsAnnounce`、`ttsAnnounceDesc`、`ttsReadReplies`、`ttsReadRepliesDesc`、`ttsRate`、`ttsVoice`、`ttsVoiceAuto`、`ttsVoiceOnline`、`ttsUnavailable`、`ttsPreviewLine`、`ttsAnnounceDone`、`ttsAnnounceQuestion`、`ttsAnnounceError`、`ttsAnnounceApproval`、`speakMsg`、`stopSpeakingMsg`、`apiKeySavedHint`、`settingsViewPromptTokens`、`settingsPromptContextTotal`、`toolsSectionCore`、`toolsCoreHint`、`toolCoreBashDesc`、`toolCoreReadDesc`、`toolCoreEditDesc`、`toolCoreWriteDesc`
+- 前端中文变更（2）：`settingsViewToolsSchema`、`lspToolEnabledDesc`
+- 前端英文变更（2）：`settingsViewToolsSchema`、`lspToolEnabledDesc`
+- 服务端新增 key（3）：`plugincatalog.sync.doc.invalid`、`terminals.bash.nosentinel.note`、`terminals.command.blocked`
+- 服务端文案变更（1）：`terminals.bash.timeout`
+- 服务端删除 key（2）：`plugincatalog.sync.source.invalid`、`plugincatalog.sync.read.failed`
+
 <!-- auto-i18n:end -->
 
 ## [0.95.0] — 2026-09-24
@@ -36,9 +158,11 @@
 - **受控的持久代码求值沙箱工具 `eval`（opt-in，默认关）** — 新第一方 customTool：在隔离子进程中执行 Python（`py`）或 JavaScript/TypeScript（`js`/`ts`），变量与导入跨调用保持，顶层表达式自动求值回显（省掉以往 `write` 临时脚本 → `bash` 跑 → 删文件的三步流程）。设计要点：① 默认关（`AGENT_TOOL_CATALOG` 里 `defaultOn: false`），关掉 AI 不知道有它，杜绝「什么问题都塞进内核」的工具挤占；② 每个会话一个独立内核进程 + 独立临时目录（cwd 不落在项目里，项目路径经 `PROJECT_DIR` 变量显式引用），关对话 / 停服务即回收进程树（Windows `taskkill /F /T`，Unix `SIGKILL` 进程组），不留孤儿；③ 单请求默认 15s、上限 120s 硬超时，超时杀进程树后内核自动重启，不会把会话拖死；④ 驱动协议串行排队，并行 `eval` 调用不会互相覆盖 resolver；⑤ stderr 持续排空，避免原生扩展写满管道缓冲造成假超时。DSH 引擎无 customTool 注册面，不接。
 
 ### Changed
+
 - **插件 manifest 校验失败即拒（P1-6）** — 坏 manifest 不再带病启动：`id` 非法/与目录名不一致、`apiVersion` 非法、未知能力拼写、`engines`/`permissions`/`ui` 坏形状、v2 不声明 `permissions`、有 `ui` 声明却无 `ui` 能力，都会拒绝激活（scan 置红 + 诊断随清单下发，activate 重判）。以前其中两类（v2 无能力声明、只有别的能力却写 `ui`）是"激活成功但 ui 静默忽略"，现在是明确拒绝；纯警告（坏文本字段/坏数组字段/截断）仍不阻断。未来版本（`apiVersion` 大于宿主）仍走版本门出"请升级"，校验层不抢错。
 
 ### Fixed
+
 - **目标调研向导：切会话不再丢弃调研成果，且消息流里有「原始目标草案」卡片（#292）** — 两处修复：① `setGoal` 新增 `targetConvId`，调研收敛后把目标写到**发起调研的那个对话**（原来是硬读 `activeConv` 再一刀切丢：「已切换对话，目标调研结果已丢弃」——用户在向导问答期间切去看代码/文档是常态，多轮问答瞬间白做）；发起会话已关闭时响亮拒绝而不是静默丢。完成通知随之改成点名会话（`🎯 会话「title」目标调研完成，目标已设为…`），取消/无结果时也告诉用户草案还在哪儿。② 调研开始先往发起对话推一张只读「🎯 原始目标草案」卡片，排在所有提问之前——调研被超时/取消打断后，用户至少能把自己最初写的那段需求读回来、复制重试，而不是面对一片空白。
 - **子代理（in-memory 会话）的扩展错误不再按轮数刷屏（#298）** — `SessionManager.inMemory(cwd)` 建出来的子代理会话取不到会话目录（`getSessionDir()` 返回空串），而 SDK 的 `ExtensionRunner.emitContext()` 在**每次 provider 请求**前都会跑一遍扩展的 `context` hook，于是「会话目录依赖型」扩展（如 SoL-Pi 的 `runtimeRoot()`）每轮都抛同一个错。原 `bindExtensions` 的 `onError` 把错误原样广播成 notice：不去重、不带会话归属、不落服务端日志，一个子代理跑 N 轮就弹 N 条，且看不出是哪个会话出的问题。现改为共享的 `makeExtensionErrorReporter()`：① 同一会话内「扩展 + 事件 + 错误文本」只提示一次；② 子代理的 notice 带 `子代理 <conversationId>：` 前缀（与同函数内其它子代理通知口径一致）；③ 全量错误（含 extensionPath / event / stack）始终 `console.error` 落服务端日志。主对话（持久会话）行为不变，只是多了去重与日志。
 - **插件市场仅同步列表时保留已激活插件实例（#296，感谢 @StarryJia）** — 启动预同步和手动目录同步不再重载插件，避免重新激活时重复广播当前工作目录。
@@ -51,6 +175,7 @@
 - **任务执行看板与对话列等宽** — Plan Mode 的任务执行看板（`PlanBoard`）此前写死左右各 16px 外边距，没走 `.main` 的列 token（`--chat-inset`）：桌面 / 宽屏聊天列下比消息列与输入框宽一截、手机上又比它们窄一点，左右边缘始终对不齐。现改为同一条列 token（`.plan-board` 落进 `styles.css`，与 `.goalbar` / 问卷面板同口径），任何视口宽度与「宽屏聊天列」开关下都与输入框严格齐平。回归：`tests/chat-column-align-test.mjs` 新增看板条目。
 
 <!-- auto-i18n:start -->
+
 ### i18n
 
 - 前端新增 key（104）：`newChatEphemeral`、`newChatEphemeralTip`、`ephemeralBadge`、`ephemeralBannerText`、`elsewhereActions`、`takeoverConfirm`、`saveEphemeral`、`forkSession`、`forkSessionTip`、`rollbackSession`、`rollbackSessionTip`、`rollbackConfirm`、`rollbackRestoreWorkspace`、`rollbackRestoreWorkspaceTip`、`toolApprovalTitle`、`toolApprovalApprove`、`toolApprovalDeny`、`toolApprovalEditAndRun`、`toolApprovalRiskAlert`、`toolApprovalCommand`、`toolApprovalParams`、`toolApprovalEditPlaceholder`、`toolApprovalReason`、`toolApprovalCategory`、`toolApprovalAllowCategory`、`toolApprovalAllowCategoryHint`、`toolApprovalAllowConversation`、`toolApprovalAllowConversationHint`、`toolApprovalEnabled`、`toolApprovalEnabledDesc`、`toolApprovalPolicyTitle`、`toolApprovalPolicyAllowAll`、`toolApprovalPolicyRevoke`、`toolApprovalPolicyHint`、`settingsApprovalRules`、`settingsApprovalRulesDesc`、`manageApprovalRules`、`approvalRuleNew`、`approvalRuleEdit`、`approvalRuleDelete`、`approvalRuleReset`、`approvalRuleResetConfirm`、`approvalRuleDeleteConfirm`、`approvalRuleActionAsk`、`approvalRuleActionDeny`、`approvalRuleActionAllow`、`approvalRuleTools`、`approvalRuleToolsTip`、`approvalRuleField`、`approvalRuleFieldCommand`、`approvalRuleFieldPath`、`approvalRuleFieldParams`、`approvalRuleMatch`、`approvalRuleMatchRegex`、`approvalRuleMatchGlob`、`approvalRuleMatchContains`、`approvalRuleMatchPrefix`、`approvalRuleMatchOutsideWs`、`approvalRuleValue`、`approvalRuleValueTip`、`approvalRuleLabel`、`approvalRuleLabelEn`、`approvalRuleReason`、`approvalRuleReasonEn`、`approvalRuleEnabled`、`approvalRuleBuiltin`、`approvalRuleEmpty`、`approvalRuleMoveUp`、`approvalRuleMoveDown`、`planBoardTitle`、`planBoardSteps`、`planBoardProgress`、`planBoardNoPlan`、`planBoardCompleted`、`planBoardInProgress`、`planBoardPending`、`planBoardFailed`、`clear`、`confirm`、`forkBadge`、`forkBadgeTip`、`goalBarBlocked`、`toolsPresetBanner`、`toolsBackToStandard`、`toolsBlockedByPreset`、`skillsHiddenByPreset`、`terminalBashMaxForegroundMs`、`terminalBashMaxForegroundMsDesc`、`pluginInspectAlreadyInstalled`、`pluginInspectInvalid`、`pluginInspectNotPlugin`、`pluginInspectNetwork`、`uiLayoutDiagTitle`、`uiLayoutDiagHint`、`planUpdateEnabledDesc`、`planUpdateOffHint`、`compactContextEnabledDesc`、`compactContextOffHint`、`evalEnabledDesc`、`evalOffHint`、`patchToolEnabledDesc`、`patchToolOffHint`、`lspToolEnabledDesc`、`lspToolOffHint`
@@ -60,6 +185,7 @@
 - 服务端新增 key（14）：`editsoft.fragment.not.supported`、`goal.wizard.draft.card`、`goal.autonomous.pass`、`goal.review.blocked`、`goal.autonomous.continue`、`goal.review.blocked_msg`、`plugins.requires.cycle`、`plugins.manifest.invalid`、`plugins.requires.cascade`、`subagents.handoff.self`、`subagents.handoff.not.found`、`subagents.handoff.success`、`subagents.handoff.failed`、`terminals.bash.background.elapsed`
 - 服务端文案变更（1）：`terminals.bash.background.running`
 - 服务端删除 key（2）：`dsh.attach.file.large`、`dsh.attach.file.ref.fallback`
+
 <!-- auto-i18n:end -->
 
 ## [0.94.1] — 2026-09-22
@@ -1260,7 +1386,11 @@ when?, children?}`，也收 `topbar` / `settings` 这类简写别名）；宿主
 - 0.35.1（2026-08-27）：编辑重问保留附件（#18）+ 全窗口拖放（#19）。
 - 0.29.0（2026-08-23）：全局搜索弹窗（Ctrl+K）+ 消息列表惰性窗口化。
 
-[Unreleased]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.93.0...main
+[Unreleased]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.97.0...main
+[0.97.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.97.0
+[0.96.1]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.96.1
+[0.96.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.96.0
+[0.95.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.95.0
 [0.94.1]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.94.1
 [0.94.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.94.0
 [0.93.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.93.0

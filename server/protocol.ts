@@ -207,6 +207,16 @@ export interface UiState {
 	 */
 	plan?: PlanState | null;
 	/**
+	 * 当前会话是否处于计划模式（只规划不实施）。会话级开关，随快照下发；
+	 * 缺省 = false。会话无内容时恒为 false（新建对话不带过来）。
+	 */
+	planMode?: boolean;
+	/** 审查者模式（自动委派）已开：主对话只审阅，用户请求由服务端转给
+	 *  一个常驻落盘执行对话执行（会话级开关，默认关）。 */
+	delegateMode?: boolean;
+	/** 审查者模式下的常驻执行对话 id（供 UI 「打开执行对话」用；null/缺省 = 还没建）。 */
+	delegateConvId?: string | null;
+	/**
 	 * 当前对话的未发送输入框草稿（issue #166，单中心文件方案）。
 	 *  只在**全量快照**里携带（切会话 / new_chat / get_state）：增量
 	 *  snapshot_delta 永远不带 —— 同一标签页的草稿本来就是自己打的，不需要
@@ -244,8 +254,8 @@ export interface UiState {
 			tokens: number | null;
 			contextWindow: number;
 			percent: number | null;
-			/** true = 压缩后 SDK 暂报 null（下轮模型响应前不可信），此处用
-			 *  compaction_end 的 estimatedTokensAfter 回填的约数，UI 加 `~` 标识。 */
+			/** 遗留字段：现恒为 false（服务端所有分支——含压缩回填——都按当前配置实时
+			 *  算出 tokens/percent，不再有「约数」态），前端已不读。保留只为旧客户端兼容。 */
 			estimated?: boolean;
 			/** 当前模型的生效压缩软上限（tokens；null = 关闭，底栏不画标记线）。 */
 			softCap?: number | null;
@@ -304,6 +314,14 @@ export interface SlashCommandInfo {
  *  page (page), raw pasted/dropped images (imageData) and raw uploaded files
  *  (fileData). Files are never injected into the prompt — the model gets a
  *  path reference and reads on demand. */
+/** 用户选中的消息原文；发送后保留副本，避免来源消息变化影响引用。 */
+export interface TextQuote {
+	text: string;
+	messageId: string;
+	role: string;
+	sessionId?: string;
+}
+
 export interface PromptAttachment {
 	/** Workspace path — except for mode "page", where it is the page's origin
 	 *  (e.g. "https://example.com"), which is also the browser_page `target`,
@@ -321,7 +339,9 @@ export interface PromptAttachment {
 	 *  right-click / global-search quote): the server emits a small
 	 *  <conversation-ref> aside pointing at it, and the model fetches the
 	 *  transcript on demand with the conversation_read tool. */
-	mode?: "inline" | "reference" | "lines" | "page" | "conversation";
+	mode?: "inline" | "reference" | "lines" | "page" | "conversation" | "quote";
+	/** mode "quote"：path 留空，引用原文和来源保存在 quote。 */
+	quote?: TextQuote;
 	/** mode "conversation" + 引用运行中对话：conversation id（如 "c3"，含子代理）。 */
 	conversationId?: string;
 	/** mode "conversation" + 引用历史会话：会话转录文件 path（左栏历史行 / 全局搜索）。 */
@@ -592,6 +612,8 @@ export type ClientMessage =
 	/** Check the npm registry for a newer pi-web-ui version. */
 	| { type: "check_update" }
 	| { type: "check_updates_all"; force?: true } // webui + direct pi extensions (manifest)
+	/** Check updates for installed UI plugins (<dataDir>/plugins). */
+	| { type: "check_plugin_updates" }
 	/** Restart the supervised service (same effect as `pi-web-ui server restart`:
 	 *  this process exits and its supervisor brings it back). The server refuses
 	 *  when no supervisor manages this instance (foreground / dev / Docker). */
@@ -659,6 +681,9 @@ export type ClientMessage =
 			authHeader?: boolean;
 			/** api type: openai-completions / openai-responses / anthropic-messages / google-generative-ai. */
 			api?: string;
+			/** 正在编辑的服务商 id：apiKey 留空时服务端按它回落到已保存的密钥
+			 *  （明文不再下发浏览器，编辑存量服务商的探测靠这个保持可用）。 */
+			providerId?: string;
 	  }
 	/** Lightweight connectivity and auth probe for a provider endpoint.
 	 *  Runs SERVER-side and returns latencyMs or error in test_model_connection_result. */
@@ -669,6 +694,8 @@ export type ClientMessage =
 			apiKey?: string;
 			authHeader?: boolean;
 			api?: string;
+			/** 同 fetch_models：apiKey 留空时按它回落到已保存的密钥。 */
+			providerId?: string;
 	  }
 	/** Re-probe a SAVED provider's /models endpoint and merge the result into
 	 *  its models.json entry. Credentials stay server-side (the browser never
@@ -713,13 +740,26 @@ export type ClientMessage =
 			reqId?: number;
 	  }
 	// -- goal / review -------------------------------------------------------
-	/** Set (or clear) the active goal. When set, each finished agent run is
-	 *  reviewed by an isolated reviewer agent; a failing review steers the main
-	 *  session to revise until `maxRounds` runs out. `locked: true` keeps the
-	 *  goal active across every subsequent turn; `false` clears it after the
-	 *  next turn (single-shot). `reviewModel` ("provider/id", optional) selects
-	 *  a different model for the reviewer. */
-	| { type: "set_goal"; goal: string; reviewModel?: string; maxRounds: number; locked: boolean }
+	/** Set (or clear) the active goal. When set, the SERVER drives the loop
+	 *  (goal mode 2.0, the only path): it spawns a persistent executor
+	 *  conversation, and the MAIN conversation plays the reviewer — it gets a
+	 *  read-only verify prompt each round and answers with
+	 *  `{"verdict":"pass|fail","feedback":…}`, which the server turns into
+	 *  pass / another round / circuit-break. Rounds are capped by `maxRounds`
+	 *  (0 = unlimited). `locked: true` keeps the goal active across every
+	 *  subsequent turn; `false` clears it after the next turn (single-shot).
+	 *  `reviewModel` ("provider/id", optional) is remembered as the goal WIZARD
+	 *  model; the reviewer is the main conversation itself (no separate model).
+	 *  `execModel` ("provider/id", optional) picks the executor's model. */
+	| {
+			type: "set_goal";
+			goal: string;
+			reviewModel?: string;
+			maxRounds: number;
+			locked: boolean;
+			/** 执行者模型（"provider/id"；空 = 跟随主对话）。 */
+			execModel?: string;
+	  }
 	| { type: "clear_goal" }
 	/** Start the collaborative target wizard: a user requirement goes into an
 	 *  ISOLATED wizard session which questions the user (multiple-choice + free
@@ -737,6 +777,8 @@ export type ClientMessage =
 			reviewModel?: string;
 			maxRounds?: number;
 			locked?: boolean;
+			/** 执行者模型偏好（"provider/id"；空 = 跟随），全局记忆。 */
+			execModel?: string;
 	  }
 	// -- settings (system prompt / skills / extensions / presets) ------------
 	/** Request the current settings state (also pushed automatically on attach). */
@@ -811,6 +853,10 @@ export type ClientMessage =
 			 *  + 自定义文本（空 = 内置默认）。pi 引擎的 scm_commitmsg 生成用。 */
 			scmCommitMsgPromptMode?: "append" | "replace";
 			scmCommitMsgPrompt?: string;
+			/** 计划模式提示词：模式（append/replace，语义同 promptMode）+ 自定义
+			 *  文本（空 = 内置默认）。仅主会话计划模式注入用（硬闸门不受影响）。 */
+			planModePromptMode?: "append" | "replace";
+			planModePrompt?: string;
 			/** Extra instructions and independently disabled skills for review. */
 			reviewPrompt?: string;
 			reviewDisabledSkills?: string[];
@@ -841,9 +887,15 @@ export type ClientMessage =
 	 *  ones, bump the epoch and re-push the catalog. Same spirit as
 	 *  extensions_reload but for pi-web-ui's own UI plugins. */
 	| { type: "plugins_reload" }
-	/** 特权 DOM 访问授权（wantsDom 插件）：granted=true 即写入 <dataDir>/plugin-dom.json
-	 *  并 epoch+1 重推清单（浏览器按新 epoch 重拉 bundle）；false = 撤销。 */
+	/** 特权 DOM 访问授权（wantsDom 插件）：granted=true 走两步握手——服务端生成
+	 *  在途 consent 请求（plugin_dom_consent_request 广播），收到绑定来源的
+	 *  plugin_dom_consent_response 才写入 <dataDir>/plugin-dom.json 并 epoch+1
+	 *  重推清单（浏览器按新 epoch 重拉 bundle）；granted=false = 撤销，单步直达
+	 *  （降权方向不值得拖 120s 窗口）。 */
 	| { type: "plugin_dom_consent"; pluginId: string; granted: boolean }
+	/** plugin_dom_consent 两步握手的应答：id 回显 plugin_dom_consent_request.id。
+	 *  服务端校验应答连接属于请求广播时的在线端才落盘（防陌生连接代答）。 */
+	| { type: "plugin_dom_consent_response"; id: string; ok: boolean }
 	/** Save the CURRENT settings as a named preset (overwrites if it exists). */
 	| { type: "save_preset"; name: string }
 	/** Upsert 一个子代理模板（同名覆盖；全局共享，所有客户端一致）。停用标记
@@ -999,6 +1051,42 @@ export type ClientMessage =
 			steps: PlanStep[];
 			activeStepId?: string | null;
 	  }
+	/** 增量更新单个步骤的状态或内容。 */
+	| {
+			type: "plan_step_update";
+			conversationId?: string;
+			stepId: string;
+			patch: Partial<PlanStep>;
+	  }
+	/** 删除单个步骤。 */
+	| {
+			type: "plan_step_delete";
+			conversationId?: string;
+			stepId: string;
+	  }
+	/** 新增单个步骤。 */
+	| {
+			type: "plan_step_add";
+			conversationId?: string;
+			step: PlanStep;
+			afterStepId?: string;
+	  }
+	/** 「✨ 净室执行（Clean-session Handoff）」：
+	 *  关闭源会话的计划闸门，新建隔离会话，在新会话中原子设置计划步骤、可选迁移目标，并触发实施轮 prompt。 */
+	| {
+			type: "plan_clean_handoff";
+			steps: PlanStep[];
+			prompt: string;
+	  }
+	/** 计划模式开关（会话级）：开启后本对话**只调研 + 出实施计划，不实施**。
+	 *  服务端在写类工具与非常规 bash 上加硬闸门（拒绝并把原因回给模型），
+	 *  并向系统提示词追加计划模式约束（先 plan_update 列步骤，再给计划正文）；
+	 *  关掉即恢复普通对话。conversationId 缺省 = 当前对话。 */
+	| { type: "set_plan_mode"; enabled: boolean; conversationId?: string }
+	/** 审查者模式开关（会话级，默认关）：开启后本对话**只审阅不施工**，用户的
+	 *  每条 prompt 由服务端转给一个常驻落盘执行对话执行；写类/派发类工具加硬闸门。
+	 *  conversationId 缺省 = 当前对话。计划模式优先（两者同开时不自动派活）。 */
+	| { type: "set_delegate_mode"; enabled: boolean; conversationId?: string }
 	/** Answer to page_request (id echoes page_request.id). `ok:false` carries a
 	 *  human-readable `error` — no browser/extension, page not allowed, or the
 	 *  action itself failed. The server never inspects `result`'s shape; it is
@@ -1036,6 +1124,11 @@ export type ClientMessage =
 	/** 将一个内存子代理（inMemory）固化为普通持久化对话：写入磁盘 .jsonl 文件，
 	 *  清除 isSubagent 标记，使其进入历史会话列表并长久保留。 */
 	| { type: "persist_conversation"; id: string }
+	/** 钉住 / 取消钉住运行中的对话：钉住后切换到其他对话也不从「运行的对话」
+	 *  释放（空闲无终端亦然），直到显式移出。pinned=false 时取消钉住。 */
+	| { type: "pin_conversation"; id: string; pinned: boolean }
+	/** 钉住 / 取消钉住历史会话文件（持久化到 client-state.json 并在历史列表展示 📌）。 */
+	| { type: "pin_session"; path: string; pinned: boolean }
 	/** Bulk-dismiss FINISHED subagents from the running list (right-click menu).
 	 *  parentId omitted = all finished subagents; given = the transitive
 	 *  subagent descendants of that conversation (children, grandchildren, …),
@@ -1059,7 +1152,14 @@ export type ClientMessage =
 	/** Manually trigger a task once right now (does not shift its next fire). */
 	| { type: "schedule_run"; id: string }
 	/** Enable / disable a scheduled task (re-arms its next fire). */
-	| { type: "schedule_toggle"; id: string; enabled: boolean };
+	| { type: "schedule_toggle"; id: string; enabled: boolean }
+	// -- compacted history retrieval (issue #398) ----------------------------
+	/** 查询被某个上下文压缩卡片折叠的历史消息（按需惰性加载，issue #398）。 */
+	| {
+			type: "get_compacted_messages";
+			compactionMessageId: string;
+			conversationId?: string;
+	  };
 
 // ---------------------------------------------------------------------------
 // Server -> Client
@@ -1073,6 +1173,8 @@ export interface SessionSummary {
 	modified: number;
 	/** Where the session lives: this UI's per-client dir, or the pi CLI/TUI dir. */
 	source?: "web" | "tui";
+	/** 用户钉住（常驻运行列表 / 历史置顶）：带 📌 标记。 */
+	pinned?: boolean;
 }
 
 /** 会话转录中一条命中消息的定位锚点：会话载入后按 role + timestamp 在
@@ -1366,13 +1468,41 @@ export interface ModelInfo {
 // Goal / review status (server -> client snapshot)
 // ---------------------------------------------------------------------------
 
+/** 目标模式下的一个「角色对话」（只有执行者槽：审查者就是主对话本身）。 */
+export interface GoalRoleRef {
+	/** 承载该角色的对话 id（左栏可点开）。 */
+	convId: string;
+	/** true = 服务端拉起的角色对话（落盘普通对话，完成/清目标时可移出）。 */
+	spawned: boolean;
+	/** 执行者上次取样时是否正在跑（goal_status 下发时点的值；轮次边界刷新，非每 token）。 */
+	streaming?: boolean;
+	/** 执行者最近动态（一句话：跑什么工具 / 自述头，≤120 字；轮次边界刷新）。 */
+	activity?: string;
+	/** activity 的英文版（客户端按 locale 二选一，与 status/statusEn 同口径）。 */
+	activityEn?: string;
+}
+
+/** 一条已终结的目标（目标条「历史」下拉用；内存态，随重启丢失）。 */
+export interface GoalHistoryEntry {
+	/** 目标全文（截断 200 字）。 */
+	goal: string;
+	/** 终态：通过 / 未通过（预算用尽）/ 受阻。 */
+	verdict: "pass" | "fail" | "blocked";
+	/** 跑到的轮次。 */
+	rounds: number;
+	/** 终态原因（结论/熔断文案，截断 200 字）。 */
+	feedback: string;
+	/** 终结时间（Date.now()）。 */
+	finishedAt: number;
+}
+
 /** Current state of the goal-review loop, shown in the goal bar UI. */
 export interface GoalStatus {
 	/** Conversation that owns this goal; null when no goal is set. */
 	conversationId: string | null;
 	/** Active goal text; null when no goal is set. */
 	goal: string | null;
-	/** Reviewer model id ("provider/id"), or null to use the main model. */
+	/** 模型 id ("provider/id")；pi 引擎语义为**调研（向导）模型**记忆位，DSH 仍用它选审查模型。 */
 	reviewModel: string | null;
 	/** Maximum number of review rounds per goal run. */
 	maxRounds: number;
@@ -1394,6 +1524,16 @@ export interface GoalStatus {
 	 *  The wizard turns a raw user requirement into a refined goal by asking
 	 *  questions, then auto-sets the goal. */
 	wizard: WizardStatus;
+	/** 2.0：循环相位。 */
+	phase?: "idle" | "executing" | "reviewing" | "blocked";
+	/** 本目标累计用量（执行者各轮 + 审查者各轮的输入/输出 token；轮次边界累计）。 */
+	usage?: { inputTokens: number; outputTokens: number };
+	/** 本对话的目标历史（终态落袋，cap 20；内存态，与目标状态同寿命；清目标不清空）。 */
+	history?: GoalHistoryEntry[];
+	/** 2.0：执行者模型（"provider/id"；null = 跟随主对话）。 */
+	execModel?: string | null;
+	/** 2.0：角色对话（审查者就是主对话，故这里只有 executor）。 */
+	roles?: { executor?: GoalRoleRef };
 }
 
 /** Progress of the collaborative target wizard (see GoalStatus.wizard). */
@@ -1460,7 +1600,13 @@ export interface UiProviderConfig {
 	/** api type: openai-completions / openai-responses / anthropic-messages / google-generative-ai. */
 	api?: string;
 	baseUrl?: string;
+	/** 【只写】save_model_config 提交的新 apiKey；服务端下发（models_config /
+	 *  clone_provider_result）时**永不填充**——明文不回传浏览器。留缺 = 保留
+	 *  已存旧值，显式空串 = 清除。 */
 	apiKey?: string;
+	/** 【只读】服务端下发的"是否已保存 apiKey"，与 headers 一样是单向字段：
+	 *  客户端保存时无需也不应携带。 */
+	hasApiKey?: boolean;
 	authHeader?: boolean;
 	/** headers are NOT returned to the browser — they can contain Authorization
 	 *  / API-key values; saveModelConfig preserves them server-side. */
@@ -1470,6 +1616,19 @@ export interface UiProviderConfig {
 // ---------------------------------------------------------------------------
 // Plugins (optional UI components dropped into <dataDir>/plugins/<id>/)
 // ---------------------------------------------------------------------------
+
+export interface UiPluginUpdateInfo {
+	id: string;
+	name?: string;
+	version?: string;
+	latestVersion?: string | null;
+	source: string;
+	localSha: string | null;
+	remoteSha: string | null;
+	updatable: boolean;
+	builtin?: boolean;
+	error?: string;
+}
 
 /** One installed pi-web-ui plugin (see server/plugins.ts). A plugin is a
  *  directory under <dataDir>/plugins/<id>/ with a manifest.json and optional
@@ -1727,7 +1886,11 @@ export type UiSlotId =
 	/** 通知条动作区（notice 上的快捷按钮）。 */
 	| "notice.actions"
 	/** 弹窗（插件声明 kind="view" 的条目，经宿主桥 openModal 按需打开）。 */
-	| "modal.dialog";
+	| "modal.dialog"
+	/** 左侧边缘悬浮工具条。 */
+	| "sidebar.left"
+	/** 右侧边缘悬浮工具条。 */
+	| "sidebar.right";
 
 /** 插件 UI 挂载点的组合语义。list 允许多个条目并列；single 只允许一个可见条目。 */
 export type UiSlotCardinality = "list" | "single";
@@ -1869,6 +2032,8 @@ export interface UiLayoutPrefs {
 	labels?: Record<string, string>;
 	/** 顶栏按钮文字总开关（默认开；false = 只剩图标，数字角标保留，溢出菜单仍带文字）。 */
 	topbarText?: boolean;
+	/** 用户自定义槽位/位置（将条目挪到 topbar.primary / bottombar / sidebar.left / sidebar.right）。 */
+	slots?: Record<string, UiSlotId>;
 }
 
 /** 一个插件下发的全部 UI 贡献（manifest "ui" 与运行时注册合并后的快照）。 */
@@ -1943,6 +2108,8 @@ export interface UiPluginCatalogEntry {
 	id: string;
 	/** Display name (falls back to id). */
 	name: string;
+	/** Display name in English (falls back to name). */
+	nameEn?: string;
 	description?: string;
 	descriptionEn?: string;
 	/** Optional emoji/single-char icon. */
@@ -1954,6 +2121,13 @@ export interface UiPluginCatalogEntry {
 	/** true = from the shipped catalog; false = user added in the UI
 	 *  (only custom entries can be removed). */
 	builtin: boolean;
+	/** true = a custom entry whose id replaced a shipped-catalog entry with the
+	 *  same id: the display fields (name/icon/description) come from a
+	 *  user-supplied source and may imitate the official entry, so surfaces
+	 *  should mark it as user-supplied. The source field always keeps the real
+	 *  (custom) install source — it cannot impersonate the official one.
+	 *  Optional, purely additive; derived at merge time, not persisted. */
+	overridesBuiltin?: boolean;
 	/** Optional project/homepage URL. */
 	homepage?: string;
 }
@@ -2053,6 +2227,8 @@ export interface ConversationSummary {
 	questionTitle?: string;
 	/** 临时会话（不落盘、关闭即销毁、不进历史；不占持久会话名额）。 */
 	isEphemeral?: boolean;
+	/** 用户钉住（常驻运行列表）：切走也不释放，左栏行带 📌 标记。 */
+	pinned?: boolean;
 	/** 派生源信息（若本会话是从另一会话的消息派生而来）。 */
 	forkFrom?: {
 		conversationId: string;
@@ -2086,6 +2262,9 @@ export interface ElsewhereRunning {
 	hasQuestion?: boolean;
 	/** 等答复问卷的简短标题/题目，供横幅与列表展示。 */
 	questionTitle?: string;
+	/** 是否为无头伪客户端（定时任务 scheduler: / 插件 plugin:）。
+	 *  无头会话不支持过户与跨页作答，前端降级为只读状态展示。 */
+	pseudo?: boolean;
 }
 
 /** DSH Agent 预设名录行（字段以运行时树为准；broken = 名录可见但不可挂载）。 */
@@ -2093,8 +2272,13 @@ export interface UiAgentPreset {
 	id: string;
 	trust: "system" | "user";
 	isDefault: boolean;
+	/** 文案（服务端默认语言，pi 内置五档为中文）。非中文界面取 *En ?? *。 */
 	name?: string;
 	description?: string;
+	/** 非中文界面的文案（与审批规则的 labelEn/reasonEn 同一约定）：
+	 *  服务端把两种语言都带上，界面按当前语言取，不再把中文硬塞给英文用户。 */
+	nameEn?: string;
+	descriptionEn?: string;
 	order?: number;
 	broken?: string;
 }
@@ -2103,8 +2287,12 @@ export interface UiAgentPreset {
 export interface DshPermissionOption {
 	/** 预设值（read-only/workspace-write(-never)/danger-full-access/custom）。 */
 	value: string;
+	/** 文案（服务端默认语言）；非中文界面取 nameEn ?? name。 */
 	name: string;
 	description?: string;
+	/** 非中文界面的文案（见 UiAgentPreset.nameEn）。 */
+	nameEn?: string;
+	descriptionEn?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -2264,6 +2452,10 @@ export interface UiSettingsState {
 	scmCommitMsgPromptMode: "append" | "replace";
 	/** SCM「AI 生成提交信息」自定义提示词。 */
 	scmCommitMsgPrompt: string;
+	/** 计划模式提示词模式：追加/替换内置默认（空文本 = 内置默认）。 */
+	planModePromptMode: "append" | "replace";
+	/** 计划模式自定义提示词。 */
+	planModePrompt: string;
 	/** Extra instructions appended to the built-in goal-review prompt. */
 	reviewPrompt: string;
 	/** Skills disabled only for the isolated goal-reviewer. */
@@ -2290,6 +2482,8 @@ export interface UiSettingsState {
 	visionBridgeDefaultPrompt: string;
 	/** SCM「AI 生成提交信息」的内置默认提示词（设置面板 replace 模式预填用）。 */
 	scmCommitMsgDefaultPrompt: string;
+	/** 计划模式的内置默认提示词（设置面板 replace 模式预填用）。 */
+	planModeDefaultPrompt: string;
 	/** Vision-capable configured models available on this machine. */
 	visionModels: UiVisionBridgeModel[];
 	skills: UiSkillInfo[];
@@ -2715,7 +2909,7 @@ export type ServerMessage =
 			type: "update_status_all";
 			items: {
 				name: string;
-				kind: "webui" | "pi-core" | "package" | "git-extension";
+				kind: "webui" | "pi-core" | "package" | "git-extension" | "plugin";
 				current: string;
 				latest: string | null;
 				latestPublishedAt?: string | null;
@@ -2723,6 +2917,10 @@ export type ServerMessage =
 				error?: string;
 				/** git-extension only: `host/path` shorthand (prepend `git:` for the `pi update` command). */
 				source?: string;
+				/** plugin only: directory/install id, matches pluginId. */
+				pluginId?: string;
+				/** plugin only: whether this is a shipped built-in plugin. */
+				builtin?: boolean;
 			}[];
 			/** issue #321: pi SDK 副本状态快照，随每次 update_status_all 下发。
 			 *  `running` = 本进程实际加载的版本（可能是自带副本，也可能是跟随的全局副本）；
@@ -2749,6 +2947,9 @@ export type ServerMessage =
 	 *  reload; the frontend uses it as an import-cache buster so changed
 	 *  bundles are actually re-fetched. */
 	| { type: "plugins"; plugins: UiPluginInfo[]; epoch: number }
+	/** Result of a check_plugin_updates run or an all-source update check
+	 *  containing UI plugins. Broadcast to all clients so plugin badges stay in sync. */
+	| { type: "plugin_updates"; updates: UiPluginUpdateInfo[] }
 	/** Installable-plugin list (marketplace). Pushed on attach and after every
 	 *  plugin_catalog_add/remove. Merges the shipped catalog
 	 *  (<pkgRoot>/plugins/catalog.json) with user-added entries
@@ -2801,6 +3002,10 @@ export type ServerMessage =
 	/** 插件请求访问工作区外的目录：宿主弹确认（文案按 kind 本地化），用户答复经
 	 *  plugin_path_response 回传。未答复超时视为拒绝。 */
 	| { type: "plugin_path_request"; id: string; pluginId: string; path: string; reason?: string }
+	/** DOM 授权两步握手的在途请求（设置面板的授权点击触发服务端生成并广播）：
+	 *  id 供 plugin_dom_consent_response 回显；from = 发起端 clientId（前端只自动
+	 *  应答自己发起的授权）。120s 未应答视为拒绝。 */
+	| { type: "plugin_dom_consent_request"; id: string; pluginId: string; from: string }
 	/** 插件目录授权表（设置面板展示 + 撤销后刷新）。 */
 	| { type: "plugin_grants"; grants: { pluginId: string; paths: string[] }[] }
 	/** 插件请求能力授权（net 主机 / llm 模型作用域）：宿主弹确认，用户答复经
@@ -2940,4 +3145,13 @@ export type ServerMessage =
 	// -- scheduled tasks (issue #184) ----------------------------------------
 	/** Built-in scheduler task list (global, all projects). Pushed on attach,
 	 *  on request (schedule_list) and on every change (save/delete/toggle/run). */
-	| { type: "scheduler_tasks"; tasks: SchedulerTaskView[] };
+	| { type: "scheduler_tasks"; tasks: SchedulerTaskView[] }
+	// -- compacted history retrieval (issue #398) ----------------------------
+	/** 响应被压缩卡片折叠的历史消息查询（issue #398）。 */
+	| {
+			type: "compacted_messages_result";
+			compactionMessageId: string;
+			conversationId: string;
+			messages: UiMessage[];
+			error?: string;
+	  };

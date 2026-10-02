@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PlanManager } from "../../server/plan-manager.js";
 import type { PlanStep } from "../../server/protocol.js";
+import { makePlanUpdateTool } from "../../server/agent-service.js";
 
 describe("结构化任务计划状态机与看板管理 (PlanManager / Plan Mode)", () => {
 	it("初始状态为空", () => {
@@ -46,6 +47,33 @@ describe("结构化任务计划状态机与看板管理 (PlanManager / Plan Mode
 		expect(updated2?.activeStepId).toBe("step-2");
 	});
 
+	it("updateStep 剥掉 patch 里的 id，title/description 与 setPlan 同口径截断", () => {
+		const pm = new PlanManager();
+		pm.setPlan("conv-1", [{ id: "step-1", title: "原标题", status: "in_progress", description: "原描述" }]);
+
+		// patch 带 id：不允许改 id（activeStepId 的锚点，改了会悬空）
+		const patched = pm.updateStep("conv-1", "step-1", {
+			id: "hijacked",
+			title: "新标题",
+			status: "in_progress",
+		});
+		expect(patched?.steps[0].id).toBe("step-1");
+		expect(patched?.activeStepId).toBe("step-1");
+		expect(patched?.steps[0].title).toBe("新标题");
+
+		// 超长截断：title ≤200、description ≤1000（与 setPlan 一致）
+		const long = pm.updateStep("conv-1", "step-1", {
+			title: "T".repeat(500),
+			description: "D".repeat(2000),
+		});
+		expect(long?.steps[0].title.length).toBe(200);
+		expect(long?.steps[0].description?.length).toBe(1000);
+
+		// patch 不带 description 时保留旧值；显式空串清除
+		expect(pm.updateStep("conv-1", "step-1", { status: "pending" })?.steps[0].description).toBeDefined();
+		expect(pm.updateStep("conv-1", "step-1", { description: "" })?.steps[0].description).toBeUndefined();
+	});
+
 	it("格式化计划文本供模型上下文使用", () => {
 		const pm = new PlanManager();
 		pm.setPlan("conv-1", [
@@ -67,5 +95,90 @@ describe("结构化任务计划状态机与看板管理 (PlanManager / Plan Mode
 
 		pm.clearPlan("conv-1");
 		expect(pm.getPlan("conv-1")).toBeNull();
+	});
+
+	it("plan_update 工具携带决策就绪型提示词规范并支持受影响清单", async () => {
+		const pm = new PlanManager();
+		const messages: unknown[] = [];
+		const tool = makePlanUpdateTool(
+			pm,
+			() => "conv-1",
+			(msg) => messages.push(msg),
+			() => {},
+		);
+
+		// 验证 promptSnippet 与 promptGuidelines 规范
+		expect(tool.promptSnippet).toBeTruthy();
+		const guidelines = (tool.promptGuidelines as string[]).join("\n");
+		expect(guidelines).toContain("decision-ready steps");
+		expect(guidelines).toContain("File Touch List");
+		expect(guidelines).toContain("rollback");
+
+		// 执行更新
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const ctx = {} as any;
+		await tool.execute(
+			"call-1",
+			{
+				steps: [
+					{
+						id: "step-1",
+						title: "定位问题代码",
+						status: "done",
+						description: "Discovery: 确认了配置解析中的异常分支",
+					},
+					{
+						id: "step-2",
+						title: "修复并添加测试",
+						status: "in_progress",
+						description: "Files touched: server/agent-service.ts; Rollback: git checkout server/agent-service.ts",
+					},
+				],
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		const plan = pm.getPlan("conv-1");
+		expect(plan).toBeTruthy();
+		expect(plan?.steps.length).toBe(2);
+		expect(plan?.steps[1].description).toContain("Files touched");
+		expect(plan?.steps[1].description).toContain("Rollback");
+		expect(messages.length).toBeGreaterThan(0);
+	});
+
+	it("deleteStep 增量删除步骤并正确推进 activeStepId (issue #444)", () => {
+		const pm = new PlanManager();
+		pm.setPlan("conv-1", [
+			{ id: "step-1", title: "步骤1", status: "done" },
+			{ id: "step-2", title: "步骤2", status: "in_progress" },
+			{ id: "step-3", title: "步骤3", status: "pending" },
+		]);
+
+		// 删除正在执行的步骤2，activeStepId 自动推给步骤3
+		const next = pm.deleteStep("conv-1", "step-2");
+		expect(next?.steps.map((s) => s.id)).toEqual(["step-1", "step-3"]);
+		expect(next?.activeStepId).toBe("step-3");
+
+		// 删除不存在的步骤：安全早退保持不变
+		const untouched = pm.deleteStep("conv-1", "step-not-found");
+		expect(untouched?.steps.length).toBe(2);
+	});
+
+	it("addStep 增量插入步骤并截断过长字符 (issue #444)", () => {
+		const pm = new PlanManager();
+		pm.setPlan("conv-1", [
+			{ id: "step-1", title: "步骤1", status: "done" },
+			{ id: "step-2", title: "步骤2", status: "pending" },
+		]);
+
+		// 插入到步骤1之后
+		const after1 = pm.addStep("conv-1", { id: "step-1.5", title: "步骤1.5", status: "pending" }, "step-1");
+		expect(after1?.steps.map((s) => s.id)).toEqual(["step-1", "step-1.5", "step-2"]);
+
+		// 默认追加到末尾
+		const atEnd = pm.addStep("conv-1", { id: "step-3", title: "步骤3", status: "pending" });
+		expect(atEnd?.steps.map((s) => s.id)).toEqual(["step-1", "step-1.5", "step-2", "step-3"]);
 	});
 });

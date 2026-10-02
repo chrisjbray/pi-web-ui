@@ -9,10 +9,12 @@ import {
 	buildToolsSchemaText,
 	collectTemplateTokens,
 	effectiveTemplate,
+	estimatePromptTokens,
 	isReadonlyPromptSource,
 	renderDefaultPrompt,
 	renderPromptTemplate,
 	resolveSectionTexts,
+	splitExtensionWrap,
 	type PromptComposerInputs,
 	type PromptToken,
 } from "../../server/prompt-composer.js";
@@ -314,5 +316,72 @@ describe("READONLY_PROMPT_SOURCES / isReadonlyPromptSource — 只读来源判�
 		expect(isReadonlyPromptSource("guidelines")).toBe(false);
 		expect(isReadonlyPromptSource("append")).toBe(false);
 		expect(isReadonlyPromptSource("typo")).toBe(false);
+	});
+});
+
+describe("estimatePromptTokens — token 占用估算", () => {
+	it("空串为 0；纯 ASCII ≈ 1 token / 4 字符（向上取整）", () => {
+		expect(estimatePromptTokens("")).toBe(0);
+		expect(estimatePromptTokens("abcdefgh")).toBe(2);
+		expect(estimatePromptTokens("abc")).toBe(1);
+	});
+
+	it("CJK 字符按 1 token/字，混排按两类分别计", () => {
+		expect(estimatePromptTokens("你好世界")).toBe(4);
+		// 4 个汉字 + 8 个 ASCII 字符
+		expect(estimatePromptTokens("你好世界abcdefgh")).toBe(6);
+	});
+
+	it("实际提示词量级合理（默认模板渲染结果不为 0 且随内容增长）", () => {
+		const short = renderDefaultPrompt(resolveSectionTexts(inputs()));
+		const more = renderDefaultPrompt(
+			resolveSectionTexts(inputs({ contextFiles: [{ path: "A.md", content: "x".repeat(10_000) }] })),
+		);
+		const base = estimatePromptTokens(short);
+		expect(base).toBeGreaterThan(0);
+		expect(estimatePromptTokens(more)).toBeGreaterThan(base + 2000);
+	});
+});
+
+describe("splitExtensionWrap", () => {
+	const base = "You are Pi.\n\nAvailable tools:\nread, bash";
+
+	it("no extension touched the prompt → nothing to re-wrap", () => {
+		expect(splitExtensionWrap(base, base)).toEqual({ pre: "", core: base, post: "" });
+	});
+
+	it("keeps a prepend", () => {
+		const wrap = splitExtensionWrap(base, `<invoked_skill/>\n${base}`);
+		expect(wrap).toEqual({ pre: "<invoked_skill/>\n", core: base, post: "" });
+		expect(wrap.pre + "RENDERED" + wrap.post).toBe("<invoked_skill/>\nRENDERED");
+	});
+
+	it("keeps an append", () => {
+		expect(splitExtensionWrap(base, `${base}\n<extra/>`)).toEqual({ pre: "", core: base, post: "\n<extra/>" });
+	});
+
+	it("keeps prepend and append together", () => {
+		expect(splitExtensionWrap(base, `A\n${base}\nB`)).toEqual({ pre: "A\n", core: base, post: "\nB" });
+	});
+
+	it("mid-prompt insertion is not splittable → caller keeps today's behaviour", () => {
+		const spliced = base.replace("Available tools:", "<mid/>\nAvailable tools:");
+		expect(splitExtensionWrap(base, spliced)).toEqual({ pre: "", core: spliced, post: "" });
+	});
+
+	it("wholesale replacement is not splittable → never doubles the prompt", () => {
+		expect(splitExtensionWrap(base, "totally different")).toEqual({
+			pre: "",
+			core: "totally different",
+			post: "",
+		});
+	});
+
+	it("empty baseline is not searched for", () => {
+		expect(splitExtensionWrap("", "anything")).toEqual({ pre: "", core: "anything", post: "" });
+	});
+
+	it("splits on the first occurrence when the baseline repeats", () => {
+		expect(splitExtensionWrap("x", "axbxc")).toEqual({ pre: "a", core: "x", post: "bxc" });
 	});
 });

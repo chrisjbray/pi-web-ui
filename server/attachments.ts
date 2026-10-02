@@ -10,7 +10,8 @@
  * 从 agent-service.ts 抽出，行为保持不变；上下文经 AttachmentContext 注入。
  */
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { ServerMessage } from "./protocol.js";
+import type { PromptAttachment, ServerMessage } from "./protocol.js";
+import { formatTextQuote, readTextQuote } from "./text-quote.js";
 import type { ServerLang } from "./i18n.js";
 import { sniffImageMime } from "./text-sniff.js";
 import { saveUpload, uploadsRoot } from "./uploads.js";
@@ -20,8 +21,20 @@ import { saveAttachment } from "./attachment-store.js";
 import type { ClientSettings } from "./client-state.js";
 
 /** 跨快照的视觉转写缓存：批次 hash（名称 + base64 头 + 提示词）→ 转写文本。
- *  编辑重问重发相同图片不再重复耗视觉 token。进程级共享即可。 */
+ *  编辑重问重发相同图片不再重复耗视觉 token。进程级共享即可。
+ *  长驻进程下无界 Map 会随图片种类缓慢吃内存（单条转写可达数十 KB），
+ *  超过 VISION_BRIDGE_CACHE_MAX 按插入序 FIFO 淘汰最旧。 */
+const VISION_BRIDGE_CACHE_MAX = 256;
 const visionBridgeCache = new Map<string, string>();
+
+function cacheVisionTranscript(key: string, value: string): void {
+	visionBridgeCache.set(key, value);
+	if (visionBridgeCache.size > VISION_BRIDGE_CACHE_MAX) {
+		// Map 迭代序 = 插入序，第一个 key 即最旧。
+		const oldest = visionBridgeCache.keys().next().value;
+		if (oldest !== undefined) visionBridgeCache.delete(oldest);
+	}
+}
 
 /** "provider/id" 解析；非法格式返回 null。 */
 export function parseModelSpec(spec?: string | null): {
@@ -59,25 +72,7 @@ function attr(value: string): string {
 
 export async function buildAttachmentMessages(
 	ctx: AttachmentContext,
-	attachments:
-		| {
-				path: string;
-				mode?: "inline" | "reference" | "lines" | "page" | "conversation";
-				conversationId?: string;
-				sessionPath?: string;
-				lines?: { start: number; end: number };
-				/** Raw pasted/dropped/uploaded image (base64) — bypasses workspace path. */
-				imageData?: string;
-				/** Raw uploaded file bytes (base64) — persisted, attached as reference. */
-				fileData?: string;
-				/** Absolute path of a previously-uploaded file to re-read from disk
-				 *  (edit-and-re-ask restore). Mutually exclusive with fileData. */
-				uploadPath?: string;
-				mimeType?: string;
-				name?: string;
-				size?: number;
-		  }[]
-		| undefined,
+	attachments: PromptAttachment[] | undefined,
 ): Promise<{ message: Parameters<AgentSession["sendCustomMessage"]>[0] }[]> {
 	if (!attachments || attachments.length === 0) return [];
 	const fs = await import("node:fs/promises");
@@ -264,7 +259,7 @@ export async function buildAttachmentMessages(
 								lang: vLang,
 							},
 						);
-						visionBridgeCache.set(batchHash, transcript);
+						cacheVisionTranscript(batchHash, transcript);
 						ctx.emit({
 							type: "notice",
 							level: "info",
@@ -287,6 +282,27 @@ export async function buildAttachmentMessages(
 	}
 
 	for (const [idx, att] of attachments.entries()) {
+		if (att.mode === "quote") {
+			const quote = readTextQuote(att.quote);
+			if (!quote) {
+				ctx.emit({
+					type: "notice",
+					level: "warning",
+					text: "引用内容无效，请重新选择文字",
+					textEn: "Select the text again to add a quote.",
+				});
+				continue;
+			}
+			out.push({
+				message: {
+					customType: "file",
+					content: [{ type: "text", text: formatTextQuote(quote) }],
+					display: true,
+					details: { mode: "quote", quote },
+				},
+			});
+			continue;
+		}
 		// Quoted conversation (left-panel right-click / global-search quote):
 		// `path` is unused — the reference travels in conversationId (running
 		// conversation, incl. subagents) or sessionPath (history transcript).
@@ -479,7 +495,21 @@ export async function buildAttachmentMessages(
 			// Uploaded files live in a GLOBAL per-user dir (not inside the project
 			// or the per-client session store) so browsing a repo never picks up
 			// uploaded junk: <dataDir>/uploads/<clientId>/（保留期自动清理，见 uploads.ts）。
-			const { abs, displayName: safeName } = saveUpload(ctx.clientId, att.name ?? "file", buf);
+			// saveUpload 对非法 clientId/displayName 抛错（消毒失败整条拒绝，绝不
+			// 落到别的目录）—— 这里报错跳过该附件，不让一条坏附件中断整条消息。
+			let saved: { abs: string; displayName: string };
+			try {
+				saved = saveUpload(ctx.clientId, att.name ?? "file", buf);
+			} catch (err) {
+				ctx.emit({
+					type: "notice",
+					level: "error",
+					text: `上传文件保存失败，已跳过：${(err as Error).message}`,
+					textEn: `Failed to save uploaded file, skipped: ${(err as Error).message}`,
+				});
+				continue;
+			}
+			const { abs, displayName: safeName } = saved;
 			// Wire format: forward-slash absolute path (the read tool accepts
 			// absolute paths; Windows uses "C:/..." — safe inside the XML-ish tag).
 			const wirePath = abs.split(sep).join("/");

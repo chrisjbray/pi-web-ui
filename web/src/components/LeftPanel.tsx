@@ -23,7 +23,7 @@ import { ProjectPicker } from "./ProjectPicker.js";
 import { LP_SECTION_ENTRY_IDS, type UiSlotEntry } from "../ui-slots";
 import { contextMenuItems, openContextMenu, type ContextMenuRequest } from "../context-menu-state";
 import { composeToComposer, focusComposer } from "../composer-bridge";
-import { clearLastCwdIfMatches } from "../use-chat";
+import { clearCachedProject, clearCachedSession, clearLastCwdIfMatches } from "../use-chat";
 
 /** Props are deliberately NARROW (no whole-ChatState object): every field is
  *  stable while tokens stream in, so the shallow-compared memo() below skips
@@ -53,6 +53,8 @@ interface LeftPanelProps {
 			| { type: "dismiss_conversation"; id: string; withFinishedSubagents?: boolean; force?: boolean }
 			| { type: "dismiss_finished_subagents"; parentId?: string }
 			| { type: "persist_conversation"; id: string }
+			| { type: "pin_conversation"; id: string; pinned: boolean }
+			| { type: "pin_session"; path: string; pinned: boolean }
 			| { type: "take_over_conversation"; owner: string; id: string }
 			| { type: "peek_elsewhere_question"; owner: string; id: string }
 			| { type: "make_dir"; path: string; setAsCwd?: boolean },
@@ -99,6 +101,7 @@ type SessionMenuTarget = {
 	kind: "running" | "history" | "section" | "elsewhere";
 	label: string;
 	owner?: string;
+	pseudo?: boolean;
 };
 
 /** 右键落点是不是「输入类」元素：重命名输入框里的右键要留给浏览器（复制 / 粘贴 /
@@ -310,9 +313,9 @@ export const LeftPanel = memo(function LeftPanel({
 				// （与悬停 ✎ 铅笔同一套内嵌输入框，见 dispatchHostSessionEntry）。
 				if (entry.id === "host:conv-rename")
 					return target.kind === "running" || target.kind === "history" ? entry : { ...entry, hidden: true };
-				// 过户：只在「另一处」行出现（无 owner/convId 的旧条目同样隐藏）。
+				// 过户：只在「另一处」行出现（无 owner/convId 的旧条目与无头伪客户端条目同样隐藏）。
 				if (entry.id === "host:conv-takeover")
-					return isElsewhere && takeId && target.owner ? entry : { ...entry, hidden: true };
+					return isElsewhere && takeId && target.owner && !target.pseudo ? entry : { ...entry, hidden: true };
 				// 关闭类是本会话口径，「另一处」行不适用。
 				if (isElsewhere && (entry.id === "host:conv-dismiss-subagents" || entry.id === "host:conv-force-dismiss"))
 					return { ...entry, hidden: true };
@@ -322,6 +325,17 @@ export const LeftPanel = memo(function LeftPanel({
 					return scopeId
 						? { ...entry, ...(armed ? { label: t("forceDismissConfirm") } : {}) }
 						: { ...entry, hidden: true };
+				// 钉住 / 取消钉住：在运行中的主对话行或历史行出现（子代理本来就永久保留，钉住无意义；「另一处」行不适用）。
+				if (entry.id === "host:conv-pin") {
+					if (target.kind === "history") {
+						const isPinned = sessions.find((s) => s.path === target.id)?.pinned;
+						return isPinned ? { ...entry, label: t("unpinConversation") } : entry;
+					}
+					if (!scopeId) return { ...entry, hidden: true };
+					const pinTarget = conversations.find((c) => c.id === scopeId);
+					if (!pinTarget || pinTarget.isSubagent) return { ...entry, hidden: true };
+					return pinTarget.pinned ? { ...entry, label: t("unpinConversation") } : entry;
+				}
 				// 固化子代理/临时对话为普通对话：只在内存会话（未落盘、isSubagent 或临时）行显示
 				if (entry.id === "host:conv-persist") {
 					if (!scopeId) return { ...entry, hidden: true };
@@ -394,6 +408,19 @@ export const LeftPanel = memo(function LeftPanel({
 			}
 			if (entry.id === "host:conv-persist") {
 				if (scopeId) panelSend({ type: "persist_conversation", id: scopeId });
+				return;
+			}
+			// 钉住 / 取消钉住：按当前状态翻转（菜面文案已按状态给过用户正确预期）。
+			if (entry.id === "host:conv-pin") {
+				if (target.kind === "history") {
+					const cur = sessions.find((s) => s.path === target.id);
+					panelSend({ type: "pin_session", path: target.id, pinned: !cur?.pinned });
+					return;
+				}
+				if (scopeId) {
+					const cur = conversations.find((c) => c.id === scopeId);
+					panelSend({ type: "pin_conversation", id: scopeId, pinned: !cur?.pinned });
+				}
 				return;
 			}
 			// 对话引用三件套（复制 id / 复制会话文件路径 / 引用到输入框）。
@@ -540,7 +567,13 @@ export const LeftPanel = memo(function LeftPanel({
 		[sessionMenuAvailable, showSessionMenu],
 	);
 
-	type RowConv = ConversationSummary & { elsewhere?: boolean; owner?: string; convId?: string; hasQuestion?: boolean };
+	type RowConv = ConversationSummary & {
+		elsewhere?: boolean;
+		owner?: string;
+		convId?: string;
+		hasQuestion?: boolean;
+		pseudo?: boolean;
+	};
 	const panelRef = useRef<HTMLElement>(null);
 	const [weights, setWeights] = useState<LpWeights>(() => loadLpWeights());
 	useEffect(() => {
@@ -560,6 +593,7 @@ export const LeftPanel = memo(function LeftPanel({
 			isStreaming: w.isStreaming,
 			isSubagent: false as const,
 			elsewhere: true as const,
+			pseudo: Boolean(w.pseudo),
 			// 过户目标定位（无则沿用旧行为：只读行，无过户入口）。
 			...(w.owner && w.convId ? { owner: w.owner, convId: w.convId } : {}),
 			...(w.hasQuestion ? { hasQuestion: true as const } : {}),
@@ -735,6 +769,7 @@ export const LeftPanel = memo(function LeftPanel({
 									</button>
 									{delButton(`proj:${p.path}`, t("deleteProject"), t("deleteProjectConfirm"), () => {
 										clearLastCwdIfMatches(p.path);
+										clearCachedProject(p.path);
 										panelSend({ type: "remove_project", path: p.path });
 									})}
 								</div>
@@ -795,9 +830,16 @@ export const LeftPanel = memo(function LeftPanel({
 											if ((c as RowConv).elsewhere) {
 												const elseOwner = (c as RowConv).owner;
 												const elseConvId = (c as RowConv).convId;
+												const isPseudo = Boolean((c as RowConv).pseudo);
 												// issue #290：可过户（有 owner + convId）时本行可点击，两段确认。
-												const canTakeover = Boolean(elseOwner && elseConvId);
+												// issue #426：无头伪客户端（定时任务/插件）不支持过户，降级为只读行。
+												const canTakeover = Boolean(elseOwner && elseConvId) && !isPseudo;
 												const confirming = confirmTakeover === c.id;
+												const tooltip = confirming
+													? t("takeoverConfirm")
+													: isPseudo
+														? `${t("elsewherePseudoTip")}\n${c.cwd}`
+														: `${t("elsewhereTip")}\n${c.cwd}`;
 												return (
 													<div
 														className="lp-row"
@@ -810,6 +852,7 @@ export const LeftPanel = memo(function LeftPanel({
 																kind: "elsewhere",
 																label: c.title,
 																...(elseOwner ? { owner: elseOwner } : {}),
+																...(isPseudo ? { pseudo: true } : {}),
 															})
 														}
 													>
@@ -818,7 +861,7 @@ export const LeftPanel = memo(function LeftPanel({
 														<button
 															type="button"
 															className={`session-item elsewhere-item${canTakeover ? "" : " elsewhere-static"}${confirming ? " confirm" : ""}`}
-															title={confirming ? t("takeoverConfirm") : `${t("elsewhereTip")}\n${c.cwd}`}
+															title={tooltip}
 															tabIndex={canTakeover ? 0 : -1}
 															onClick={
 																canTakeover
@@ -840,8 +883,10 @@ export const LeftPanel = memo(function LeftPanel({
 															<FiMessageSquare className="session-icon" />
 															<span className="session-info">
 																<span className="session-title">
-																	<span className="elsewhere-badge">{t("elsewhereBadge")}</span>
-																	{c.hasQuestion && elseOwner && elseConvId && (
+																	<span className="elsewhere-badge">
+																		{isPseudo ? t("elsewherePseudoBadge") : t("elsewhereBadge")}
+																	</span>
+																	{c.hasQuestion && elseOwner && elseConvId && !isPseudo && (
 																		<span
 																			className="question-badge clickable"
 																			title={t("takeoverHasQuestion")}
@@ -881,6 +926,7 @@ export const LeftPanel = memo(function LeftPanel({
 																		kind: "elsewhere",
 																		label: c.title,
 																		...(elseOwner ? { owner: elseOwner } : {}),
+																		...(isPseudo ? { pseudo: true } : {}),
 																	});
 																}}
 															>
@@ -956,6 +1002,11 @@ export const LeftPanel = memo(function LeftPanel({
 																	{c.hasQuestion && (
 																		<span className="question-badge" title={t("waitingQuestionBadge")}>
 																			?
+																		</span>
+																	)}
+																	{c.pinned && (
+																		<span className="pin-badge" title={t("pinnedConversation")}>
+																			📌
 																		</span>
 																	)}
 																</span>
@@ -1149,7 +1200,14 @@ export const LeftPanel = memo(function LeftPanel({
 													onBlur={() => setRenaming(null)}
 												/>
 											) : (
-												<span className="session-title">{displayName(s)}</span>
+												<span className="session-title">
+													{displayName(s)}
+													{s.pinned && (
+														<span className="pin-badge" title={t("pinnedConversation")}>
+															📌
+														</span>
+													)}
+												</span>
 											)}
 											{renaming === s.path ? null : (
 												<span className="session-sub">
@@ -1177,9 +1235,10 @@ export const LeftPanel = memo(function LeftPanel({
 									>
 										<FiEdit2 />
 									</button>
-									{delButton(`sess:${s.path}`, t("deleteSession"), t("deleteSessionConfirm"), () =>
-										panelSend({ type: "delete_session", path: s.path }),
-									)}
+									{delButton(`sess:${s.path}`, t("deleteSession"), t("deleteSessionConfirm"), () => {
+										clearCachedSession(s.path, currentCwd);
+										panelSend({ type: "delete_session", path: s.path });
+									})}
 									{renderLeftSessions()}
 								</div>
 							);
