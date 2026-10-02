@@ -470,7 +470,6 @@ export class ModelAdminService {
 		} catch {
 			console.warn(`[model-admin] 配置文件解析失败且无法留存：${path}（${(err as Error).message}）`);
 		}
-		}
 	}
 
 	/** Default name "密钥 N" for a provider's Nth key. */
