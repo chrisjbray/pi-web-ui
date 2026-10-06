@@ -2116,6 +2116,34 @@ wss.on("connection", (ws) => {
 					uiLayout: (msg as { uiLayout?: UiLayoutPrefs }).uiLayout,
 				});
 				break;
+			case "tool_approval_response": {
+				const svc = cs as unknown as {
+					resolveToolApproval?: (
+						id: string,
+						decision: "approve" | "deny" | "edit",
+						editedParams?: unknown,
+						reason?: string,
+						scope?: "once" | "category" | "all",
+					) => boolean;
+				};
+				if (typeof svc.resolveToolApproval === "function") {
+					svc.resolveToolApproval(msg.id, msg.decision, msg.editedParams, msg.reason, msg.scope);
+				}
+				break;
+			}
+			case "set_approval_policy": {
+				const svc = cs as unknown as {
+					setApprovalPolicy?: (p: { conversationId?: string; allowAll?: boolean; categories?: string[] }) => void;
+				};
+				if (typeof svc.setApprovalPolicy === "function") {
+					svc.setApprovalPolicy({
+						conversationId: msg.conversationId,
+						allowAll: msg.allowAll,
+						categories: msg.categories,
+					});
+				}
+				break;
+			}
 			case "extensions_reload":
 				void cs.reloadExtensions();
 				break;
