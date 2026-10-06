@@ -53,8 +53,10 @@ import type { PluginCommandDef } from "../plugins.js";
 import { checkAll as checkAllUpdates, collectTargets, resolveNpmRegistry } from "../update-check.js";
 import { previewKind } from "../text-sniff.js";
 import { removeQueuedByIndexOrText } from "../queue-utils.js";
+import { ensureCredentialFilePermissions, writeCredentialFile } from "../model-admin.js";
 import type {
 	BgServer,
+	ClientMessage,
 	CommandDef,
 	ConversationSummary,
 	DshPermissionOption,
@@ -91,6 +93,15 @@ import {
 } from "./dsh-sessions.js";
 import { generatePresetClones, PRESET_DEFAULT_ID } from "./preset-clones.js";
 import { dshContextUsage, lastUsageFromEvents, normalizeDshUsage } from "./dsh-usage.js";
+import {
+	exportPresetVia,
+	importPresetFromUrlVia,
+	importPresetVia,
+	packageVersion,
+	pushPresetCatalogVia,
+	sharePresetVia,
+	type PresetSharePort,
+} from "../preset-share.js";
 
 const SNAPSHOT_INTERVAL_MS = 60;
 /** 用户主目录（wire 格式）：进程内不变，模块加载时求值一次（右栏 🏠）。 */
@@ -402,6 +413,7 @@ export class DshClientSession {
 		this.roots = stateStore.getWorkspaceRoots(clientId, cwd);
 		this.dataDir = dataDir;
 		this.agentDir = agentDir;
+		ensureCredentialFilePermissions(this.agentDir);
 		this.sessionRoot = dshSessionRoot(dataDir);
 		try {
 			mkdirSync(this.sessionRoot, { recursive: true });
@@ -2858,12 +2870,6 @@ export class DshClientSession {
 		this.flushSnapshot(true);
 	}
 
-	async cycleModel(): Promise<void> {
-		const idx = DSH_MODELS.findIndex((m) => m.id === this.model);
-		const next = DSH_MODELS[(idx + 1) % DSH_MODELS.length];
-		await this.setModel(next.id);
-	}
-
 	setThinking(level: string): void {
 		if (level !== "high") {
 			this.emit({
@@ -2876,16 +2882,6 @@ export class DshClientSession {
 		}
 		this.thinkingLevel = level;
 		this.flushSnapshot();
-	}
-
-	cycleThinking(): void {
-		// DSH 固定 high。
-		this.emit({
-			type: "notice",
-			level: "info",
-			text: "DeepSeek V4 仅支持高思考强度",
-			textEn: "DeepSeek V4 only supports high thinking intensity",
-		});
 	}
 
 	// -----------------------------------------------------------------------
@@ -2909,6 +2905,8 @@ export class DshClientSession {
 			toolWatchdogTimeoutMs: this.settings.toolWatchdogTimeoutMs,
 			// DSH 引擎无 customTool 注册面（工具来自 shipped preset），read 目录覆盖面不存在。
 			readDirEnabled: true,
+			// DSH 无 pi 工具注册面，不适用延迟加载；保协议完整。
+			toolLazyLoading: true,
 			editSoftEnabled: this.settings.editSoftEnabled,
 			// DSH 无独立重试配置（pi 引擎才暴露），保持默认。
 			retryMaxAttempts: DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -2944,6 +2942,8 @@ export class DshClientSession {
 			uiLayout: normalizeUiLayout(this.settings.uiLayout),
 			promptTemplate: "",
 			promptOverrides: {},
+			// DSH 无 pi 工具注册表面，逐工具文案覆盖不适用；保协议完整。
+			toolPromptOverrides: {},
 			effectiveSystemPrompt: this.settings.customSystemPrompt,
 			promptSourceDefaults: {},
 			// DSH 引擎不接标准 pi 的 customTool 工具 schema（走 goal-rpc），此处给空。
@@ -3465,6 +3465,80 @@ export class DshClientSession {
 			presets.filter((p) => p.name !== name),
 		);
 		this.pushSettings();
+	}
+
+	/* -----------------------------------------------------------------------
+	 * 预设分享（server/preset-share.ts）—— 与 pi 引擎同一份编排，只换适配层。
+	 * DSH 的预设存储/应用语义不同，所以把「取/存/应用」按 DSH 的做法接上。
+	 * --------------------------------------------------------------------- */
+
+	/** 分享编排需要的最小能力集合（DSH 侧）。 */
+	private sharePort(): PresetSharePort {
+		return {
+			lang: () => this.getLang(),
+			appVersion: () => packageVersion(),
+			presets: () => this.stateStore.getPresets(this.clientId),
+			currentSettings: () => {
+				const s = this.settings;
+				// DSH 的预设记录字段与 ClientSettings 不完全一致（没有 promptTemplate/
+				// promptOverrides 等），导出时按预设形状给默认值（应用侧只读它认识的）。
+				return {
+					promptMode: s.promptMode,
+					customSystemPrompt: s.customSystemPrompt,
+					promptTemplate: "",
+					promptOverrides: {},
+					disabledSkills: [...(s.disabledSkills ?? [])],
+					disabledExtensions: [...(s.disabledExtensions ?? [])],
+					disabledAgentTools: [],
+					disabledPluginTools: [],
+					terminalToolsEnabled: s.terminalToolsEnabled,
+					terminalBash: s.terminalBash,
+					terminalBashIdleMs: s.terminalBashIdleMs,
+					terminalBashMaxForegroundMs: s.terminalBashMaxForegroundMs,
+					editSoftEnabled: s.editSoftEnabled,
+					skillsFullText: [],
+					reviewPrompt: s.reviewPrompt ?? "",
+					reviewDisabledSkills: [],
+				};
+			},
+			upsertPreset: (preset) => {
+				const presets = this.stateStore.getPresets(this.clientId);
+				this.stateStore.savePresets(
+					this.clientId,
+					presets.some((p) => p.name === preset.name)
+						? presets.map((p) => (p.name === preset.name ? preset : p))
+						: [...presets, preset],
+				);
+			},
+			applyPreset: (name) => this.applyPreset(name),
+			pushSettings: () => this.pushSettings(),
+			emit: (msg) => this.emit(msg),
+		};
+	}
+
+	/** 导出预设/当前设置为可分享的 JSON（服务端 preset-share.ts）。 */
+	async exportPreset(msg: Extract<ClientMessage, { type: "preset_export" }>): Promise<void> {
+		exportPresetVia(this.sharePort(), msg);
+	}
+
+	/** 解析导入的预设 JSON（dryRun = 只预览）。 */
+	async importPreset(msg: Extract<ClientMessage, { type: "preset_import" }>): Promise<void> {
+		await importPresetVia(this.sharePort(), msg);
+	}
+
+	/** 按网址导入预设（服务端抓取）。 */
+	async importPresetFromUrl(msg: Extract<ClientMessage, { type: "preset_import_url" }>): Promise<void> {
+		await importPresetFromUrlVia(this.sharePort(), msg);
+	}
+
+	/** 拉社区共享预设目录。 */
+	async pushPresetCatalog(msg: Extract<ClientMessage, { type: "preset_catalog" }>): Promise<void> {
+		await pushPresetCatalogVia(this.sharePort(), msg);
+	}
+
+	/** 一键分享预设到社区共享仓库。 */
+	async sharePreset(msg: Extract<ClientMessage, { type: "preset_share" }>): Promise<void> {
+		await sharePresetVia(this.sharePort(), msg);
 	}
 
 	// -----------------------------------------------------------------------
@@ -4151,7 +4225,8 @@ export class DshClientSession {
 				/* new file */
 			}
 			auth[this.normalizeDshProvider(provider)] = { type: "api_key", key };
-			writeJsonAtomicSync(authPath, auth);
+			writeCredentialFile(authPath, JSON.stringify(auth, null, 2) + "\n");
+			ensureCredentialFilePermissions(this.agentDir);
 			this.emit({
 				type: "notice",
 				level: "info",
@@ -4180,7 +4255,8 @@ export class DshClientSession {
 				return;
 			}
 			delete auth[pid];
-			writeJsonAtomicSync(authPath, auth);
+			writeCredentialFile(authPath, JSON.stringify(auth, null, 2) + "\n");
+			ensureCredentialFilePermissions(this.agentDir);
 			this.emit({
 				type: "notice",
 				level: "info",

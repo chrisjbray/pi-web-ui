@@ -76,11 +76,13 @@ import type {
 	PluginChatRequest,
 	PluginChatResult,
 	PluginCommandDef,
+	PluginConversationQuery,
 	PluginConversationSnapshot,
 	PluginRunEvent,
 	PluginToolEvent,
 } from "./plugins.js";
 import { syncPluginToolsIntoSession } from "./plugins.js";
+import { modelChangeKey, pickClientConversation, pickLatestClientSnapshot } from "./plugin-conversation-view.js";
 import {
 	denialText,
 	type GuardedToolName,
@@ -88,6 +90,7 @@ import {
 	type ToolPostRequest,
 	type ToolPreRequest,
 } from "./plugin-tool-guard.js";
+import { BASH_DESCRIPTION, BASH_PARAMETERS, BASH_PROMPT_GUIDELINES, BASH_PROMPT_SNIPPET } from "./tool-prompts.js";
 import { SettingsService } from "./settings-service.js";
 import {
 	GoalService,
@@ -97,6 +100,7 @@ import {
 	type GoalConversation,
 	type RoleWaitOutcome,
 } from "./goal-service.js";
+import { buildEvidenceDigest, sessionMessagesOf } from "./goal-evidence.js";
 import { MarkerService } from "./marker-service.js";
 import { SlashCommandsService, parseSlash } from "./slash-commands.js";
 import { ModelAdminService } from "./model-admin.js";
@@ -134,7 +138,7 @@ import { PlanManager } from "./plan-manager.js";
 import { buildPlanModePrompt, planModeDenial, planModeNoticeText, PLAN_MODE_BLOCKED_TOOL_NAMES } from "./plan-mode.js";
 import { DELEGATION_SYSTEM_PROMPT, delegationDenial, delegateNoticeText } from "./delegate-mode.js";
 import { goalReviewDenial, shouldDeferPromptForReview } from "./goal-review-gate.js";
-import { readPlanModeFromSession } from "./permission-preset.js";
+import { readPlanModeFromSession, readPlanFromSession } from "./permission-preset.js";
 import { readDelegateModeFromSession } from "./permission-preset.js";
 
 import {
@@ -149,8 +153,12 @@ import {
 	ASK_USER_QUESTION_TOOL_NAME,
 	BROWSER_PAGE_TOOL_NAME,
 	effectiveDisabledAgentTools,
+	filterToolsByPreset,
 	isAgentToolEnabled,
 	isTerminalGuidanceOn,
+	LAZY_CORE_TOOL_NAMES,
+	lazyLoadingDisabledTools,
+	LOAD_TOOLS_TOOL_NAME,
 	localizedName,
 	MARKERS_LIST_TOOL_NAME,
 	PI_AGENT_PRESETS,
@@ -161,6 +169,7 @@ import {
 	presetHasQuestionnaire,
 	presetShowsSkillCatalog,
 } from "./tool-manager.js";
+import { makeLoadToolsTool, type LoadableToolInfo, type LoadToolsHost } from "./load-tools-tool.js";
 import { WebUIContext } from "./webui-context.js";
 import { DEFAULT_COMPACTION_RESERVE_TOKENS, effectiveSoftCap, softCapToReserve } from "./soft-cap.js";
 import { pruneContextHierarchically } from "./context-budget.js";
@@ -190,6 +199,13 @@ import {
 import { disposeAllEvalKernels, disposeEvalSession, makeEvalTool } from "./eval-tool.js";
 // 工具定义说明的归一化（工具卡右键 → 「显示工具详细信息」，见 getToolInfo）。
 import { normalizeToolInfo, type RawToolDefinition } from "./tool-info.js";
+// 逐工具文案覆盖（设置页「工具」区可编辑 description/snippet/guidelines）。
+import {
+	applyToolPromptOverrides,
+	effectiveToolPrompt,
+	toolPromptOverrideOf,
+	type ToolPromptSessionLike,
+} from "./tool-prompt-overrides.js";
 import {
 	collectSubagentDescendantIds,
 	makeSubagentTools,
@@ -212,7 +228,7 @@ import { ClaimStore, matchClaims, mergeTouchSidecar, readTouchSidecar, removeTou
 import { makeClaimFilesTool, type ClaimFilesHost } from "./claim-files-tool.js";
 import { makeSkillTool, type SkillToolHost } from "./skill-tool.js";
 import { getCompactedMessages, type SessionManagerLike } from "./compacted-history.js";
-import { makeScheduleTools, type ScheduleToolHost } from "./schedule-agent-tool.js";
+import { makeScheduleTool, type ScheduleToolHost } from "./schedule-agent-tool.js";
 import { makePatchTool } from "./patch-tool.js";
 import { makeLspTool } from "./lsp-tool.js";
 import { sameSessionFile, type SchedulerStore } from "./scheduler-tasks.js";
@@ -417,31 +433,10 @@ export function makeKillableBashTool(
 	return {
 		name: tool.name,
 		label: tool.label,
-		description:
-			"Run a shell command natively (process spawn, no terminal); returns full output plus exit code. persist is ignored here; use head/tail to trim returned output.",
-		parameters: Type.Object({
-			command: Type.String({ description: "The shell command to run" }),
-			timeout: Type.Optional(Type.Number({ description: "Optional timeout in seconds" })),
-			persist: Type.Optional(
-				Type.Boolean({
-					description: "Ignored in native mode (no terminal). Only meaningful when the terminal-backed bash is active.",
-				}),
-			),
-			head: Type.Optional(
-				Type.Integer({
-					minimum: 1,
-					maximum: 5000,
-					description: "Only return the FIRST N lines of output (like `| head -N`).",
-				}),
-			),
-			tail: Type.Optional(
-				Type.Integer({
-					minimum: 1,
-					maximum: 5000,
-					description: "Only return the LAST N lines of output (like `| tail -N`).",
-				}),
-			),
-		}),
+		description: BASH_DESCRIPTION,
+		promptSnippet: BASH_PROMPT_SNIPPET,
+		promptGuidelines: BASH_PROMPT_GUIDELINES,
+		parameters: BASH_PARAMETERS,
 		prepareArguments: tool.prepareArguments,
 		executionMode: tool.executionMode,
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
@@ -466,6 +461,9 @@ export function makeKillableBashTool(
  * 动态分流 bash：按「默认 bash 覆盖」设置（terminalBash）在调用时决定走哪套——
  * 关 = 原生 SDK bash（纯进程、不开终端）；开 = 终端接管 bash（persist 决定一次性/
  * 持久）。开关因此即时生效（customTools 固定于 runtime 创建，不能在创建时二选一）。
+ *
+ * 提示词不在此覆盖：两条路径共用 server/tool-prompts.ts 的那一份（单源），
+ * 覆盖 description 正是当年终端版文案被写死却不生效的成因。
  */
 export function makeAdaptiveBashTool(
 	killable: ToolDefinition,
@@ -474,12 +472,6 @@ export function makeAdaptiveBashTool(
 ): ToolDefinition {
 	return {
 		...killable,
-		description:
-			"Run a shell command and return its full output plus exit code. Behavior depends on the「default bash override」setting (terminalBash):\n" +
-			"OFF → runs natively (process spawn, no terminal); persist has no effect.\n" +
-			"ON → runs in a visible terminal. persist=true keeps the 'ai-bash' terminal alive (shell state cd/venv/ssh retained across calls); persist=false (default) is a one-shot terminal whose output stays viewable.\n" +
-			"Run the bare command — never pipe through head/tail/more/less (use the head/tail params; pipes hide live progress). For interactive commands (REPLs, y/n prompts) set persist=true and drive them with terminal_input / terminal_key.",
-		promptSnippet: "run shell commands",
 		execute: (id, params, signal, onUpdate, ctx) => {
 			const p = params as { persist?: boolean };
 			// Windows 下 ConPTY 架构限制（MSYS2 全局控制台上限 128，且高频创建销毁容易句柄耗尽/卡顿）：
@@ -912,6 +904,24 @@ function wrapWriteToolWithPermission(
 }
 
 /**
+ * `edit` 的模型可见主描述（仅无扩展覆盖时的基底用；有扩展 edit 时保留它自己的文案）。
+ *
+ * SDK 自带的描述与其自带 guidelines 几乎逐条复述（oldText 要唯一匹配 / 多处改动合成一次调用 /
+ * 不要垫大段未改区域都说两遍），单条信息重复进上下文。这里只留一句「做什么」，细节交给
+ * guidelines（它们是 SDK 的，本模块不碰）。
+ */
+const EDIT_DESCRIPTION =
+	"Edit a single file by exact text replacement: every edits[].oldText must uniquely match the original file.";
+
+/** `edit` 的精简 guidelines（同上：只用于无扩展覆盖的基底；与 SDK 四条规则一一对应，只去冗余措辞）。 */
+const EDIT_GUIDELINES = [
+	"Use edit for precise changes; oldText must match exactly",
+	"When changing several separate locations in one file, put them in ONE call's edits[] instead of multiple calls",
+	"Each oldText matches the original file, not earlier edits in the same call — never overlapping or nested",
+	"Keep oldText small but unique; never pad with large unchanged regions",
+];
+
+/**
  * 为 edit 工具包装会话级权限沙箱与人机协同审批（基底语义同 write）。
  */
 function wrapEditToolWithPermission(
@@ -1156,20 +1166,21 @@ function wrapEditSoftToolWithPermission(
  */
 export function makePlanUpdateTool(
 	planManager: PlanManager,
-	getActiveConvId: () => string,
+	getActiveConvTarget: () => string | { id: string; sessionId?: string; sessionManager?: unknown },
 	emit: (msg: ServerMessage) => void,
 	flushSnapshot: () => void,
+	onPersist?: (convId: string, plan: import("./protocol.js").PlanState) => void,
 ): ToolDefinition {
 	return {
 		name: PLAN_UPDATE_TOOL_NAME,
 		label: "plan_update",
 		description:
-			"Update the structured task plan / step state machine (Plan Mode): break non-trivial work into decision-ready steps and track progress (pending -> in_progress -> done/failed). Prefer steps that note discovery conclusions, files to be touched, and a rollback strategy.",
-		promptSnippet: "update structured task plan with decision-ready steps, file touch list, and live status",
+			"Update the structured task plan / step state machine (Plan Mode) and track progress (pending -> in_progress -> done/failed).",
+		promptSnippet: "track decision-ready steps, file touch list, and live status",
 		promptGuidelines: [
-			"When executing non-trivial tasks, use plan_update early to outline decision-ready steps before coding: " +
-				"specify discovery conclusions, explicitly list files to be touched (File Touch List), and note potential rollback strategies",
-			"Keep step status updated as work progresses (pending -> in_progress -> done/failed) so the user has real-time visibility",
+			"Use plan_update early on non-trivial tasks to outline decision-ready steps before coding",
+			"Per step: discovery conclusions, files to be touched (File Touch List), rollback strategy",
+			"Update step status as work progresses for real-time visibility",
 		],
 		parameters: Type.Object({
 			steps: Type.Array(
@@ -1185,7 +1196,7 @@ export function makePlanUpdateTool(
 					),
 					description: Type.Optional(
 						Type.String({
-							description: "Optional detailed description, acceptance criteria, file touch list, or rollback note.",
+							description: "Optional step detail: acceptance criteria, files touched, rollback note.",
 						}),
 					),
 				}),
@@ -1194,9 +1205,20 @@ export function makePlanUpdateTool(
 			activeStepId: Type.Optional(Type.String({ description: "ID of the step currently being executed" })),
 		}),
 		execute: async (toolCallId: string, params: unknown) => {
-			const convId = getActiveConvId();
+			const target = getActiveConvTarget();
+			const convId = typeof target === "string" ? target : target.id;
+			const sessionId = typeof target === "string" ? undefined : target.sessionId;
 			const p = params as { steps: import("./protocol.js").PlanStep[]; activeStepId?: string | null };
-			const plan = planManager.setPlan(convId, p.steps, p.activeStepId);
+			const plan = planManager.setPlan(convId, p.steps, p.activeStepId, sessionId);
+			if (typeof target !== "string" && target.sessionManager) {
+				try {
+					const sm = target.sessionManager as { appendCustomEntry?: (type: string, data: unknown) => void };
+					sm?.appendCustomEntry?.("plan/update", { plan });
+				} catch {
+					// 转录追加失败不影响主流程
+				}
+			}
+			onPersist?.(convId, plan);
 			emit({
 				type: "plan_updated",
 				conversationId: convId,
@@ -1254,7 +1276,7 @@ function makeMarkersListTool(
 ): ToolDefinition {
 	return {
 		name: MARKERS_LIST_TOOL_NAME,
-		promptSnippet: "list current inline-marker tasks (read-only — writes go through [[todo:...]] inline markers)",
+		promptSnippet: "list inline-marker tasks (read-only; writes use [[todo:...]])",
 		label: "List marker state",
 		description:
 			"Read-only query of inline marker state. All WRITE operations must use inline markers ([[todo:new:...]] etc.) in the reply body — never this tool.",
@@ -1350,17 +1372,15 @@ export function makeAskUserQuestionTool(
 		label: "Ask the user",
 		description:
 			"Ask the user 1-3 focused questions to clarify requirements, confirm decisions, or choose options. " +
-			"Provide 2-4 choices (recommended first) with concise tradeoffs. " +
 			"Renders a rich browser dialog; resumes on submit or cancel.",
-		promptSnippet: "ask the user 1-3 focused questions with recommended options and tradeoffs to clarify requirements",
+		promptSnippet: "clarify ambiguous requirements or confirm a decision with the user",
 		promptGuidelines: [
-			"When requirements are ambiguous, use ask_user_question to clarify: " +
-				"strictly 1 to 3 focused questions (prefer 1), 2-4 choices with recommended option first, and explain impact/tradeoff concisely",
+			"When requirements are ambiguous, clarify with ask_user_question: 1 to 3 focused questions (prefer 1), 2-4 choices with the recommended option first, each with a concise impact/tradeoff",
 			"A cancelled question comes back as a tool error — respect it without immediately re-asking",
 		],
 		parameters: Type.Object({
 			questions: Type.Array(QuestionSchema, {
-				description: "1-3 questions to ask (prefer 1)",
+				description: "Questions to ask (prefer 1).",
 				minItems: 1,
 				maxItems: 3,
 			}),
@@ -1506,29 +1526,20 @@ export function makeBrowserPageTool(
 		name: BROWSER_PAGE_TOOL_NAME,
 		label: "Browser page",
 		description: [
-			'Read or act on a page in the USER\'S OWN browser via the pi-web-ui page-picker extension (the server only forwards). Only pages the user explicitly allowed/paired can be touched. Start with op:"pages" to list available pages, and use ONLY when the user asked you to read or operate a page — never click/type on their pages unprompted.',
-			"ops (forwarded to the extension as-is):",
-			"  pages  — no args; lists the pages you may act on",
-			'  read   — { what?: "text" | "html" | "title" | "url" | "query", selector?, all? }',
-			"  click  — { selector, index? }",
-			"  type   — { selector, text, clear?, submit? } (submit: true presses Enter)",
-			"  scroll — { selector?, to?: { x, y }, by?: { x, y } }",
-			"  goto   — { url }",
-			"  wait   — { selector?, text?, timeoutMs? } waits for the element/text to appear; that timeoutMs is the op's own",
-			"  eval   — { code } runs JS inside the page (extension-side switch, off by default)",
-			"Op options that are not fields of this tool (e.g. read's `limit`) fall back to the extension's defaults. `target` selects the page by origin when more than one is allowed; `timeoutMs` is how long the SERVER waits for the browser (1000-120000, default 30000) before failing the call.",
+			"Read or act on a page in the USER'S OWN browser via the pi-web-ui page-picker extension (the server only forwards).",
+			"Only the parameters below exist — an op option that is not a field here (e.g. type's submit) is unavailable.",
+			"ops: pages | read (what? selector? all?) | click (selector? index?) | type (selector text) | scroll (selector?) | goto (url) | wait (selector? text? timeoutMs?) | eval (code) | shot (maxEdge?)",
 		].join("\n"),
-		promptSnippet: "read or operate a page in the user's browser (page-picker extension; allowed pages only)",
+		promptSnippet: "operate a page in the user's browser (page-picker extension)",
 		promptGuidelines: [
 			"Only use browser_page when the user asked you to read or act on a page in their browser; " +
 				"never click or type on their pages on your own initiative",
-			'Start with op:"pages" to see which pages are available; ' +
-				"the target page must already be allowed in the page-picker extension — when it fails, tell the user what to enable instead of retrying blindly",
+			'Start with op:"pages"; the target page must already be allowed in the page-picker extension — ' +
+				"if it fails, tell the user what to enable instead of retrying.",
 		],
 		parameters: Type.Object({
 			op: Type.String({
-				description:
-					"Action name (extension-side): pages | read | click | type | scroll | goto | wait | eval | shot — see the tool description for each op and its options.",
+				description: "Action to perform (extension-side).",
 			}),
 			target: Type.Optional(
 				Type.String({
@@ -1547,7 +1558,7 @@ export function makeBrowserPageTool(
 			url: Type.Optional(Type.String({ description: "For op:goto — the absolute URL to navigate to." })),
 			code: Type.Optional(
 				Type.String({
-					description: "For op:eval — JavaScript to run inside the page (extension-side switch, disabled by default).",
+					description: "For op:eval — JS to run in the page (extension-side switch, disabled by default).",
 				}),
 			),
 			all: Type.Optional(
@@ -1556,13 +1567,12 @@ export function makeBrowserPageTool(
 			index: Type.Optional(Type.Number({ description: "For op:click — which match to click (default: 0)." })),
 			maxEdge: Type.Optional(
 				Type.Number({
-					description:
-						"For op:shot — max size of the longer side in px (320-1568, default 1280). Bigger = more tokens.",
+					description: "For op:shot — max px of the longer side (320-1568, default 1280).",
 				}),
 			),
 			timeoutMs: Type.Optional(
 				Type.Number({
-					description: "How long the server waits for the browser before failing (1000-120000 ms, default 30000).",
+					description: "How long the server waits for the browser (1000-120000 ms, default 30000).",
 				}),
 			),
 		}),
@@ -1792,6 +1802,15 @@ export { workspacePath };
  *
  * 导出给过户载荷类型（TakeoverPayload）用：对话对象本身在会话之间整体搬迁。
  */
+/** 描述首句（延迟加载目录里没 promptSnippet 时的回落摘要）。 */
+function firstSentence(description: string | undefined): string {
+	const text = (description ?? "").trim();
+	if (!text) return "";
+	const cut = text.split(/\n|[.。](?=\s|$)/)[0]?.trim() ?? "";
+	const head = cut || text;
+	return head.length > 160 ? `${head.slice(0, 160)}…` : head;
+}
+
 export interface Conversation {
 	id: string;
 	/** Display title: first user prompt (truncated) or the default. */
@@ -1821,6 +1840,8 @@ export interface Conversation {
 	peerHandoffTo?: string[];
 	/** 同行协作接收自的来源子代理 convId 列表（谁交接给该子代理）。 */
 	peerHandoffFrom?: string[];
+	/** 正在过户给其他会话（detach 阶段切走 active 时不触发销毁）。 */
+	transferring?: boolean;
 	runtime: AgentSessionRuntime;
 	session: AgentSession;
 	cwd: string;
@@ -2572,6 +2593,9 @@ export class ClientSession {
 	private convs = new Map<string, Conversation>();
 	private activeId = "";
 	private convSeq = 0;
+	/** 模型变更事件（#542）已发过的去重键：convId → `modelChangeKey(snap)`。重连重放
+	 *  同一个 set_model、或重复点同一个模型，不会重复触发插件订阅者。 */
+	private pluginModelKeys = new Map<string, string>();
 	/** One ModelRuntime shared by all conversations — the model chosen in the
 	 *  top bar applies to every chat, not just the one that set it. Seeded by
 	 *  the first conversation and reused by later ones. */
@@ -2631,6 +2655,9 @@ export class ClientSession {
 	/** index.ts 注入：当前打开对话变了（切历史会话/切 running 对话/新对话）时
 	 *  通知插件（PluginManager.emitConversationChanged）——轨迹视图靠它重拉。 */
 	onConversationChanged: (() => void) | undefined = undefined;
+	/** index.ts 注入：某客户端的对话模型切换成功（#542）——直接转发给
+	 *  PluginManager.emitClientModelChanged（插件用 host.onClientModelChanged 订阅）。 */
+	onClientModelChanged: ((snap: PluginConversationSnapshot) => void) | undefined = undefined;
 	/** index.ts 注入：读取插件当前注册的 AI 工具（attach 时拷贝到每个新会话）。 */
 	pluginToolsProvider: (() => PluginAgentTool[]) | undefined = undefined;
 	/** index.ts 经 AgentService 注入：内置调度存储（定时任务 Agent 工具用；未注入时工具直接报错）。 */
@@ -3146,6 +3173,267 @@ export class ClientSession {
 	 *  composer 的 {{append}} 自动内容。仅主会话（无模板）记录。 */
 	private lastSdkAppendFiles: string[] = [];
 
+	/**
+	 * 延迟加载（工具按需加载）模式下，按 session 对象存「已加载」工具集。
+	 *
+	 * 为什么手 session 而不是对话 id：过户搬的就是 session 本体（见 take_over_conversation），
+	 * 集合跟它一起走；会话销毁后 WeakMap 自动回收，不需要清理钩子。
+	 */
+	private readonly lazyLoadedBySession = new WeakMap<object, Set<string>>();
+
+	/** 延迟加载总开关（设置项，默认开；DSH 无 pi 工具注册面，走自己的服务）。 */
+	private lazyLoadingOn(): boolean {
+		return this.settingsSvc?.current.toolLazyLoading !== false;
+	}
+
+	/** 会话是否已有转录内容 —— 区分「刚建的新会话」（种子为空）与「从转录恢复的会话」
+	 *  （种子 = 当时活跃的非核心工具，保证上次加载过什么就还是什么）。 */
+	private sessionHasTranscript(session: AgentSession): boolean {
+		try {
+			return (session.state?.messages?.length ?? 0) > 0;
+		} catch {
+			return false;
+		}
+	}
+
+	/** 取（必要时建立）某 session 的已加载集合。 */
+	private lazyLoadedFor(session: AgentSession, seedFromActive: boolean): Set<string> {
+		const existing = this.lazyLoadedBySession.get(session);
+		if (existing) return existing;
+		const seed: string[] = [];
+		if (seedFromActive) {
+			const core = new Set<string>([...LAZY_CORE_TOOL_NAMES, LOAD_TOOLS_TOOL_NAME]);
+			try {
+				for (const n of session.getActiveToolNames()) if (!core.has(n)) seed.push(n);
+			} catch {
+				/* session 未就绪：空集 = 只用核心工具 */
+			}
+		}
+		const set = new Set(seed);
+		this.lazyLoadedBySession.set(session, set);
+		return set;
+	}
+
+	/**
+	 * 当前**未加载但可加载**的工具名录（名字 + 一行摘要）—— 供系统提示词的目录段
+	 * 与 `load_tools` 的数据源。
+	 *
+	 * 已按用户禁用名单 / 预设白名单 / 计划模式闸门过滤：目录里绝不能出现模型实际
+	 * 拿不到的工具，否则它会反复尝试加载。
+	 */
+	private lazyToolCatalog(
+		session: AgentSession | undefined,
+		conv: Conversation | undefined,
+	): { names: string[]; snippets: Record<string, string>; infos: LoadableToolInfo[] } {
+		const empty = { names: [] as string[], snippets: {} as Record<string, string>, infos: [] as LoadableToolInfo[] };
+		if (!session || !this.lazyLoadingOn()) return empty;
+		try {
+			const all = this.allowedToolNames(session, conv);
+			const active = new Set(session.getActiveToolNames());
+			const names: string[] = [];
+			const snippets: Record<string, string> = {};
+			const infos: LoadableToolInfo[] = [];
+			for (const name of all) {
+				if (active.has(name) || name === LOAD_TOOLS_TOOL_NAME) continue;
+				const def = session.getToolDefinition(name);
+				const snippet = this.toolSnippetOf(def);
+				if (snippet) snippets[name] = snippet;
+				names.push(name);
+				infos.push({ name, summary: snippet, description: def?.description, guidelines: def?.promptGuidelines });
+			}
+			return { names, snippets, infos };
+		} catch {
+			return empty;
+		}
+	}
+
+	/**
+	 * 延迟加载下系统提示词里的工具目录：**全部可用工具**（含已加载），顺序 = 注册表顺序。
+	 *
+	 * 刻意不过滤已加载集合 —— 列表随加载变化会让系统提示词变，供应商的前缀缓存整段失效。
+	 * 「哪些已附 schema」由 function list（tools 数组）表达，那是追加式变化，缓存前缀不变。
+	 */
+	private promptToolCatalog(
+		session: AgentSession | undefined,
+		conv: Conversation | undefined,
+	): { names: string[]; snippets: Record<string, string> } {
+		const empty = { names: [] as string[], snippets: {} as Record<string, string> };
+		if (!session || !this.lazyLoadingOn()) return empty;
+		try {
+			const names = this.allowedToolNames(session, conv).filter((n) => n !== LOAD_TOOLS_TOOL_NAME);
+			const snippets: Record<string, string> = {};
+			for (const name of names) {
+				const snippet = this.toolSnippetOf(session.getToolDefinition(name));
+				if (snippet) snippets[name] = snippet;
+			}
+			return { names, snippets };
+		} catch {
+			return empty;
+		}
+	}
+
+	/** 当前可用（未被用户禁用 / 未被预设屏蔽 / 未被当前模式闸门拦截）的工具名，注册表顺序。 */
+	private allowedToolNames(session: AgentSession, conv: Conversation | undefined): string[] {
+		const all = session.getAllTools().map((t) => t.name);
+		const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
+		const allowed = new Set(filterToolsByPreset(all, preset));
+		const disabled = new Set(effectiveDisabledAgentTools(this.settingsSvc.current));
+		if (conv?.planMode === true) for (const n of PLAN_MODE_BLOCKED_TOOL_NAMES) disabled.add(n);
+		return all.filter((n) => allowed.has(n) && !disabled.has(n));
+	}
+
+	/** 工具在系统提示词里的一行摘要：用户覆盖 → 出厂 snippet → 描述首句。 */
+	private toolSnippetOf(def: ToolDefinition | undefined): string {
+		if (!def) return "";
+		const eff = effectiveToolPrompt(
+			def,
+			toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, def.name as string),
+		);
+		return (eff.promptSnippet ?? "").trim() || firstSentence(eff.description);
+	}
+
+	/** 延迟加载下**永远活跃**的基线工具名（核心 + load_tools，按注册表顺序）。 */
+	private lazyBaselineNames(session: AgentSession): string[] {
+		let all: string[] = [];
+		try {
+			all = session.getAllTools().map((t) => t.name);
+		} catch {
+			return [];
+		}
+		const base = new Set<string>([...LAZY_CORE_TOOL_NAMES, LOAD_TOOLS_TOOL_NAME]);
+		return all.filter((n) => base.has(n));
+	}
+
+	/** `load_tools` 宿主（延迟加载）：只管「现在能加载什么」与「加载」。 */
+	private loadToolsHost(ownerId: string | undefined): LoadToolsHost {
+		return {
+			listLoadable: () => this.lazyToolCatalog(this.sessionOfOwner(ownerId), this.convOfOwner(ownerId)).infos,
+			listLoaded: () => {
+				const session = this.sessionOfOwner(ownerId);
+				if (!session) return [];
+				try {
+					return session.getActiveToolNames();
+				} catch {
+					return [];
+				}
+			},
+			load: (names) => this.loadLazyTools(this.sessionOfOwner(ownerId), this.convOfOwner(ownerId), names),
+		};
+	}
+
+	/** 按 ownerId 解析会话/对话（调用瞬间解析，与问卷/页桥同口径）。 */
+	private sessionOfOwner(ownerId: string | undefined): AgentSession | undefined {
+		try {
+			return (ownerId ? this.convs.get(ownerId)?.session : undefined) ?? this.conv?.session ?? this.session;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private convOfOwner(ownerId: string | undefined): Conversation | undefined {
+		try {
+			return (ownerId ? this.convs.get(ownerId) : undefined) ?? this.conv ?? undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** `load_tools` 的执行体：校验 → 加入已加载集 → 重放门控（工具就此活跃）。 */
+	private loadLazyTools(
+		session: AgentSession | undefined,
+		conv: Conversation | undefined,
+		names: string[],
+	): { loaded: LoadableToolInfo[]; rejected: { name: string; reason: string }[] } {
+		const lang = this.getLang();
+		const loaded: LoadableToolInfo[] = [];
+		const rejected: { name: string; reason: string }[] = [];
+		if (!session) {
+			return {
+				loaded,
+				rejected: names.map((name) => ({
+					name,
+					reason: pick(lang, "会话未就绪", "session not ready", "loadtools.notready"),
+				})),
+			};
+		}
+		let all: string[] = [];
+		try {
+			all = session.getAllTools().map((t) => t.name);
+		} catch {
+			return {
+				loaded,
+				rejected: names.map((name) => ({
+					name,
+					reason: pick(lang, "会话未就绪", "session not ready", "loadtools.notready"),
+				})),
+			};
+		}
+		const known = new Set(all);
+		const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
+		const allowed = new Set(filterToolsByPreset(all, preset));
+		const disabled = new Set(effectiveDisabledAgentTools(this.settingsSvc.current));
+		if (conv?.planMode === true) for (const n of PLAN_MODE_BLOCKED_TOOL_NAMES) disabled.add(n);
+		const set = this.lazyLoadedFor(session, this.sessionHasTranscript(session));
+		let changed = false;
+		for (const name of names) {
+			if (!known.has(name)) {
+				rejected.push({
+					name,
+					reason: pick(
+						lang,
+						"未知工具名（看目录里的名字）",
+						"unknown tool name (use a catalog name)",
+						"loadtools.unknown",
+					),
+				});
+				continue;
+			}
+			if (name === LOAD_TOOLS_TOOL_NAME) {
+				rejected.push({ name, reason: pick(lang, "常驻工具，无需加载", "always available", "loadtools.always") });
+				continue;
+			}
+			if (set.has(name)) {
+				rejected.push({ name, reason: pick(lang, "已经加载过了", "already loaded", "loadtools.already") });
+				continue;
+			}
+			if (disabled.has(name)) {
+				rejected.push({
+					name,
+					reason: pick(
+						lang,
+						"已被关闭，或在当前模式下被拦截",
+						"disabled, or blocked in the current mode",
+						"loadtools.disabled",
+					),
+				});
+				continue;
+			}
+			if (!allowed.has(name)) {
+				rejected.push({
+					name,
+					reason: pick(lang, "当前预设不允许使用它", "not allowed by the current preset", "loadtools.preset"),
+				});
+				continue;
+			}
+			set.add(name);
+			changed = true;
+			const def = session.getToolDefinition(name);
+			loaded.push({
+				name,
+				summary: def?.promptSnippet,
+				description: def?.description,
+				guidelines: Array.isArray(def?.promptGuidelines) ? def.promptGuidelines : undefined,
+			});
+		}
+		if (changed) {
+			this.applyToolGating(session, conv?.agentPreset);
+			this.sessionStatsCache = null;
+			this.cachedBaseTokens = null;
+			this.flushSnapshot();
+		}
+		return { loaded, rejected };
+	}
+
 	/** 当前活动会话的工具/资源快照 → composer 输入。cwd 取活动对话的。 */
 	private composeInputs(src: {
 		cwd: string;
@@ -3155,6 +3443,10 @@ export class ClientSession {
 		contextFiles: { path: string; content: string }[];
 		skills: { name: string; description: string; filePath: string }[];
 		preset?: string;
+		/** 延迟加载：提示词列完整目录、并按基线取 guidelines（详见 prompt-composer）。 */
+		lazy?: boolean;
+		/** 延迟加载：工具目录（全部可用工具，顺序稳定）。 */
+		catalogTools?: string[];
 	}): PromptComposerInputs {
 		const preset = src.preset ?? this.conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
 		// 技能名录指纹观测（只打日志，不干预组装；预览与 run 共用此入口，
@@ -3169,6 +3461,8 @@ export class ClientSession {
 			selectedTools: src.selectedTools,
 			toolSnippets: src.toolSnippets,
 			toolGuidelines: src.toolGuidelines,
+			...(src.lazy ? { lazy: true } : {}),
+			...(src.lazy && src.catalogTools ? { catalogTools: src.catalogTools } : {}),
 			piReadme: PI_DOC_PATHS.readme,
 			piDocs: PI_DOC_PATHS.docs,
 			piExamples: PI_DOC_PATHS.examples,
@@ -3220,13 +3514,22 @@ export class ClientSession {
 		contextFiles: { path: string; content: string }[];
 		skills: { name: string; description: string; filePath: string }[];
 		preset?: string;
+		/** 延迟加载：提示词列完整目录、并按基线取 guidelines。 */
+		lazy?: boolean;
+		/** 延迟加载：工具目录（全部可用工具，顺序稳定）。 */
+		catalogTools?: string[];
 	}): string | undefined {
 		const tpl = (this.settingsSvc.current.promptTemplate ?? "").trim();
 		const ovs = this.settingsSvc.current.promptOverrides ?? {};
 		const hasOverride = Object.values(ovs).some((v) => typeof v === "string" && v.trim());
 		const preset = src.preset ?? this.conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
 		const isCustomized =
-			!!tpl || hasOverride || preset !== "standard" || effectiveDisabledAgentTools(this.settingsSvc.current).length > 0;
+			!!tpl ||
+			hasOverride ||
+			preset !== "standard" ||
+			effectiveDisabledAgentTools(this.settingsSvc.current).length > 0 ||
+			// 延迟加载：提示词多了恒定目录段与 load_tools 引导，不渲染就根本不会出现。
+			src.lazy === true;
 		if (!isCustomized) return undefined;
 		const texts = resolveSectionTexts(this.composeInputs(src));
 		return renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, hasOverride ? ovs : undefined);
@@ -3249,28 +3552,44 @@ export class ClientSession {
 			const sess = conv.session;
 			const cwd = conv.cwd;
 			const active = sess.getActiveToolNames();
-			const snippets: Record<string, string> = {};
-			const guidelines: string[] = [];
 			const schemaEntries: import("./prompt-composer.js").ToolSchemaEntry[] = [];
 			for (const name of active) {
 				const def = sess.getToolDefinition(name);
 				if (!def) continue;
-				if (def.promptSnippet && def.promptSnippet.trim()) snippets[name] = def.promptSnippet;
-				if (def.promptGuidelines) guidelines.push(...def.promptGuidelines);
+				// 用户覆盖优先（description 同时反映在 schema 预览里）。
+				const eff = effectiveToolPrompt(def, toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name));
 				schemaEntries.push({
 					name,
-					description: def.description,
+					description: eff.description,
 					parameters: def.parameters,
 				});
 			}
 			const loader = sess.resourceLoader;
 			const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
+			// 提示词侧的输入必须**与已加载集合无关**：延迟加载下列完整目录（恒定），
+			// guidelines 只取基线（核心 + load_tools）——它们的要点随 load_tools 回执交付。
+			const lazyOn = this.lazyLoadingOn();
+			const catalog = lazyOn
+				? this.promptToolCatalog(sess, conv)
+				: { names: active, snippets: {} as Record<string, string> };
+			const baseNames = lazyOn ? this.lazyBaselineNames(sess) : active;
+			const baseSet = new Set(baseNames);
+			const snippets: Record<string, string> = {};
+			const guidelines: string[] = [];
+			for (const name of catalog.names) {
+				const def = sess.getToolDefinition(name);
+				if (!def) continue;
+				const eff = effectiveToolPrompt(def, toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name));
+				if (eff.promptSnippet && eff.promptSnippet.trim()) snippets[name] = eff.promptSnippet.trim();
+				if (baseSet.has(name) && eff.promptGuidelines) guidelines.push(...eff.promptGuidelines);
+			}
 			const texts = resolveSectionTexts(
 				this.composeInputs({
 					cwd,
-					selectedTools: active,
+					selectedTools: baseNames,
 					toolSnippets: snippets,
 					toolGuidelines: guidelines,
+					...(lazyOn ? { lazy: true, catalogTools: catalog.names } : {}),
 					contextFiles: loader.getAgentsFiles().agentsFiles,
 					skills: loader.getSkills().skills.map((s) => ({
 						name: s.name,
@@ -3882,7 +4201,7 @@ export class ClientSession {
 	>();
 
 	/** 任务计划管理器（Plan Mode / Step State Machine）。 */
-	private planManager = new PlanManager();
+	private planManager: PlanManager;
 	private approvalSeq = 0;
 	/** 待审批高危工具调用（Human-in-the-Loop: Edit & Run）。 */
 	private pendingApprovals = new Map<string, PendingApprovalEntry>();
@@ -3921,6 +4240,7 @@ export class ClientSession {
 		this.subagentTemplates = new SubagentTemplatesStore(join(stateStore.dataDir, "subagent-templates.json"));
 		this.approvalRules = new ApprovalRulesStore(join(stateStore.dataDir, "approval-rules.json"));
 		this.drafts = new ComposerDraftsStore(join(stateStore.dataDir, "composer-drafts.json"));
+		this.planManager = new PlanManager(join(stateStore.dataDir, "plans.json"));
 		this.markerSvc = new MarkerService({
 			clientId,
 			stateStore,
@@ -4099,6 +4419,17 @@ export class ClientSession {
 					lastTool,
 					usage,
 				};
+			},
+			// #543：执行者会话最近的工具/命令证据 —— 审查者的输入原本只有「执行者自述」，
+			// 远程部署类目标于是只能靠猜。只在审查前读一次（轮次边界），与 vitals 分开。
+			readRoleEvidence: (convId) => {
+				const conv = this.convs.get(convId);
+				if (!conv?.session) return undefined;
+				try {
+					return buildEvidenceDigest(sessionMessagesOf(conv.session)) || undefined;
+				} catch {
+					return undefined;
+				}
 			},
 			stopRoleAgent: async (convId) => {
 				const conv = this.convs.get(convId);
@@ -4439,22 +4770,33 @@ export class ClientSession {
 										);
 										return swapped === event.systemPrompt ? undefined : { systemPrompt: swapped };
 									}
-									// 主会话：按当前会话归属预设与真正活跃的工具列表组装系统提示词
+									// 主会话：按当前会话归属预设与工具组装系统提示词。
+									// 延迟加载打开时，提示词内容刻意**不依赖已加载集合**（否则每次 load_tools
+									// 都会改系统提示词，供应商前缀缓存整段失效）：工具列表 = 完整目录，
+									// guidelines 只取基线；加载后的 schema 追加在 tools 数组里（前缀不变）。
 									const conv = this.convs.get(ownerId ?? this.activeId) ?? this.conv;
 									const sess = conv?.session;
 									const activeToolNames = sess ? sess.getActiveToolNames() : [];
-									const activeSet = new Set(activeToolNames);
+									const lazyOn = this.lazyLoadingOn();
+									const catalog =
+										lazyOn && sess ? this.promptToolCatalog(sess, conv) : { names: activeToolNames, snippets: {} };
+									const baseNames = lazyOn && sess ? this.lazyBaselineNames(sess) : activeToolNames;
+									const baseSet = new Set(baseNames);
 									const activeSnippets: Record<string, string> = {};
 									const activeGuidelines: string[] = [];
 									if (sess) {
-										for (const name of activeSet) {
+										for (const name of catalog.names) {
 											const def = sess.getToolDefinition(name);
 											if (!def) continue;
-											if (def.promptSnippet && def.promptSnippet.trim()) {
-												activeSnippets[name] = def.promptSnippet.trim();
+											const eff = effectiveToolPrompt(
+												def,
+												toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name),
+											);
+											if (eff.promptSnippet && eff.promptSnippet.trim()) {
+												activeSnippets[name] = eff.promptSnippet.trim();
 											}
-											if (def.promptGuidelines) {
-												activeGuidelines.push(...def.promptGuidelines);
+											if (baseSet.has(name) && eff.promptGuidelines) {
+												activeGuidelines.push(...eff.promptGuidelines);
 											}
 										}
 									}
@@ -4473,9 +4815,10 @@ export class ClientSession {
 										| undefined;
 									const rendered = this.renderMainCompose({
 										cwd: typeof opts?.cwd === "string" ? opts.cwd : (conv?.cwd ?? effectiveCwd ?? this.cwd),
-										selectedTools: activeToolNames.length > 0 ? activeToolNames : (opts?.selectedTools ?? []),
+										selectedTools: baseNames.length > 0 ? baseNames : (opts?.selectedTools ?? []),
 										toolSnippets: activeSnippets,
 										toolGuidelines: activeGuidelines,
+										...(lazyOn ? { lazy: true, catalogTools: catalog.names } : {}),
 										contextFiles: opts?.contextFiles ?? [],
 										skills: (opts?.skills ?? []).map((s) => ({
 											name: s.name,
@@ -4677,7 +5020,15 @@ export class ClientSession {
 					// 结构化任务计划更新（Plan Mode / Step State Machine）。
 					makePlanUpdateTool(
 						this.planManager,
-						() => ownerId ?? this.activeId,
+						() => {
+							const id = ownerId ?? this.activeId;
+							const c = this.convs.get(id);
+							return {
+								id,
+								sessionId: c?.session?.sessionId,
+								sessionManager: c?.session?.sessionManager,
+							};
+						},
 						(msg) => this.emit(msg),
 						() => this.flushSnapshot(),
 					),
@@ -4718,6 +5069,11 @@ export class ClientSession {
 							isAgentToolEnabled(PRESENT_FILES_TOOL_NAME, effectiveDisabledAgentTools(this.settingsSvc.current)),
 						getLang: () => this.getLang(),
 					}),
+					// 延迟加载入口（延迟加载模式默认开）：系统提示词只给未加载工具的
+					// 名字 + 一行摘要，模型用本工具把要用的工具拉进本对话（schema 才随之下发）。
+					// 本事常在活跃集（见 applyToolGating 的 forceActive），关掉延迟加载后
+					// 它也无害（目录为空，调用会告诉模型没东西可加载）。
+					makeLoadToolsTool(this.loadToolsHost(ownerId), () => this.getLang()),
 					// 技能全文按名加载（名录在 {{skills}} 段）：模型不再拼路径调 read。
 					// 子代理会话同样注册（owner 即真正派发的父对话，读该会话 loader）。
 					// DSH 引擎无 customTool 注册面，不接。开关走统一工具 tab。
@@ -4725,11 +5081,11 @@ export class ClientSession {
 					// 主动压缩上下文工具（compact_context）：AI 主动根据当前问题精简上下文。
 					// 开关走统一工具 tab（ActiveSet 门控）。DSH 引擎无 customTool 注册面，不接。
 					makeCompactContextTool(this.compactContextHost(ownerId), () => this.getLang()),
-					// 定时唤醒三件套（schedule_task/list/cancel，issue #193）：默认绑定
+					// 定时唤醒（单 action：create/list/cancel，issue #193）：默认绑定
 					// 发起对话（ownerId，无则活动对话），到期 steer 语义唤醒它；子代理
 					// 会话同样注册（owner 即真正派发的父对话）。开关走统一工具 tab。
 					// DSH 引擎无 customTool 注册面，不接。
-					...makeScheduleTools(this.scheduleToolHost(), ownerId, () => this.getLang()),
+					makeScheduleTool(this.scheduleToolHost(), ownerId, () => this.getLang()),
 					// 持久代码求值沙箱（eval）：开关走统一工具 tab（ActiveSet 门控，默认关）。
 					// ownerId 绑定当前会话；DSH 引擎无 customTool 注册面，不接。
 					makeEvalTool({
@@ -4793,7 +5149,7 @@ export class ClientSession {
 
 	/** Wrap a fresh runtime as a new conversation record. */
 	private makeConversation(runtime: AgentSessionRuntime, id: string, terminals: TerminalManager): Conversation {
-		return {
+		const conv: Conversation = {
 			id,
 			title: conversationTitle(runtime.session),
 			isSubagent: false,
@@ -4837,6 +5193,55 @@ export class ClientSession {
 			toolWatchdogs: new Map(),
 			workspaceSnapshots: [],
 		};
+		this.restorePlan(conv);
+		return conv;
+	}
+
+	/** 会话计划回放恢复：持久化文件（sessionId）→ 转录 customType → 历史消息三重兜底。 */
+	private restorePlan(conv: Conversation): void {
+		const sessionId = conv.session.sessionId;
+		if (sessionId) {
+			const existing = this.planManager.bindSession(conv.id, sessionId);
+			if (existing) return;
+		}
+
+		// 2. 从 sessionManager entries 回放
+		const smPlan = readPlanFromSession(conv.session.sessionManager);
+		if (smPlan && Array.isArray(smPlan.steps) && smPlan.steps.length > 0) {
+			this.planManager.setPlan(conv.id, smPlan.steps, smPlan.activeStepId, sessionId);
+			return;
+		}
+
+		// 3. 从已有历史消息中回放最后一次成功的 plan_update 工具调用
+		const msgs = conv.session.agent?.state?.messages;
+		if (Array.isArray(msgs)) {
+			for (let i = msgs.length - 1; i >= 0; i--) {
+				const msg = msgs[i] as { role?: string; content?: unknown };
+				if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+					for (const part of msg.content) {
+						const p = part as {
+							type?: string;
+							name?: string;
+							input?: { steps?: unknown; activeStepId?: unknown };
+						};
+						if (
+							p?.type === "tool_use" &&
+							p.name === "plan_update" &&
+							Array.isArray(p.input?.steps) &&
+							p.input.steps.length > 0
+						) {
+							this.planManager.setPlan(
+								conv.id,
+								p.input.steps as import("./protocol.js").PlanStep[],
+								(p.input.activeStepId as string) ?? null,
+								sessionId,
+							);
+							return;
+						}
+					}
+				}
+			}
+		}
 	}
 
 	/** Summaries of conversations currently streaming — captured at shutdown
@@ -5043,8 +5448,10 @@ export class ClientSession {
 
 	/** (Re)attach event plumbing to a conversation's session. 默认绑当前活跃对话；
 	 *  forceReset 重建非活跃对话（子代理/角色对话）时必须显式传入该对话，
-	 *  否则重建后的会话永远拿不回事件订阅（issue #484）。 */
-	private async bindSession(target?: Conversation): Promise<void> {
+	 *  否则重建后的会话永远拿不回事件订阅（issue #484）。
+	 *  **public**：过户（take_over_conversation）后由 ClientSessionPool 对 **其它页面** 的
+	 *  ClientSession 调用（切会话只重建 runtime，订阅得重新挂上，见 idle-takeover-test）。 */
+	async bindSession(target?: Conversation): Promise<void> {
 		const conv = target ?? this.conv;
 		conv.unsubscribe?.();
 		conv.session = conv.runtime.session;
@@ -5201,14 +5608,38 @@ export class ClientSession {
 		}
 	}
 
-	/** 插件用：本客户端最近活跃对话的快照（轨迹视图直接显示打开对话的时间线）。
-	 *  messages/streamingMessage 为引用稳定的只读缓存对象——调用方只读、不得修改。 */
-	readConversationForPlugins(): PluginConversationSnapshot | null {
+	/** 模型切换成功后通知插件（#542）：只在（客户端, 对话, 模型）三元组真的变了时发
+	 *  一次——重连重放同一个 set_model / 重复点同一个模型不重复触发订阅者。异常隔离：
+	 *  插件侧报错不得影响切换流程。 */
+	private notifyPluginModelChange(): void {
+		if (!this.onClientModelChanged) return;
 		try {
-			let target: Conversation | null = null;
-			for (const c of this.convs.values()) {
-				if (!target || c.lastActiveAt > target.lastActiveAt) target = c;
-			}
+			// 取「本客户端正在看的那条对话」的快照（模型属于它，不能回落成别的会话）。
+			const snap = this.readConversationForPlugins({ preferActive: true, includeSubagents: true });
+			if (!snap) return;
+			const key = modelChangeKey(snap);
+			if (this.pluginModelKeys.get(snap.conversationId) === key) return;
+			this.pluginModelKeys.set(snap.conversationId, key);
+			this.onClientModelChanged(snap);
+		} catch (err) {
+			console.error("[agent-service] onClientModelChanged failed:", err);
+		}
+	}
+
+	/** 插件用：本客户端最近活跃对话的快照（轨迹视图直接显示打开对话的时间线）。
+	 *  messages/streamingMessage 为引用稳定的只读缓存对象——调用方只读、不得修改。
+	 *
+	 *  #542：`opts.preferActive` = 先认「本客户端正在看的对话」（按 clientId 取快照时用），
+	 *  否则按 lastActiveAt 选；`opts.includeSubagents` = 连子代理对话一起算（缺省跳过）。 */
+	readConversationForPlugins(opts?: {
+		preferActive?: boolean;
+		includeSubagents?: boolean;
+	}): PluginConversationSnapshot | null {
+		try {
+			const target = pickClientConversation(this.convs.values(), {
+				active: opts?.preferActive ? this.convs.get(this.activeId) : undefined,
+				includeSubagents: opts?.includeSubagents,
+			});
 			if (!target) return null;
 			const state = target.session.agent.state;
 			let stats: PluginConversationSnapshot["stats"] = {
@@ -5231,7 +5662,9 @@ export class ClientSession {
 			const curModel = target.session.model;
 			const modelId = curModel ? `${curModel.provider}/${curModel.id}` : undefined;
 			return {
+				clientId: this.clientId,
 				conversationId: target.id,
+				isSubagent: target.isSubagent,
 				sessionId: target.session.sessionId,
 				sessionFile: target.session.sessionFile,
 				sessionDir: target.session.sessionManager?.getSessionDir?.(),
@@ -6252,7 +6685,9 @@ export class ClientSession {
 			compaction: conv.compactionState ?? null,
 			pendingQuestion: this.pendingQuestionForSnapshot(),
 			pendingApproval: this.pendingApprovalForSnapshot(),
-			plan: this.planManager.getPlan(this.activeId),
+			// 任务计划看板状态同样是会话级：快照恒给 PlanState 或 null（不用 undefined），
+			// 否则 snapshot_delta 里 key 缺席 → 前端 spread 浅合并会残留上一对话的 plan。
+			plan: this.planManager.getPlan(this.activeId) ?? null,
 			// 计划模式是**会话级**开关：快照恒给布尔（不用 undefined），否则
 			// snapshot_delta 里 key 缺席 → 前端 spread 合并会残留上一对话的 true。
 			planMode: conv?.planMode === true,
@@ -6735,7 +7170,17 @@ export class ClientSession {
 
 	updatePlan(steps: import("./protocol.js").PlanStep[], activeStepId?: string | null, conversationId?: string): void {
 		const convId = conversationId ?? this.activeId;
-		const plan = this.planManager.setPlan(convId, steps, activeStepId);
+		const conv = this.convs.get(convId);
+		const sessionId = conv?.session?.sessionId;
+		const plan = this.planManager.setPlan(convId, steps, activeStepId, sessionId);
+		try {
+			const sm = conv?.session?.sessionManager as unknown as {
+				appendCustomEntry?: (type: string, data: unknown) => void;
+			};
+			sm?.appendCustomEntry?.("plan/update", { plan });
+		} catch {
+			// ignore
+		}
 		this.emit({
 			type: "plan_updated",
 			conversationId: convId,
@@ -6788,7 +7233,7 @@ export class ClientSession {
 
 		await this.newChat();
 		const targetConv = this.conv;
-		this.planManager.setPlan(targetConv.id, steps);
+		this.planManager.setPlan(targetConv.id, steps, undefined, targetConv?.session?.sessionId);
 		if (sourceGoal) {
 			try {
 				await this.goalSvc.setGoal(sourceGoal, { targetConvId: targetConv.id, autoStart: false });
@@ -7010,6 +7455,8 @@ export class ClientSession {
 	 * the forked child deadlocks between fork and exec. This applies to
 	 * asynchronous spawns too — the previous async probe reproduced the hang.
 	 */
+	// 手写 TTL 缓存而非通用 memoize：安装 pi 后 invalidatePiCliProbe() 要立即
+	// 失效重探，通用 TTL memoize 不带失效通道（issue #470 处置说明）。
 	private static piCliProbe: { at: number; installed: boolean } | null = null;
 	private static readonly PI_CLI_PROBE_TTL_MS = 10_000;
 
@@ -7220,6 +7667,7 @@ export class ClientSession {
 	 * 主动检查已安装界面插件（<dataDir>/plugins）的更新状态并向客户端推送。
 	 */
 	async checkPluginUpdates(manual = false): Promise<void> {
+		this.updatesAllCache = null;
 		const lang = () => this.getLang();
 		try {
 			const updates = await checkPluginUpdates(this.stateStore.dataDir, undefined, lang);
@@ -7346,11 +7794,13 @@ export class ClientSession {
 				this.lastPluginUpdates = list;
 				this.emit({ type: "plugin_updates", updates: list });
 
+				const fmtVer = (v?: string | null) => (v ? (/^[vV]/.test(v) ? v : `v${v}`) : null);
+
 				pluginItems = pluginUpdates.map((p) => ({
 					name: p.name ? `${p.name} (${p.id})` : p.id,
 					kind: "plugin" as const,
-					current: p.version ? `v${p.version}` : (p.localSha ?? "unknown"),
-					latest: p.latestVersion ? `v${p.latestVersion}` : (p.remoteSha ?? null),
+					current: fmtVer(p.version) ?? p.localSha ?? "unknown",
+					latest: fmtVer(p.latestVersion) ?? p.remoteSha ?? null,
 					latestPublishedAt: null,
 					upToDate: !p.updatable,
 					error: p.error,
@@ -7565,11 +8015,61 @@ export class ClientSession {
 		try {
 			const defs = this.session.getAllTools();
 			const found = defs.find((d) => d.name === name);
-			if (found) raw = { ...found, active: this.session.getActiveToolNames().includes(name) };
+			if (found) {
+				// `getAllTools()` 不带 promptSnippet（SDK 的 ToolInfo 里就没这个字段），
+				// 从 getToolDefinition 补齐默认值（该表是出厂定义，本服务不改它）。
+				const def = this.session.getToolDefinition(name);
+				const base = {
+					...found,
+					...(def?.promptSnippet ? { promptSnippet: def.promptSnippet } : {}),
+				};
+				// 展示的是**生效文案**（用户在设置页覆盖后的）——与模型看到的 tool schema 一致。
+				const eff = effectiveToolPrompt(base, toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name));
+				raw = {
+					...base,
+					description: eff.description,
+					promptSnippet: eff.promptSnippet,
+					promptGuidelines: eff.promptGuidelines,
+					active: this.session.getActiveToolNames().includes(name),
+				};
+			}
 		} catch {
 			// Session not ready (or the engine threw) — fall through to found:false.
 		}
 		this.emit({ type: "tool_info", ...normalizeToolInfo(name, raw) });
+	}
+
+	/**
+	 * 设置页逐工具编辑文案时取「出厂默认 + 当前覆盖」→ `tool_prompt`。
+	 *
+	 * 与 getToolInfo 分开：那条应答会弹「工具详细信息」弹窗，在设置页里弹它不合适。
+	 * 出厂默认从 `getToolDefinition()`（SDK 原始定义，本服务从不改它）取 —— 它带
+	 * promptSnippet（`getAllTools()` 不带）；所以无论用户覆盖过几次，编辑器都能展示真正的默认文本。
+	 */
+	getToolPrompt(name: string): void {
+		let found: { description?: string; promptSnippet?: string; promptGuidelines?: string[] } | undefined;
+		try {
+			const def = this.session.getToolDefinition(name);
+			if (def) {
+				found = {
+					...(typeof def.description === "string" ? { description: def.description } : {}),
+					...(typeof def.promptSnippet === "string" ? { promptSnippet: def.promptSnippet } : {}),
+					...(Array.isArray(def.promptGuidelines) ? { promptGuidelines: def.promptGuidelines } : {}),
+				};
+			}
+		} catch {
+			// 会话未就绪：回 found:false，前端显示「取不到定义」。
+		}
+		const override = toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name);
+		this.emit({
+			type: "tool_prompt",
+			name,
+			found: Boolean(found),
+			...(found?.description ? { defaultDescription: found.description } : {}),
+			...(found?.promptSnippet ? { defaultPromptSnippet: found.promptSnippet } : {}),
+			...(found?.promptGuidelines ? { defaultPromptGuidelines: found.promptGuidelines } : {}),
+			...(override ? { override } : {}),
+		});
 	}
 
 	/** 模型/服务商配置管理 —— 自包含模块，见 model-admin.ts。 */
@@ -7932,9 +8432,6 @@ export class ClientSession {
 		reviewPrompt?: string;
 		reviewDisabledSkills?: string[];
 		disabledPlugins?: string[];
-		/** 插件顶栏条目的隐藏/排序偏好（纯 UI，per-client）。 */
-		pluginTopbarHidden?: string[];
-		pluginTopbarOrder?: string[];
 		markersEnabled?: boolean;
 		disabledMarkers?: string[];
 		quickPhrases?: string[];
@@ -8004,6 +8501,31 @@ export class ClientSession {
 	/** Remove a named preset. */
 	async deletePreset(name: string): Promise<void> {
 		return this.settingsSvc.deletePreset(name);
+	}
+
+	/** 导出预设/当前设置为可分享的 JSON（server/preset-share.ts）。 */
+	async exportPreset(msg: Parameters<SettingsService["exportPreset"]>[0]): Promise<void> {
+		return this.settingsSvc.exportPreset(msg);
+	}
+
+	/** 解析导入的预设 JSON（dryRun = 只预览）。 */
+	async importPreset(msg: Parameters<SettingsService["importPreset"]>[0]): Promise<void> {
+		return this.settingsSvc.importPreset(msg);
+	}
+
+	/** 按网址导入预设（服务端抓取）。 */
+	async importPresetFromUrl(msg: Parameters<SettingsService["importPresetFromUrl"]>[0]): Promise<void> {
+		return this.settingsSvc.importPresetFromUrl(msg);
+	}
+
+	/** 拉社区共享预设目录。 */
+	async pushPresetCatalog(msg: Parameters<SettingsService["pushPresetCatalog"]>[0]): Promise<void> {
+		return this.settingsSvc.pushPresetCatalog(msg);
+	}
+
+	/** 一键分享预设到社区共享仓库。 */
+	async sharePreset(msg: Parameters<SettingsService["sharePreset"]>[0]): Promise<void> {
+		return this.settingsSvc.sharePreset(msg);
 	}
 
 	/** Upsert 一个子代理模板（全局共享）。 */
@@ -8131,7 +8653,19 @@ export class ClientSession {
 				composeWith: (base) => withToolGuard(withReadDirSupport(base, cwd, readDirOptions), readGuardOptions),
 			},
 			{ name: "write", fallback: () => composeWrite(), composeWith: (base) => composeWrite(base) },
-			{ name: "edit", fallback: () => composeEdit(), composeWith: (base) => composeEdit(base) },
+			{
+				name: "edit",
+				// 无扩展 edit：基底用 SDK 定义，但把**模型可见描述**换成精简版——SDK 的原描述与其自带的
+				// guidelines 逐条复述（唯一/合并/不要垫大段未改区域都说两遍）。只改描述，保留 SDK 的
+				// 参数 schema / guidelines / 执行体；有扩展 edit 时（composeWith）一律不动它的文案。
+				fallback: () =>
+					composeEdit({
+						...createEditToolDefinition(cwd),
+						description: EDIT_DESCRIPTION,
+						promptGuidelines: EDIT_GUIDELINES,
+					} as unknown as AnyToolDefinition),
+				composeWith: (base) => composeEdit(base),
+			},
 		];
 	}
 
@@ -8155,7 +8689,26 @@ export class ClientSession {
 				disabled.add(toolName);
 			}
 		}
-		applyAgentToolsGating(session, [...disabled], targetPreset);
+		// 延迟加载（默认开）：未加载的已登记工具一律当「临时禁用」——与用户禁用名单 /
+		// 计划模式闸门走同一条门控链，不做第二套机制。加载只是把名字从这份名单里拿出来。
+		const lazy = this.lazyLoadingOn();
+		if (lazy) {
+			try {
+				const loaded = this.lazyLoadedFor(session, this.sessionHasTranscript(session));
+				for (const name of lazyLoadingDisabledTools(
+					session.getAllTools().map((t) => t.name),
+					loaded,
+				)) {
+					disabled.add(name);
+				}
+			} catch {
+				/* session 未就绪：下次创建/reload 会再应用 */
+			}
+		}
+		applyAgentToolsGating(session, [...disabled], targetPreset, {
+			// load_tools 不在任何预设白名单里，又必须永远可用（ask 预设本来就无工具，不强加）。
+			forceActive: lazy && targetPreset !== "ask" ? [LOAD_TOOLS_TOOL_NAME] : [],
+		});
 		const ownerId = conv?.id;
 		syncSubagentOverride(session as unknown as OverrideSessionLike, disabled.has("subagent"), () =>
 			ownerId
@@ -8163,6 +8716,10 @@ export class ClientSession {
 				: makeSubagentTools(this.subagentHost)[0],
 		);
 		this.syncPluginTools(session, targetPreset);
+		// 逐工具文案覆盖（设置页「工具」区）：在插件 sync / 工具刷新之后重放——
+		// `_refreshToolRegistry()` 会用出厂定义重建注册表，覆盖必须重新打上去。
+		// 只改模型可见的 description / snippet / guidelines，不碰执行体。
+		applyToolPromptOverrides(session as unknown as ToolPromptSessionLike, this.settingsSvc.current.toolPromptOverrides);
 		this.sessionStatsCache = null;
 		this.cachedBaseTokens = null;
 		// SDK 的 setActiveToolsByName 只改 agent.state.tools，不派发任何事件——门控后
@@ -9837,7 +10394,8 @@ export class ClientSession {
 		// this branch normally can't exist — kept as a safety net).
 		const isBlank = (c: Conversation): boolean => {
 			try {
-				return c.session.getSessionStats().totalMessages === 0 && c.terminals.list().length === 0;
+				const hasPlan = (this.planManager.getPlan(c.id)?.steps.length ?? 0) > 0;
+				return c.session.getSessionStats().totalMessages === 0 && c.terminals.list().length === 0 && !hasPlan;
 			} catch {
 				// session being replaced — treat as used so we don't switch onto it
 				return false;
@@ -10209,6 +10767,8 @@ export class ClientSession {
 
 	private displaceActive(): Conversation | null {
 		const conv = this.conv;
+		// 正在过户给其他会话：绝不就地释放（runtime/终端等整体搬迁给 target）。
+		if (conv.transferring) return null;
 		// 子代理不受切换关闭影响（见上）。
 		if (conv.isSubagent) {
 			conv.listed = true;
@@ -10296,6 +10856,7 @@ export class ClientSession {
 			// ignore
 		}
 		this.convs.delete(id);
+		this.planManager.unbindConversation(id);
 		this.clearAllToolWatchdogs(conv);
 		// 关对话 → 连它的 eval 内核（Python/Node 子进程 + 临时沙箱目录）一起回收：
 		// 这些进程是 detached 进程组，父进程退出不会自动带走它们。
@@ -10359,15 +10920,20 @@ export class ClientSession {
 		const set = new Set(ids);
 		const convs = [...this.convs.values()].filter((c) => set.has(c.id));
 		if (convs.length === 0) return { ok: false, reason: "missing" };
-		if (set.has(this.activeId)) {
-			const remaining =
-				[...this.convs.values()].find((c) => !set.has(c.id) && !c.isSubagent) ??
-				[...this.convs.values()].find((c) => !set.has(c.id));
-			if (remaining) {
-				await this.switchConversation(remaining.id);
-			} else if (!(await this.newChat())) {
-				return { ok: false, reason: "empty" };
+		for (const conv of convs) conv.transferring = true;
+		try {
+			if (set.has(this.activeId)) {
+				const remaining =
+					[...this.convs.values()].find((c) => !set.has(c.id) && !c.isSubagent) ??
+					[...this.convs.values()].find((c) => !set.has(c.id));
+				if (remaining) {
+					await this.switchConversation(remaining.id);
+				} else if (!(await this.newChat())) {
+					return { ok: false, reason: "empty" };
+				}
 			}
+		} finally {
+			for (const conv of convs) delete conv.transferring;
 		}
 		for (const conv of convs) {
 			this.convs.delete(conv.id);
@@ -12686,26 +13252,6 @@ export class ClientSession {
 		}
 	}
 
-	async cycleModel(): Promise<void> {
-		try {
-			const result = await this.session.cycleModel();
-			if (result?.model) {
-				const mid = `${result.model.provider}/${result.model.id}`;
-				await this.restoreKeyForModel(mid, this.cwd);
-				// Remember per-project like setModel — cycling is also a model switch.
-				this.rememberProjectModel(mid);
-			}
-		} catch (err) {
-			this.emit({
-				type: "notice",
-				level: "error",
-				text: `切换模型失败：${(err as Error).message}`,
-				textEn: `Failed to switch model: ${(err as Error).message}`,
-			});
-		}
-		this.flushSnapshot();
-	}
-
 	/**
 	 * Path completion for the cwd input: expand ~/relative paths, list the parent
 	 * directory, and return prefix matches (dirs first, capped).
@@ -13057,6 +13603,8 @@ export class ClientSession {
 			this.rememberProjectModel(modelId);
 			// 换模型后按新模型的窗口重算软上限覆盖（按模型覆盖可能不同，issue #229）。
 			this.applyCompactionOverrides();
+			// 切换成功 → 立即通知插件（#542：不发消息也能收到）；失败路径落在 catch 里，不发。
+			this.notifyPluginModelChange();
 		} catch (err) {
 			this.emit({
 				type: "notice",
@@ -13162,24 +13710,6 @@ export class ClientSession {
 			const cur = this.session.model;
 			if (cur) {
 				this.session.settingsManager.setModelThinkingLevel(cur.provider, cur.id, thinkingLevel);
-			}
-		} catch (err) {
-			this.emit({
-				type: "notice",
-				level: "error",
-				text: `切换思考强度失败：${(err as Error).message}`,
-				textEn: `Failed to switch thinking level: ${(err as Error).message}`,
-			});
-		}
-		this.flushSnapshot();
-	}
-
-	cycleThinking(): void {
-		try {
-			const nextLevel = this.session.cycleThinkingLevel({ persist: true });
-			const cur = this.session.model;
-			if (cur && nextLevel) {
-				this.session.settingsManager.setModelThinkingLevel(cur.provider, cur.id, nextLevel);
 			}
 		} catch (err) {
 			this.emit({
@@ -13307,6 +13837,8 @@ export class AgentService {
 	onRunEvent: ((ev: PluginRunEvent) => void) | undefined = undefined;
 	/** index.ts 注入：对话切换通知钩子，attach 时拷贝到每个新会话。 */
 	onConversationChanged: (() => void) | undefined = undefined;
+	/** index.ts 注入：模型切换成功通知钩子（#542），attach 时拷贝到每个新会话。 */
+	onClientModelChanged: ((snap: PluginConversationSnapshot) => void) | undefined = undefined;
 	/** index.ts 注入：读取插件当前注册的 AI 工具（attach 时拷贝到每个新会话）。 */
 	pluginToolsProvider: (() => PluginAgentTool[]) | undefined = undefined;
 	/** index.ts 注入：读取插件当前注册的斜杠命令（attach 时拷贝到每个新会话）。 */
@@ -13690,18 +14222,33 @@ export class AgentService {
 		return n;
 	}
 
-	/** 插件用：全客户端最近活跃对话的快照（at 最大者即“当前打开的对话”）。 */
-	readConversationForPlugins(): PluginConversationSnapshot | null {
-		let best: PluginConversationSnapshot | null = null;
+	/** 插件用：全客户端最近活跃对话的快照（#542：按 clientId 取某个标签页正在看的
+	 *  对话；缺省回落「最近活跃的**非子代理**会话」——子代理跑得再勤也不会把用户
+	 *  正在看的对话挤出快照）。clientId 不认识/该客户端暂无对话时同样走回落。 */
+	readConversationForPlugins(opts?: PluginConversationQuery): PluginConversationSnapshot | null {
+		const want = (opts?.clientId ?? "").trim();
+		if (want) {
+			const cs = this.clients.get(want);
+			if (cs) {
+				try {
+					// 显式客户端：返回它**真正在看**的对话（含子代理对话——那是事实，
+					// 快照带 isSubagent 由插件自己判）。
+					const s = cs.readConversationForPlugins({ preferActive: true, includeSubagents: true });
+					if (s) return s;
+				} catch {
+					/* 单客户端坏了不影响回落 */
+				}
+			}
+		}
+		const snaps: (PluginConversationSnapshot | null)[] = [];
 		for (const cs of this.clients.values()) {
 			try {
-				const s = cs.readConversationForPlugins();
-				if (s && (!best || s.at > best.at)) best = s;
+				snaps.push(cs.readConversationForPlugins());
 			} catch {
 				/* 单客户端坏了不影响其他 */
 			}
 		}
-		return best;
+		return pickLatestClientSnapshot(snaps);
 	}
 
 	/** 插件无头调用（host.chat 的落地）：外部通道（微信等）把文本投给 agent。
@@ -14074,6 +14621,7 @@ export class AgentService {
 				textEn: `"${main.title}" was moved to this page — pick up right where it left off.`,
 			});
 			await target.switchConversation(newMainId);
+			await target.bindSession();
 		} catch (err) {
 			fail(`过户失败：${(err as Error).message}`, `Takeover failed: ${(err as Error).message}`);
 		}
@@ -14244,6 +14792,7 @@ export class AgentService {
 		cs.toolGuard = this.toolGuard;
 		cs.onRunEvent = this.onRunEvent;
 		cs.onConversationChanged = () => this.onConversationChanged?.();
+		cs.onClientModelChanged = (snap) => this.onClientModelChanged?.(snap);
 		cs.pluginToolsProvider = this.pluginToolsProvider;
 		cs.pluginCommandsProvider = this.pluginCommandsProvider;
 		cs.pluginBgTasksProvider = this.pluginBgTasksProvider;

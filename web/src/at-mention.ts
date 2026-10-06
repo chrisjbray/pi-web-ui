@@ -13,13 +13,13 @@
 import { SKILL_NAMESPACE } from "./slash-filter.js";
 
 /** 光标前的一个 `@` 词元：start = `@` 下标，query = `@` 之后到光标的串。 */
-export interface AtToken {
+interface AtToken {
 	start: number;
 	query: string;
 }
 
 /** `@` 提及项可带的路径附件（点选后宿主追加到输入框附件 chips）。 */
-export interface AtAttachment {
+interface AtAttachment {
 	path: string;
 	name?: string;
 	mode?: "inline" | "reference" | "lines" | "page";
@@ -78,7 +78,7 @@ export function mapPageHits(
 }
 
 /** 服务端 search_files 结果 → `@` 命中（内置文件提供方用，引用 chip）。 */
-export interface FileHitLike {
+interface FileHitLike {
 	path: string;
 	name: string;
 	type: "file" | "dir";
@@ -96,7 +96,10 @@ export function mapFileHits(providerLabel: string, raw: unknown, limit = 10): At
 			providerLabel,
 			title: o.name,
 			hint: o.path,
-			text: `@${o.name}`,
+			// 正文写相对路径而非 basename：同名文件/目录（根目录 报告/ 与 方案/报告/）
+			// 在输入框与聊天记录里靠路径才能区分，linkify 也按相对路径渲染文件药丸
+			// （@src/App.tsx 形态本就受支持）。
+			text: `@${o.path}`,
 			attachments: [
 				{
 					path: o.path,

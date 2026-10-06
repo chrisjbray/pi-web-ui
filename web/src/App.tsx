@@ -36,10 +36,17 @@ import {
 	installPluginHostApi,
 	triggerPluginUiAction,
 } from "./plugin-host";
-import { buildUiSlots, withPluginViewItems, type UiDiagnostic, type UiSlotEntry } from "./ui-slots";
+import {
+	buildUiSlots,
+	withPluginViewItems,
+	HIDDEN_FROM_LAYOUT_ITEM_IDS,
+	type UiDiagnostic,
+	type UiSlotEntry,
+} from "./ui-slots";
 import { renderSlotToolbar } from "./slot-toolbar";
 import { ContextMenu } from "./components/ContextMenu";
 import { BannerContainer } from "./components/BannerContainer";
+import { IconEditor } from "./components/IconEditor";
 import { showBanner, dismissBanner, dismissBannersWhere } from "./banner-notice";
 import { ensurePluginViewLoaded } from "./plugin-loader";
 import { registerAttachmentSink, insertTextAtCursor, removeMentionFromComposer } from "./composer-bridge";
@@ -72,6 +79,7 @@ import { TemplateProvider } from "./components/PromptTemplates";
 import { FilePreview, type PreviewFile } from "./components/FilePreview";
 import { PluginFilePreview } from "./components/PluginFilePreview";
 import { useChat } from "./use-chat";
+import { useSwipeDrawer } from "./use-swipe-drawer";
 import { appUrl } from "./base-url";
 import type { ClientMessage, CommandDef, PromptAttachment, UiMessage } from "./types";
 import { useT, useI18n } from "./i18n";
@@ -687,6 +695,8 @@ export function App() {
 	}, []);
 	// Mobile: which side panel is open as a drawer (null = both closed).
 	const [drawer, setDrawer] = useState<"left" | "right" | null>(null);
+	// 抽屉手势的监听容器（移动端 `.layout` 整屏）。
+	const layoutRef = useRef<HTMLDivElement | null>(null);
 	// Viewport class: ≤768px turns the side panels into sliding drawers
 	// (matches the CSS breakpoint) — used to lazy-load panel data only when
 	// a drawer is actually open on mobile.
@@ -697,6 +707,18 @@ export function App() {
 		mq.addEventListener("change", onChange);
 		return () => mq.removeEventListener("change", onChange);
 	}, []);
+	// 手机端侧栏手势：从左右边缘往里横滑 = 拉出该侧列表，列表开着时往外横滑 = 收回去。
+	// 只在 chat 视图挂（左右面板就长在这个 view-pane 里；终端视图的抽屉是另一套）。
+	// 判定纯函数见 `swipe-drawer.ts`，DOM 粘合见 `use-swipe-drawer.ts`。
+	useSwipeDrawer({
+		enabled: isMobile && view === "chat",
+		open: drawer,
+		onOpenChange: setDrawer,
+		container: layoutRef,
+		// 必须点名 `.persistent`：终端视图的抽屉也用 `.drawer-backdrop`（常驻但 display:none
+		// 的 pane 里照样能被 querySelector 查到），不加限定会去改那道看不见的遮罩。
+		backdropSelector: ".drawer-backdrop.persistent",
+	});
 	// Setup modal: one-time prompt when the pi agent config is missing.
 	const [setupDismissed, setSetupDismissed] = useState(false);
 	// Custom model config panel (model dropdown → 管理模型).
@@ -753,6 +775,8 @@ export function App() {
 	const [bgTasksOpen, setBgTasksOpen] = useState(false);
 	// Global search panel (sessions / projects / workspace files).
 	const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+	// 图标编辑模式（顶栏「⋯」→ 编辑图标）：直接拖图标改四个栏的位置。
+	const [iconEditOpen, setIconEditOpen] = useState(false);
 	/** 全局搜索「会话」结果点击后的跳转目标：切到该会话并定位到命中消息。
 	 *  由 MessageList 消费（消息载入即跳转+高亮），跳完后置空。 */
 	const [searchJump, setSearchJump] = useState<{
@@ -1138,8 +1162,12 @@ export function App() {
 		// 联动在输入框光标处插入 @提及（文件/目录/页签等所有带名引用统一行为）。
 		// silent（@ 选单 acceptAt）：正文已由 ChatInput 亲自插好，这里不再插；
 		// 重复点同一文件：ChatInput 的 insert sink 会判正文已有该 @提及而跳过。
-		if (!silent && name) {
-			insertTextAtCursor(`@${name} `);
+		// 文件/目录类引用正文写相对路径而非 basename：同名条目（根目录 报告/ 与
+		// 方案/报告/）靠路径才能区分，linkify 也按相对路径渲染文件药丸；
+		// page 无文件路径语义，保持标题形式。
+		const mention = mode === "page" ? name : path;
+		if (!silent && mention) {
+			insertTextAtCursor(`@${mention} `);
 		}
 	};
 	const removeAttachment = (pathOrKey: string) => {
@@ -1151,7 +1179,8 @@ export function App() {
 					: a.mode === "conversation"
 						? `conv|${a.conversationId ?? ""}|${a.sessionPath ?? ""}` === pathOrKey
 						: a.path === pathOrKey;
-				if (isHit && !removedName) removedName = a.name;
+				// 移除口径与 attach 插入一致：文件类提及正文是相对路径，page/conversation 是标题。
+				if (isHit && !removedName) removedName = a.mode === "page" || a.mode === "conversation" ? a.name : a.path;
 				return !isHit;
 			}),
 		);
@@ -1526,6 +1555,7 @@ export function App() {
 				}}
 				onOpenBgTasks={() => setBgTasksOpen(true)}
 				onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
+				onOpenIconEdit={() => setIconEditOpen(true)}
 				sound={sound}
 				onSoundChange={setSound}
 				onSoundPreview={(kind: SoundKind) => playSound(kind, sound)}
@@ -1534,6 +1564,14 @@ export function App() {
 				onThemeChange={switchTheme}
 				reloadThemes={reloadThemes}
 			/>
+			{iconEditOpen && (
+				<IconEditor
+					slots={uiSlots}
+					layout={chat.settings?.uiLayout}
+					exclude={HIDDEN_FROM_LAYOUT_ITEM_IDS}
+					onClose={() => setIconEditOpen(false)}
+				/>
+			)}
 			{chat.protocolMismatch && <div className="protocol-banner">⚠ {t("protocolMismatch")}</div>}
 			<div className="notices">
 				{chat.notices.map((n) => (
@@ -1622,10 +1660,45 @@ export function App() {
 			</div>
 			<TemplateProvider currentModelId={model ? `${model.provider}/${model.id}` : null}>
 				<div
+					ref={layoutRef}
 					className="layout"
 					style={{ "--left-w": `${leftWidth}px`, "--right-w": `${rightWidth}px` } as CSSProperties}
 				>
-					{drawer && <div className="drawer-backdrop" onClick={() => setDrawer(null)} />}
+					{/* 遮罩：移动端**常驻**（否则关着的抽屉被手势拉出来时没有可渐变的遮罩，见
+					    `use-swipe-drawer.ts`），靠 `.on` 类控制显隐与可点；桌面端仍按需挂载。 */}
+					{isMobile ? (
+						<div className={`drawer-backdrop persistent${drawer ? " on" : ""}`} onClick={() => setDrawer(null)} />
+					) : (
+						drawer && <div className="drawer-backdrop" onClick={() => setDrawer(null)} />
+					)}
+					{/* 悬浮停靠栏是**布局内的贴边槽位**（不再是覆盖一切的 fixed 浮层）：夹在屏幕边缘与
+					    面板之间，面板与主区自动向内让出它的宽度 —— 面板里的按钮再也不会被压住；该侧没有
+					    图标时整条不渲染，连宽度都不占。 */}
+					<SideDock
+						side="left"
+						items={uiSidebarLeft}
+						chat={chat}
+						view={view}
+						onViewChange={(v: ViewName) => {
+							terminalOpenRequested.current = v === "terminal" && chat.terminals.length === 0;
+							if (terminalOpenRequested.current && createShell()) {
+								terminalOpenRequested.current = false;
+							}
+							setView(v);
+							setDrawer(null);
+						}}
+						onOpenPanel={setDrawer}
+						onOpenSettings={(sec) => {
+							setSettingsInitialSection(sec as any);
+							setSettingsOpen(true);
+						}}
+						onOpenBgTasks={() => setBgTasksOpen(true)}
+						onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
+						onUiAction={onUiAction}
+						uiContextTopbar={uiSlots["contextmenu.topbar"]}
+						onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
+						onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
+					/>
 					<div className={`view-pane ${view === "chat" ? "" : "hidden"}`}>
 						{!isMobile && leftCollapsed && <PanelRail side="left" onClick={toggleLeft} />}
 						<div
@@ -1928,7 +2001,13 @@ export function App() {
 								/>
 							)}
 							{/* 任务执行看板 (Plan Mode) */}
-							<PlanBoard plan={chat.state?.plan} />
+							<PlanBoard
+								plan={
+									chat.activeConversationId && chat.state?.conversationId !== chat.activeConversationId
+										? null
+										: chat.state?.plan
+								}
+							/>
 							<ChatInput
 								composerLeading={uiSlots["composer.leading"]}
 								composerActions={uiSlots["composer.actions"]}
@@ -2037,58 +2116,33 @@ export function App() {
 							failed={failedPluginViews.includes(view.slice("plugin:".length))}
 						/>
 					)}
+					<SideDock
+						side="right"
+						items={uiSidebarRight}
+						chat={chat}
+						view={view}
+						onViewChange={(v: ViewName) => {
+							terminalOpenRequested.current = v === "terminal" && chat.terminals.length === 0;
+							if (terminalOpenRequested.current && createShell()) {
+								terminalOpenRequested.current = false;
+							}
+							setView(v);
+							setDrawer(null);
+						}}
+						onOpenPanel={setDrawer}
+						onOpenSettings={(sec) => {
+							setSettingsInitialSection(sec as any);
+							setSettingsOpen(true);
+						}}
+						onOpenBgTasks={() => setBgTasksOpen(true)}
+						onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
+						onUiAction={onUiAction}
+						uiContextTopbar={uiSlots["contextmenu.topbar"]}
+						onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
+						onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
+					/>
 				</div>
 			</TemplateProvider>
-			<SideDock
-				side="left"
-				items={uiSidebarLeft}
-				chat={chat}
-				view={view}
-				onViewChange={(v: ViewName) => {
-					terminalOpenRequested.current = v === "terminal" && chat.terminals.length === 0;
-					if (terminalOpenRequested.current && createShell()) {
-						terminalOpenRequested.current = false;
-					}
-					setView(v);
-					setDrawer(null);
-				}}
-				onOpenPanel={setDrawer}
-				onOpenSettings={(sec) => {
-					setSettingsInitialSection(sec as any);
-					setSettingsOpen(true);
-				}}
-				onOpenBgTasks={() => setBgTasksOpen(true)}
-				onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
-				onUiAction={onUiAction}
-				uiContextTopbar={uiSlots["contextmenu.topbar"]}
-				onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
-				onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
-			/>
-			<SideDock
-				side="right"
-				items={uiSidebarRight}
-				chat={chat}
-				view={view}
-				onViewChange={(v: ViewName) => {
-					terminalOpenRequested.current = v === "terminal" && chat.terminals.length === 0;
-					if (terminalOpenRequested.current && createShell()) {
-						terminalOpenRequested.current = false;
-					}
-					setView(v);
-					setDrawer(null);
-				}}
-				onOpenPanel={setDrawer}
-				onOpenSettings={(sec) => {
-					setSettingsInitialSection(sec as any);
-					setSettingsOpen(true);
-				}}
-				onOpenBgTasks={() => setBgTasksOpen(true)}
-				onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
-				onUiAction={onUiAction}
-				uiContextTopbar={uiSlots["contextmenu.topbar"]}
-				onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
-				onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
-			/>
 			<FooterBar
 				chat={chat}
 				bottombarItems={uiSlots["bottombar"]}

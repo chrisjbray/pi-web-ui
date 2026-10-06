@@ -18,7 +18,6 @@ import {
 	isHostProvidedPackage,
 	listGitExtensions,
 	listInstalledPackages,
-	memoizeWithTtl,
 	NPM_DEFAULT_REGISTRY,
 	parseGitExtensionSource,
 	parseNpmrcAuth,
@@ -77,38 +76,6 @@ describe("parsePiVersionOutput", () => {
 	it("garbage → null", () => {
 		expect(parsePiVersionOutput("")).toBeNull();
 		expect(parsePiVersionOutput("no version here")).toBeNull();
-	});
-});
-
-describe("memoizeWithTtl", () => {
-	it("calls through once within the TTL, again after expiry", () => {
-		vi.useFakeTimers();
-		try {
-			let n = 0;
-			const fn = vi.fn(() => ++n);
-			const memo = memoizeWithTtl(fn, 10_000);
-			expect(memo()).toBe(1);
-			expect(memo()).toBe(1);
-			expect(fn).toHaveBeenCalledTimes(1);
-			vi.advanceTimersByTime(10_000);
-			expect(memo()).toBe(2);
-			expect(fn).toHaveBeenCalledTimes(2);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it("caches null results like any other value", () => {
-		vi.useFakeTimers();
-		try {
-			const fn = vi.fn((): string | null => null);
-			const memo = memoizeWithTtl(fn, 60_000);
-			expect(memo()).toBeNull();
-			expect(memo()).toBeNull();
-			expect(fn).toHaveBeenCalledTimes(1);
-		} finally {
-			vi.useRealTimers();
-		}
 	});
 });
 
@@ -253,11 +220,12 @@ describe("collectTargets", () => {
 		}
 	});
 
-	it("probe miss + no vendored copy → no pi-core row, rest unchanged", () => {
+	it("probe miss + no vendored copy → pi-core row kept with an unknown hint (issue #533)", () => {
 		const dir = makeAgentDir({ foo: "^1.0.0" }, [["foo", "foo", "1.0.0"]]);
 		try {
 			expect(collectTargets(dir, "0.48.0", () => null)).toEqual([
 				{ name: "pi-web-ui", version: "0.48.0", kind: "webui" },
+				{ name: CORE, version: "unknown", kind: "pi-core", error: "pluginupdate.piCore.unknown" },
 				{ name: "foo", version: "1.0.0", kind: "package" },
 			]);
 		} finally {
@@ -769,6 +737,12 @@ describe("collectTargets with git extensions (issue #178)", () => {
 			const targets = collectTargets(dir, "0.48.0", () => null, {});
 			expect(targets).toEqual([
 				{ name: "pi-web-ui", version: "0.48.0", kind: "webui" },
+				{
+					name: "@earendil-works/pi-coding-agent",
+					version: "unknown",
+					kind: "pi-core",
+					error: "pluginupdate.piCore.unknown",
+				},
 				{ name: "foo", version: "1.0.0", kind: "package" },
 				{
 					name: "sol-pi",

@@ -10,33 +10,148 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- **系统提示词不再吞掉其他扩展的增补** — 自定义了提示词模板/覆盖、或使用非 standard 预设、或禁用了工具时，内置的提示词组装曾整体替换该轮系统提示词，把别的扩展前置/后置注入的内容（如 `<invoked_skill>` 块）一起丢掉。现在会先把扩展的首尾增补摘出来，渲染完再原样套回去；子代理模板 replace 同样不再丢掉前置增补。
-- **已钉住的对话跨服务重启持久化**（#433）— 钉住状态持久化至 `client-state.json`，服务重启后自动恢复常驻运行列表，历史会话列表同步展示 📌 置顶标记并支持右键切换钉住状态。
-- **计划模式净室执行（Clean Handoff）原子化**（#434）— 修复净室执行前端四发消息由于服务端异步分发导致的竞态，提供原子协议通道 `plan_clean_handoff`，确保旧会话计划闸门关闭、新隔离会话原子就绪并承接计划步骤与目标后再发起实施。
-- **压缩历史展开区只读防护与序号对齐**（#437）— 压缩历史展开视窗右键菜单禁用派生分支、回滚与生成长图等写/非会话操作，序列化复用全局序号生成器，杜绝序号重计与碰撞。
-- **PlanBoard 任务看板并发编辑防范**（#444）— 看板步骤状态切换、内容修改、增量新增与删除改走单步骤级增量协议（`plan_step_update`、`plan_step_delete`、`plan_step_add`），解决快速连点与模型流式更新互相整组清改问题，前端即时响应 `plan_updated` 广播。
-- **多轮压缩历史折叠卡片链式展示与错误本地化**（#448）— 多次压缩的会话按分支链完整展示前序历史压缩卡片，各卡片按链式切分边界独立展开早期折叠内容；优化压缩记录未找到时的错误提示并接入多语言。
-- **第三方 subagent 扩展同名工具透传支持**（#481）— 修复内置 `subagent` 工具与第三方扩展（如 `pi-subagents`）同名冲突问题；当第三方扩展注册了同名工具且内置 `subagent` 被关闭/禁用时，自动透传扩展工具，不再强制顶替或剔除。
-- **作为 Pi 扩展包安装时宿主 SDK 识别与加载器告警修复**（#482）— 声明可选 `peerDependencies` 解决扩展加载器告警；`/webui` 子进程显式透传宿主 SDK 路径并加载 `resolve-global-sdk` 钩子，使服务准确跟随宿主 SDK 版本。
-- **恢复模型管理中的第二把密钥与刷新模型功能**（#456）— 恢复模型管理面板中克隆内置提供商添加第二把密钥与刷新已存提供商模型列表的功能与按钮。
-- **防止会话交接记录与展开历史无界内存增长**（#465）— `subagentHandoffs` 增加上限容量保护，前端被折叠压缩历史展开缓存改用 LRU 淘汰机制，防止长时间会话内存泄漏。
-- **目标审查循环状态机健壮性强化**（#464, #457）— `goal_ask` 超时定时器保证在 `finally` 中清理，避免残留定时器误杀后续调研；`stopDelegated` 异步等待执行者完全移出，消除容量误判；会话过户时主动唤醒等待者并清理目标审查阻塞态。
-- **工具参数 TypeBox 约束与运行时一致性校准**（#462）— `eval` 工具在执行 TypeScript 代码时启用原生类型剥离（`--experimental-strip-types`）；`lsp`、`terminals`、`compact_context`、`patch` 工具参数范围严格钳制与上下限校准。
-
 ### Added
 
-- **聊天内容引用** — 选中消息中的文字或代码后点击引用，将原文添加到输入框。支持展开、移除、多条引用和重复引用去重，发送后的引用可在历史消息中查看，编辑重问时保留。
-- **侧边贴边悬浮栏与按钮上下左右移动** — 顶栏、底栏条目支持右键移至顶部、底部、左侧侧边栏、右侧侧边栏，支持左右侧边停靠栏折叠展开与偏好持久化。
+- **工具描述可编辑（设置→工具区「编辑文案」）** —— 每个工具行新增编辑入口，三处模型可见文案都可逐工具覆盖：`description`（tool schema 里的工具说明）、`promptSnippet`（系统提示词 Available tools 列表的一行）、`promptGuidelines`（Guidelines 段要点）；留空 = 用工具自带默认（默认文案折叠可见，可一键恢复）。覆盖持久化在设置里（不进预设），改动即时对**所有工具**生效（核心内置 / 本项目工具 / 插件 / MCP），会话中途改动也会重新声明工具；DSH 引擎无 pi 工具注册面，入口隐藏。
+- **工具延迟加载（默认开，可在设置→工具区关掉）** —— 默认只有核心工具（bash/read/edit/write）与 `load_tools` 的完整参数 schema 常驻；其余工具在系统提示词里只有「名字 + 一行摘要」（目录），模型要用时先调 `load_tools(["patch","lsp"])`，那批工具的 schema 才随之下发（加载后本对话后续轮次都可用；已被关闭/预设不允许/计划模式拦截的名字会被拒绝并给出原因）。常驻工具 schema 约 **33k → 7k 字符**，系统提示词也由 ~8.6k 降到 ~6.7k。**不损坏供应商前缀缓存**：系统提示词的目录段与已加载集合无关（逐字节不变）、被加载工具的 guidelines 随加载回执而非提示词、tools 数组只产生追加增量（回归 `lazy-tools-test` 逐字断言）。激活由用户/模型触发；只影响新会话与之后的门控重放，不会反向清空正在跑的对话。DSH 引擎不适用。
+
+### Changed
+
+- **工具描述进一步精简（模型可见文字 -11.0%，schema -1924 字符）** —— 去掉描述 / guidelines / 参数说明里已由 JSON Schema 约束、参数自身或另一处工具信息覆盖的重复句（`browser_page` 的 target/timeoutMs 说明与 op 矩阵重复、`delegate_task` 的模板名枚举与收集方式说明、`compact_context` 的 token 区间（schema 已有 min/max）、`subagent`/`conversation_read`/`present_files`/`schedule` 的多余措辞等），并按项目自身口径（description = 做什么 + 副作用，不写「何时用」）收紧多处文案；`lsp` 的动作表从多行压缩成一段（op 与语义不变）。`edit`：SDK 原描述与它自带的 guidelines 逐条复述同一批规则，无扩展覆盖时（fallback）改由本项目提供精简版（有扩展 edit 时仍用扩展文案，参数 schema/执行体不变）。30 个目录/核心工具：文字合计 12734→11328 字符，参数说明 19480→18594，下发工具 schema 35085→33161。
+- **定时任务三件套合并为单 `schedule` 工具** —— `schedule_task` / `schedule_list` / `schedule_cancel` 三个独立工具合并为一个 action 式 `schedule`：`action=create` 建任务、`action=list` 查看、`action=cancel` 按 id 取消。工具条目从 3 个减为 1 个（设置页「工具」照常循环渲染；旧版本关掉过任意一个 `schedule_*` 的用户会保持关闭，禁用名单自动迁移）。计划 / 审查者 / 目标审查三道只读闸门的派发名单同步为 `schedule`（保守起见整工具拒，调度面在这三道闸门都不需要）。
+- **webmail 插件六个 AI 工具合并为单 `mail` 工具** —— `mail_list` / `mail_read` / `mail_search` / `mail_send` / `mail_manage` / `mail_folders` 合并为一个 action 式 `mail`（`action=list|read|search|send|manage|folders`），邮件条数、正文、发信与批量标记/删除的返回文本与参数语义不变；`mail_send` 原有的「发送前先与用户确认一次」守则原样保留。工具条目从 6 个减为 1 个；设置页「注册的 AI 工具」开关同步为单行。
+- **工具提示词全量收敛（少 18.5% 字符）** —— 模型同一轮里能同时看到三处工具信息（tool schema 的 `description`、`Available tools` 列表里的 `promptSnippet`、`Guidelines` 段里的 `promptGuidelines`），过去大量内容是同一句话的三份复述。现在职责严格分开：`description` 只写「做什么 + 副作用/边界」（≤600c）、`promptSnippet` 只写触发条件（≤80c、不再重复工具名前缀、不再复述描述）、`promptGuidelines` 只管「何时用/顺序/禁止/跨工具路由」；同一个参数块被多个工具复用的（SSH 凭据、数据库连接/库参数、桌面坐标）抽成共享常量。服务端内置工具少 6.1k 字符（-24.7%，其中 1.1k 是 `terminals.ts` 里**永不发送**的终端版 bash 文案死副本），插件侧少 3.8k（-13.5%）。bash 的提示词与参数 schema 统一到新增的 `server/tool-prompts.ts`（原生/终端/分流三路径单源）。守卫升级：`tests/unit/tool-prompt-hygiene.test.ts` 新增长度上限、snippet 工具名前缀、snippet/guideline 复述检测与同文件同义重复检测。
 
 <!-- auto-i18n:start -->
 ### i18n
 
-- 前端新增 key（20）：`openInNewTab`、`clickToCloseImage`、`compactedHistoryNotFound`、`uiLayoutSidebarLeft`、`uiLayoutSidebarRight`、`uiLayoutPosition`、`uiLayoutPosTop`、`uiLayoutPosBottom`、`uiLayoutPosLeft`、`uiLayoutPosRight`、`moveToTop`、`moveToBottom`、`moveToLeft`、`moveToRight`、`sideDockCollapse`、`sideDockExpand`、`quoteSelection`、`quoteText`、`quoteSource`、`removeQuote`
-- 前端英文变更（1）：`browserControlExample2`
-- 服务端文案变更（2）：`markers.todo.dep.blocks.updated`、`subagents.wait.pending`
+- 前端新增 key（12）：`toolLazyLoading`、`toolLazyLoadingDesc`、`toolPromptEdit`、`toolPromptEdited`、`toolPromptHint`、`toolPromptDescription`、`toolPromptSnippet`、`toolPromptGuidelines`、`toolPromptDefault`、`toolPromptReset`、`toolPromptSave`、`toolPromptUnavailable`
+- 前端中文变更（1）：`scheduleTaskEnabledDesc`
+- 前端英文变更（1）：`scheduleTaskEnabledDesc`
+- 服务端新增 key（13）：`loadtools.notready`、`loadtools.unknown`、`loadtools.always`、`loadtools.already`、`loadtools.disabled`、`loadtools.preset`、`loadtools.names.empty`、`loadtools.loaded`、`loadtools.rejected`、`loadtools.none`、`prompt.tools.lazy`、`sched.action.missing`、`sched.action.unknown`
+- 服务端文案变更（3）：`sched.list.empty`、`sched.cancel.empty.id`、`sched.cancel.not.found`
 <!-- auto-i18n:end -->
+
+## [0.99.0] — 2026-10-03
+
+### Added
+
+- **手机端边缘横滑抽屉手势** —— 从屏幕左/右边缘向内横滑拉出左侧会话面板或右侧工具面板，手势支持全行程实时跟手跟随、常驻遮罩层透明度渐显，并具备横向主导轴向识别与代码块/宽表格横向滚动元素避让。回归：`swipe-drawer.test.ts`、`swipe-drawer-ui-test`。
+- **侧边图标停靠栏竖轴对齐（#443）** —— 侧边停靠栏（`SideDock`）支持「靠上 / 居中 / 靠下」三档竖轴对齐模式，三段贴边药丸自适应内容高度，并在设置页「界面布局」对齐选项及拖拽式图标编辑模式中打通。回归：`ui-layout-edit.test.ts`、`side-dock-align-ui-test`。
+
+### Fixed
+
+- **任务计划跨会话隔离防串台** —— `PlanManager` 架构重构：按持久化 `sessionId` 独立落盘至 `<dataDir>/plans.json`，而运行时按 `conversationId` 存入只活在进程内存的临时缓存，启动与载入时严格过滤易变短 ID（`c\d+`），绑定新会话时主动清理旧内存缓存，杜绝服务重启或短 ID 复用导致新会话被上一会话的任务串台附体。回归：`plan-state.test.ts`。
+- **工具契约与运行时脱节修复（#462、#537）** —— 落地三处未对齐的契约细节：`eval` 将 `python` 别名统一归一为 `py`，非法语言显式抛错提示候选；`patch` 真正接入 schema 声明的 `timeout`（1-300s）超时控制并通过 Promise.race 竞速；`bash` 的 `head`/`tail` 参数严密钳制在 schema 上限 5000 以内，防止异常大数冲垮工具结果缓冲与转录。
+- **目标模式 `stopDelegated` 串行化与时序窗口（#464、#536）** —— `stopDelegated` 改为按会话串行化队列执行，`setGoal`/`clearGoal`/`stopAllGoals` 增加 `await` 落定，解决满员边缘重设目标时旧执行者尚未完全移出、同步名额检查误报「名额已满」的问题。
+
+### Changed
+
+- **抽出 CollapsibleHead 公共壳组件（#476、#539）** —— 提取统一的 `CollapsibleHead` 组件，将 `ThinkingBlock`、`ToolCallBlock` 及 `Message`（附件卡/压缩摘要/技能卡）五处内联的可折叠区块头骨架代码收敛统一，键控行为与 ARIA 规范保持一致。
+- **清理 memoizeWithTtl 死码并为手写 TTL 补充注释（#470、#538）** —— 移除全仓零消费的 `memoizeWithTtl` 死码，并为 `agent-service` 的 `piCliProbe`（安装后即时失效）与 `model-enrich` 的 `catalogCache`（双键异步 fetch）补充语义注释。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端新增 key（3）：`uiLayoutAlignTop`、`uiLayoutAlignMiddle`、`uiLayoutAlignBottom`
+
+<!-- auto-i18n:end -->
+
+## [0.98.0] — 2026-10-03
+
+### Added
+
+- **聊天内容引用（#430）** —— 选中消息里的文字或代码，点浮动按钮即可把原文作为引用卡片加进输入框：支持多条引用、展开查看、逐条移除与重复去重，发送后能在历史消息里回看，编辑重问时保留。标准引擎与 DSH 引擎的消息序列化、草稿恢复、流式提问都已适配。回归：`quote-selection.test.ts`、`text-quote.test.ts`、`dsh-edit-quotes.test.ts`、`quote-selection-ui-test.mjs`。
+- **图标编辑模式：拖拽调整四个栏的布局（#443）** —— 顶栏「⋯」→「编辑图标」进入。顶栏 / 底栏 / 左侧边栏 / 右侧边栏四个栏与「待放回」托盘同处一面板，把条目从一个栏拖到另一个栏、或拖回托盘，即直接改写同一份 `uiLayout`（order / align / slots / hidden），与设置页的布局选项实时互通；内置条目的图标名登记在 `host-icon.tsx`（否则编辑面板里只剩文字）。拖拽用 pointer 事件而非 HTML5 DnD（DnD 在触屏上不触发）。「⋯」溢出菜单因此改为顶栏有任意条目时常驻——否则用户根本进不来。回归：`ui-layout-edit.test.ts`、`host-icon.test.ts`、`ui-layout-ui-test`（真 Chrome）。
+- **顶栏/底栏条目可移动到上下左右（右键路径）** —— 条目右键菜单新增「移至顶部 / 底部 / 左侧 / 右侧」，与上面的拖拽是同一份 `uiLayout` 的两个入口；左右侧边停靠栏可折叠展开，偏好持久化。
+- **侧边图标停靠栏改为布局内槽位（#443）** —— `SideDock` 不再是 `position:fixed` 贴边浮层，而是 `.layout` 里的 flex 子项：面板与主区主动向它让出宽度，不再压住面板里的按钮；该侧没有图标时整条不渲染（连宽度都不占）。想要旧行为可在「设置 → 界面布局 → 侧边图标悬浮显示」（`uiLayout.sideDockFloat`）打开。
+- **全屏预览增强** —— 预览头双击（避开按钮 / 链接 / 输入框）切换全屏；图片预览点击图片即关闭（`clickToCloseImage`）；HTML 预览工具条新增「在新标签页打开」外链（`openInNewTab`）；不需要编辑栏时页脚不再占位。
+- **子代理 `wait_all` 阻塞上限可配（#449）** —— 上限从硬编码 60 秒提升到 0.8×看门狗（默认约 16 分钟），可用 `PI_WEB_SUBAGENT_WAIT_CAP_SECONDS` 覆盖：长子代理任务不再被迫每 60 秒重发一次 `wait_all` 烧轮次。
+- **任务计划跨重启/跨刷新持久化** —— 计划不再只活在内存：按 `sessionId` 落盘到 `<dataDir>/plans.json`，并随会话转录（`plan/update` custom entry）一起走；重建会话时按「落盘文件 → 转录 → 历史 `plan_update` 工具调用」三重兼容顺序回放，旧会话也能找回看板。回归：`plan-state.test.ts`。
+- **任务看板折叠态精简为单行状态条** —— 折叠时只留「标题 + 进度徽标 + 当前步骤」，进度以底边 2px 细线呈现（零额外高度）；「净室执行 / 复制 Markdown / 清空」收进展开态，「开始实施」在两种状态都可达。
+- **`ask_user_question` 提问框可折叠（#480）** —— 模型提问卡支持折叠/展开，长问卷不再长期占满消息区。
+
+### Fixed
+
+- **系统提示词不再吞掉其他扩展的增补（#455）** —— 自定义了提示词模板/覆盖、或使用非 standard 预设、或禁用了工具时，内置的提示词组装曾整体替换该轮系统提示词，把别的扩展前置/后置注入的内容（如 `<invoked_skill>` 块）一起丢掉。现在会先把扩展的首尾增补摘出来，渲染完再原样套回去；子代理模板 replace 同样不再丢掉前置增补。
+- **计划模式只读闸门堵住成体系旁路（#436）** —— 六处旁路一次性收口：`terminal_input`/`terminal_key` 从计划模式工具集里整条剔除（PTY 行编辑缓冲在 shell 进程里，无法在服务端可靠镜像，只查缓冲会同时误伤与漏放）；`eval` 补进计划 / 审查者 / 目标审查三道闸门的封禁名单（它是能直接落盘的写路径）；`BYPASS_TOOLS` / `DISPATCH_TOOLS` 里那批**根本不存在**的工具名（`spawn`/`subagent_spawn`/`schedule_agent`/`set_plan_mode` 等）换成真实注册名，并抽成共享的 `SESSION_DISPATCH_TOOLS`（`delegate_task` + 真实存在的 `schedule_task`），三处不再各自漂移；`subagent` 只放行 `get_result`/`list`/`templates`，`steer`/`stop`/`wait_all`/`handoff` 与未知/缺失 action 一律按旁路拒绝（`steer` 最狠：能把写指令注进一个 `planMode=false`、工具齐全的会话）；打开历史会话 / 派生分支 / 冷启动续会话三条注册路径补上 `applyToolGating` 重放，计划模式不再「闸门生效但写工具仍在模型视野里」。回归：`plan-mode` 相关单测。
+- **计划模式有了可靠退出路径（#435）** —— 看板为空时整个 UI 曾无出口（开关已从输入框移除，唯一出口是看板里的「开始实施」）。现在空计划也能从目标条/看板退出计划模式，且状态随转录持久化后仍能正确恢复。
+- **长驻服务内存单调上涨（#440）** —— `sessionFileCache` 原本是无上限的静态 Map，值里还带着整份转录文本（`allMessagesText`，长会话可达数 MB），删掉/改名/轮转出去的转录永远留在内存里。现在列表缓存改成 LRU 上限 512 条且只存元数据；全文搜索改为按需加载到独立小缓存（256 条、30 秒 TTL、单条 256K 字符上限），删除/改名失效与 200 候选的列表语义保持不变。
+- **`client-state.json` 膨胀与界面冻结（#441）** —— 死 `clientId` 键（来自 sessionStorage，每开一个标签页就多一个）此前永不清理，文件与 `save()` 的同步序列化开销线性增长；`getRecentProjects()` 又会在截断到 30 条**之前**对每条合并路径做同步 `existsSync`，Windows 上一个断连网络盘就能把事件循环卡住数秒、冻住所有客户端的 WS/HTTP。现在加载时做保守清扫（30 天不活跃或超出 50 条上限才淘汰，`__settings__` 永不淘汰），探测改成先排序截断再用 `fsPromises.access` 并发探活，`discoverRecentProjectsFromDisk` 的三处同步调用一并异步化。
+- **扁平布局下历史会话列表串项目（#438）** —— 设了 `PI_CODING_AGENT_SESSION_DIR` 时 pi 把各项目转录平铺在会话根目录（cwd 是文件内字段），但快路径从未按 cwd 过滤，导致 A 项目的历史面板里混进 B/C 项目的会话、点一下整个工作区就被切走。现在按全仓统一的 `normalizePathKey` 过滤，并且 200 条名额在**过滤之后**分配——别的项目不再把当前项目挤出自己的列表。
+- **会话缓存首帧种子不校验 cwd（#439）** —— localStorage 里的会话缓存与快照守卫不看 cwd，刷新或切项目时会先显示上一个项目的会话；删除/重命名也不跨标签页失效。
+- **LSP 截断口径如实上报（#447）** —— `cascade` 超 25 个引用方时静默截断且谎报完整，现在文本头与 `details` 都报真实总数并补「还有 N 个未分析」尾注；`documentSymbol` 改为按**展平后**的符号数截断（与文本大纲口径一致，截断的父节点连子树一起去掉），并加序列化体积预算，超大 `.d.ts` / protobuf 文件不再因为整条 `details` 超 64KB 被整块丢弃。
+- **WS 半开连接与背压（#460）** —— 补上 ping/pong 半开连接回收；heartbeat / notice / 调度广播不再绕过 `bufferedAmount` 背压直写死 socket。
+- **迟到的异步副作用复活（#461）** —— 反激活或连接失败后，迟到的异步回调曾把已该结束的东西重新拉起来：vscode-editor 留下僵尸 `connecting`、db-client 工具复活、webmail 泄漏 IMAP 连接、dsh-client 在 close 之后重启运行时。
+- **`lsp`/`patch` 文案未接多语言（#463）** —— 工具返回文案恒英文、scheduler 校验错误中文直通，统一改走 `pick()`。
+- **DSH 视觉附件链路无上限（#467）** —— 视觉附件链路补体量上限与 stdin 背压；`dsh-sessions` 的 zstd 魔数切帧误命中导致的静默丢事件一并修掉。
+- **`ChatInput` 发送按钮白名单漏附件类型（#493）** —— `canSubmit` 漏了 `reference`/`lines`/`page` 附件：纯引用消息发送按钮恒灰但回车照发，流式胶囊也不出现。
+- **后台问卷横幅「切入会话」永久消失（#494）** —— 它复用了 `onClose`，把 `questionId` 记进「已关闭」集合，未作答切走后就再也收不到常驻提醒。
+- **插件目录授权并发覆盖（#495）** —— confirm 没有 busy 守卫，并发授权第二个覆盖第一个，先到的 Promise 永不 settle、悬挂整条 `openSession` 链。
+- **@ 补全与全局搜索抢通道（#496）** —— 两者共用 `chat.fileSearch` 但 `reqId` 编号空间重叠，并发时结果交叉串 feed。
+- **@ 补全浮层词元坐标失效（#442）** —— 光标移动或程序化改文后旧坐标仍被使用，接受补全会把正文拼接写坏。
+- **纯附件提问「直接重问」无效（#443）** —— 只贴图不写字的提问上按钮可见但点击静默无效。
+- **PWA 旧缓存永不淘汰（#504）** —— Service Worker 静态缓存名硬编码 `v1` 且 activate 只清异名缓存，升级后旧 hash 资产永久堆积。
+- **受限网络下安装白等 7.5 分钟（#529）** —— 插件安装的探测/安装阶段补超时与快速失败。
+- **语音输入两处（#445, #446）** —— auto 引擎下本地「超 8 分钟 413 / 忙 429」的前置拦截直接抛出、绕过远端兜底；Whisper 安装轮询器用全局 overlay 判活，可跨浮层存活并在完成回调里无条件 `startRecorderFlow`，劫持或双重开启录音。
+- **vscode-editor「ssh config 自动加载」全链路失效（#429）** —— `loadFile` 作用域错误（ReferenceError 被静默吞掉），并加固了日志。
+- **插件目录非中文语言下恒中文（#505, #432）** —— `catalog.json` 补 `nameEn` 字段并接进 schema 白名单与市场渲染，非 zh 语言不再恒显示中文名。
+- **语言包「中文假翻译」（#502）** —— de/es/fr/it/ko/ru 六个包里各约 130 条的值是中文原文，而 pack 值优先于 en 回落，等于系统性地把中文当成译文发出去；逐条修正并补上文档（#478：README 工具清单、`wait_all` 描述、6 个环境变量、serverStrings 的 ja/pt 缺口）。
+- **db-client 两处硬伤（#458）** —— 三家 SQL 长连接没有 `error` 监听，一个连接错误就能崩掉主进程；Mongo 的保存/删除 100% 抛 `ObjectId` ReferenceError（从未可用）。回归：`tests/unit`。
+- **DSH 提问桥超时后队列永久停摆（#459）** —— `goal-rpc` 的 pending 超时后排队中的提问 Promise 永不 settle，agent 卡死在工具调用上；超时路径现在统一 settle 并派发下一个。
+- **legado 规则引擎启动超时后永久瘫痪（#466）** —— worker 启动超时后 `ready` 永久 rejected，桥再也起不来；现在会复位 worker。`/store`、`/proxy` 的 `readRawBody` 补 10MB 上限。
+- **`forceReset` 后事件订阅不重挂 / 幽灵重建（#484, #485）** —— 重建非活跃会话（子代理/角色对话）后事件订阅没挂回去，表现为快照冻结、看门狗失聪、`turnEndWaiters` 死等；强行关闭与 `forceReset` 交错还会把已移除会话幽灵重建，泄漏无主 runtime 与扩展宿主子进程。
+- **模型列表刷新回滚并发编辑（#486）** —— `refreshProviderModels` 的读-改-写没有互斥，probe 的网络窗口里用户对同一服务商的编辑会被旧快照静默回滚；现在以盘上最新条目为合并基准。
+- **abort/移除会话不结算挂起审批（#487）** —— `pendingQuestions`/`pendingApprovals` 里的悬挂条目会让失联检测被永久豁免，弹窗还会跨轮残留；现在就地结算。
+- **`wait_all` 把「已移出」当「仍在运行」（#488）** —— 等待集合里含被移出的子代理时必然白等满 cap（#449 的放大）；现在视为终态。
+- **插件 reload 让剩余守卫整体跳过（#489）** —— reload/uninstall 原地清空 `loaded` Map，`evaluateToolPre` 的迭代器静默终止，剩余插件的 pre 守卫整体 fail-open；改为对快照迭代。
+- **目标重设污染新目标（#490）** —— `dispatchExecutor` spawn 后没有代次复检就写回老执行者，`deliverAndWait` 登记 `verdictWaiter` 前也有 `await` 窗口；两处都补上复检。
+- **可崩全服的 `unhandledRejection`（#491）** —— dispatch 的 `queue_remove` 是唯一缺 `void` 的 async 调用，且 `removeQueued` 内 `clearQueue` 无 try；现已消除该点。
+- **新对话窗口静默吞消息（#492）** —— 新对话 displacement 与 runtime 创建窗口重叠时 `prompt` 被 abort 静默丢弃（无 notice、草稿已清），现在补「消息未送达」回执。
+- **`mcp.json` 读失败被当空配置（#497）** —— EBUSY/EACCES 被当成空配置，会把在跑的 MCP 服务器全杀掉并推「热加载成功 0 个」的误导通知；现在按坏配置口径保留在跑的服务器，仅 ENOENT 视为删除。
+- **markers 三处（#499）** —— `todo dep` 英文反馈方向颠倒、`new` 主题含逗号被静默截断、notify guidance 宣称协议里并不存在的 `success` 级别。
+- **session-migrate 可伪造官方会话（#500）** —— fallback 导入没有来源标记，能伪造出看起来像官方的会话记录，且插件内直写会话库绕过了 outside-workspace 审批；现在补 `[imported-from]` 提示与会话头来源元数据。
+- **内置预览页可被注入（#501）** —— live-preview 的 Markdown 链接/图片替换没有 scheme 白名单，`javascript:` href 可注入同源预览页。
+- **直启路径端口校验（#506）** —— `--port abc` 曾静默绑随机端口并打印 `http://localhost:NaN`，现在 fail-fast。
+- **只读 `bash` 白名单的 `find` 旁路（#483）** —— 白名单命中不等于只读：`find` 的 `-exec`/`-delete`/`-fprintf` 族现在按写副作用拒绝，一条常规 `find` 语法不再能绕过计划模式的三道只读闸门。
+- **@ 引用正文写相对路径（#532）** —— 引用正文改用相对路径，同名文件/文件夹在输入框与聊天记录里可区分；退格整块删除与 chip 的 ✕ 反查口径同步对齐。
+- **Windows 更新面板缺 `pi-core` 行（#533）** —— `readPiCoreVersionFromDisk()` 只认 npm 的 POSIX 布局，Windows 下 cmd-shim 是普通脚本、`realpathSync` 原样返回，向上找 `package.json` 永远找不到；现在先试 `<bin 同级>/node_modules/<pkg>/package.json`，探测不到时也保留该行并诚实标注「无法检测」而不是假装不存在。
+- **Windows `server install` 生成的 VBS 无效（#534）** —— PowerShell 7 的 `C:\Program Files\PowerShell\7\pwsh.exe` 含空格却没加引号，Windows Script Host 报 `80070002`，登录自启与桌面快捷方式都起不来。
+- **已钉住的对话跨服务重启持久化（#433）** —— 钉住状态持久化至 `client-state.json`，服务重启后自动恢复常驻运行列表，历史会话列表同步展示 📌 置顶标记并支持右键切换钉住状态。
+- **计划模式净室执行（Clean Handoff）原子化（#434）** —— 修复净室执行前端四发消息由于服务端异步分发导致的竞态，提供原子协议通道 `plan_clean_handoff`，确保旧会话计划闸门关闭、新隔离会话原子就绪并承接计划步骤与目标后再发起实施。
+- **压缩历史展开区只读防护与序号对齐（#437）** —— 压缩历史展开视窗右键菜单禁用派生分支、回滚与生成长图等写/非会话操作，序列化复用全局序号生成器，杜绝序号重计与碰撞。
+- **PlanBoard 任务看板并发编辑防范（#444）** —— 看板步骤状态切换、内容修改、增量新增与删除改走单步骤级增量协议（`plan_step_update`、`plan_step_delete`、`plan_step_add`），解决快速连点与模型流式更新互相整组清改问题，前端即时响应 `plan_updated` 广播。
+- **多轮压缩历史折叠卡片链式展示与错误本地化（#448）** —— 多次压缩的会话按分支链完整展示前序历史压缩卡片，各卡片按链式切分边界独立展开早期折叠内容；优化压缩记录未找到时的错误提示并接入多语言。
+- **第三方 subagent 扩展同名工具透传支持（#481）** —— 修复内置 `subagent` 工具与第三方扩展（如 `pi-subagents`）同名冲突问题；当第三方扩展注册了同名工具且内置 `subagent` 被关闭/禁用时，自动透传扩展工具，不再强制顶替或剔除。
+- **作为 Pi 扩展包安装时宿主 SDK 识别与加载器告警修复（#482）** —— 声明可选 `peerDependencies` 解决扩展加载器告警；`/webui` 子进程显式透传宿主 SDK 路径并加载 `resolve-global-sdk` 钩子，使服务准确跟随宿主 SDK 版本。
+- **恢复模型管理中的第二把密钥与刷新模型功能（#456）** —— 恢复模型管理面板中克隆内置提供商添加第二把密钥与刷新已存提供商模型列表的功能与按钮。
+- **防止会话交接记录与展开历史无界内存增长（#465）** —— `subagentHandoffs` 增加上限容量保护，前端被折叠压缩历史展开缓存改用 LRU 淘汰机制，防止长时间会话内存泄漏。
+- **目标审查循环状态机健壮性强化（#464, #457）** —— `goal_ask` 超时定时器保证在 `finally` 中清理，避免残留定时器误杀后续调研；`stopDelegated` 异步等待执行者完全移出，消除容量误判；会话过户时主动唤醒等待者并清理目标审查阻塞态。
+- **工具参数 TypeBox 约束与运行时一致性校准（#462）** —— `eval` 工具在执行 TypeScript 代码时启用原生类型剥离（`--experimental-strip-types`）；`lsp`、`terminals`、`compact_context`、`patch` 工具参数范围严格钳制与上下限校准。
+- **插件更新检查不再误报** —— 版本号相同就绝不报更新（即使 monorepo 仓库 HEAD SHA 变化）；子目录源插件抓不到远端清单时明确报「无法检查（未能获取远端插件清单）」，不再拿仓库根 SHA 当版本号；随包（`pkgRoot`）插件版本可离线直读。CLI `pi-web-ui check-updates` 同步改为按版本号（而非 SHA）展示「已装 → 远端」差距。安装/卸载插件完成后立即重算更新状态，不必等下次轮询。
+- **已结束的对话过户到另一处后可直接继续（#484）** —— 过户只换页面持有者、不重建 runtime，但新页面的会话订阅此前没挂回去，导致过户后发消息收不到回复（必须刷新页面）。现在过户尾部显式重挂事件订阅。回归：`idle-takeover-test`。
+
+### Changed
+
+- **清掉 103 个没人引用的 i18n key（#472）** —— 前端字典里积了一批没人读的翻译（旧模型管理 UI 残留 54 个、旧语言选择键 10 个、提示词/工具开关重构残留等），白白拖着 8 个语言包一起翻译与审阅。现新增守卫 `tests/unit/i18n-dead-keys.test.ts`（随 `npx vitest run` 进 CI）：字典里出现全仓零引用的 key 就直接红，并列出清单。模板拼接的动态 key（`thinking.*` / `promptTok_*`）已显式白名单。
+- **服务端与前端死码清理（#468, #473）** —— 服务端：删掉协议死链（`cycle_model`/`cycle_thinking`、上行 `subagent_handoff`）、`sendControlCommand` 死副本、16 个零引用导出与一批死设置类型；`plugin_job_cancel` 反向补上 UI 入口（设置页作业状态行加「取消」），插件安装/更新这类长任务终于能中止。前端：删掉 11 个只被自己单测养活的 hook/util（约 1000 行）、7 个全死导出、`ui-slots` 三条「可拖可隐藏但对渲染毫无影响」的假条目（`host:lp-projects/lp-running/lp-history`），184 个仅本文件使用的导出去掉 `export`。
+- **基础工具层统一、目录选择器同构合并、复制与格式化组件抽离（#470, #474, #475, #476, #477）** —— 服务端路径归一化 6 套语义分派、手抄 15+ 处的原子写、三份 TTL memoize 收敛为一套；`FooterBar` 与 `ProjectPicker` 复刻的两套目录浏览器（约 250 行同构）合并；`SettingsModal` 6 个逐行同构的提示词覆盖区块与两套 list+modal 编辑器合并；前端复制反馈 8 处内联、`formatSize` 6 份、可折叠区块头 3 份抽成共享组件；11 个插件里逐字复刻的 `esc`/`hostApi`/`apiBase` 等 client utils 下沉到 plugin-sdk 共享层。
+- **构建期依赖归类与产物守卫（#468）** —— 16 个只被 `web/src` 用、随 vite 打进 `web/dist` 的包移入 devDependencies（npm 用户的安装体积与供应链面纯收益）；探针从 `server/dsh/` 挪到 `dev/dsh-probes/`（`dev/` 不进 npm 包）；新增 `.gitattributes` 与 CI 步骤「重新生成插件 bundle / vendor 后 `git diff --exit-code`」，改了 `src/` 忘了重新生成会被当场拦下。
+- **CI 与 lint 覆盖补口（#479, #503）** —— `lint`/`lint:fix` 纳入 `bin/`（4400 行主入口不再零 lint 防护）；`check:protocol` 补 git 启发式：`protocol.ts` 相对上一个 tag 有 diff 而 `PROTOCOL_VERSION` 未 bump 即报错。
+- **`release-notes.mjs --write-changelog` 替换串改函数形式（#498, #515）** —— i18n 文案含 `$&`、`` $` `` 等替换模式时不再静默写坏 `CHANGELOG.md`。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端新增 key（26）：`openInNewTab`、`clickToCloseImage`、`compactedHistoryNotFound`、`uiLayoutSideDockFloat`、`uiIconEdit`、`uiIconEditTitle`、`uiIconEditHint`、`uiIconEditTray`、`uiIconEditDropHere`、`uiLayoutSidebarLeft`、`uiLayoutSidebarRight`、`uiLayoutPosition`、`uiLayoutPosTop`、`uiLayoutPosBottom`、`uiLayoutPosLeft`、`uiLayoutPosRight`、`moveToTop`、`moveToBottom`、`moveToLeft`、`moveToRight`、`sideDockCollapse`、`sideDockExpand`、`quoteSelection`、`quoteText`、`quoteSource`、`removeQuote`
+- 前端删除 key（103）：`langZh`、`langEn`、`langIt`、`langJa`、`langKo`、`langFr`、`langDe`、`langEs`、`langRu`、`langPt`、`manageModelsTitle`、`setGlobalDefault`、`clearGlobalDefault`、`globalDefaultBadge`、`slashHelpHint`、`renameSessionConfirm`、`dismissConversationWithSubagents`、`dismissConversationWithSubagentsMixed`、`toolApprovalCommand`、`toolApprovalReason`、`approvalRuleResetConfirm`、`approvalRuleDeleteConfirm`、`planBoardSteps`、`planBoardProgress`、`planBoardNoPlan`、`editHint`、`updateTip`、`pluginAllUpToDate`、`fileSaved`、`dshVisionHiddenNote`、`questionNavTip`、`planModeTipOn`、`scmQueryFailed`、`scmTooManyFailures`、`editProvider`、`builtinProviders`、`hintKeyOnly`、`providerAuthHint`、`keyReady`、`replaceKey`、`replaceKeyTitle`、`cloneProviderTitle`、`pasteKey`、`providerIdPlaceholder`、`baseUrlExamplePh`、`saveAllBatch`、`advancedEdit`、`batchCreateProviders`、`secondKeyTitle`、`noBaseUrlShort`、`providerNameLabel`、`providerNameHint`、`apiKeyLabel`、`secondKeyPlaceholder`、`batchDesc`、`batchKeyLabel`、`modelsCountShort`、`customProviders`、`customDesc`、`noCustomProviders`、`refreshBuiltinCatalog`、`appendModelTitle`、`appendModelIdPh`、`appendModelNamePh`、`appendModelAdd`、`appendModelBusy`、`appendModelCancel`、`appendModelApiTitle`、`appendModelApiAuto`、`appendModelBaseUrlPh`、`modelsCount`、`addProvider`、`modelsTitle`、`modelIdReq`、`textImage`、`maxOutput`、`removeModel`、`addModel`、`fetchModelsErr`、`antigravityTemplateTitle`、`antigravityTemplateDesc`、`antigravityFillOpenAI`、`antigravityFillAnthropic`、`enrichHintPh`、`enrichModelsCancelled`、`goalBarActive`、`goalBarStatusPending`、`goalWizardAnswer`、`promptHistoryCleared`、`settingsPromptMode`、`promptAppendHint`、`promptReplaceHint`、`promptPlaceholder`、`promptReadonlyLockedBadge`、`reviewPromptHint`、`settingsTerminalTools`、`terminalToolsOffHint`、`settingsEditTools`、`visionBridgePromptAppendHint`、`visionBridgePromptReplaceHint`、`dshPresetCurrent`、`schedulerNameLabel`、`schedulerPromptLabel`
+- 前端中文变更（3）：`planBoardTitle`、`planImplementBtn`、`planCleanHandoffBtn`
+- 前端英文变更（4）：`planBoardTitle`、`planImplementBtn`、`planCleanHandoffBtn`、`browserControlExample2`
+- 服务端新增 key（1）：`pluginupdate.subpath.manifest.failed`
+- 服务端文案变更（2）：`markers.todo.dep.blocks.updated`、`subagents.wait.pending`
+- 服务端删除 key（1）：`markers.todo.list.empty`
 
 ## [0.97.0] — 2026-09-26
 
@@ -1386,7 +1501,9 @@ when?, children?}`，也收 `topbar` / `settings` 这类简写别名）；宿主
 - 0.35.1（2026-08-27）：编辑重问保留附件（#18）+ 全窗口拖放（#19）。
 - 0.29.0（2026-08-23）：全局搜索弹窗（Ctrl+K）+ 消息列表惰性窗口化。
 
-[Unreleased]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.97.0...main
+[Unreleased]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.99.0...main
+[0.99.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.99.0
+[0.98.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.98.0
 [0.97.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.97.0
 [0.96.1]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.96.1
 [0.96.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.96.0

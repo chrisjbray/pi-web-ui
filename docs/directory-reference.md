@@ -40,7 +40,7 @@ pi-web-ui/
 ├── Dockerfile / docker-compose.yml
 ├── docs/                       # 详细文档（architecture-core / architecture-attachments / architecture-terminal /
 │                               #   architecture-plugins / architecture-system-prompt / goal-conversation-design /
-│                               #   development / release /
+│                               #   tool-context-budget / development / release /
 │                               #   deployment / dsh-engine / antigravity-proxy / env-vars ＋ 本文件）
 └── tsconfig.server.json / tsconfig.extensions.json / tsconfig.tests.json / web/tsconfig.json
 ```
@@ -61,6 +61,7 @@ server/
 ├── uploads.ts              # 文件对话上传 + 保留期清理
 ├── bg-servers.ts           # 后台任务跟踪（bash 前后端口快照 diff + 存活刷新）
 ├── settings-service.ts     # 设置面板状态机
+├── preset-share.ts         # ★ 设置预设的导入/导出/分享/社区目录（交换格式 pi-web-ui-preset v1：白名单净化、SSRF 收口、gh issue 回落预填网页、index.json 目录 5 分钟缓存；编排走 PresetSharePort，见 docs/preset-sharing.md）
 ├── goal-service.ts         # 目标/审查循环/调研向导
 ├── i18n.ts                 # 服务端语言协商 + 翻译表注册（resolveServerLang/pick/bilingual/getServerBlock）
 ├── locales.ts              # 可下载语言包（核心只含 zh/en，其余语言走语言包 serverStrings 节）
@@ -89,6 +90,9 @@ server/
 ├── schedule-agent-tool.ts  # 把内置调度器暴露给 Agent（issue #193）
 ├── scheduler-tasks.ts      # 内置定时任务调度（issue #184）：任务 CRUD + cron/间隔触发 + 无头执行
 ├── tool-info.ts            # 工具定义说明（工具卡右键 → 显示工具详细信息）：按名现取 SDK / DSH 运行时的工具定义 → `tool_info`（定义是大对象，不进快照；DSH 拿不到时回 `unsupported`）
+├── tool-prompt-overrides.ts # 逐工具文案覆盖（设置→工具区「编辑文案」）：归一化 + 给会话 _toolRegistry 打 description/snippet/guidelines 补丁（出厂定义永不动，可复原）
+├── load-tools-tool.ts      # 工具延迟加载入口（load_tools）：目录（名字 + 一行摘要）在系统提示词里，模型按需把参数 schema 拉进本对话
+├── tool-prompts.ts         # bash 工具模型可见文案（description/snippet/guidelines/参数 schema）的唯一事实源（三条执行路径共用）
 ├── subagents.ts            # 第一方子代理：统一的 subagent 工具（spawn/get_result/steer/list/stop/templates/wait_all/handoff）+ 运行态快照
 ├── subagent-templates.ts   # 子代理模板库（全局 <dataDir>/subagent-templates.json；白名单语义；可选模型/思考强度，空=跟随主对话；enabled=false 对 AI 不可见）
 ├── wait-subscription-scan.ts # 挂起 wake 订阅扫描（保留带 pending 子代理 wake 的对话）
@@ -114,6 +118,7 @@ server/
 ├── plugin-api-catalog.ts   # 机器可读的注册面目录（slot 的 key/kind/occupants/example）
 ├── plugin-catalog.ts       # 插件市场列表（builtin plugins/catalog.json + 用户自定义 <dataDir>/plugin-catalog.json）+ 目录同步纯函数（normalizeSyncPayload/writeCustomCatalog，issue #148）
 ├── plugin-catalog-sync.ts  # 市场目录同步编排（拉取/校验/原子写/可选安装/重载+重推，issue #148）
+├── plugin-conversation-view.ts # ★ 插件会话快照选会话策略（#542：按 clientId 取本标签页正看的对话 / 缺省跳过子代理回落 + 模型变更去重键，纯函数）
 ├── plugin-dom.ts           # 特权 DOM 访问授权表（<dataDir>/plugin-dom.json）
 ├── plugin-facilities.ts    # 插件宿主设施：插件私有 KV 存储 + 加密 secrets
 ├── plugin-grants.ts        # 插件目录授权表（<dataDir>/plugin-grants.json）：工作区外目录的「记住」授权（父目录覆盖子目录），设置面板可撤销
@@ -185,13 +190,13 @@ web/src/
 ├── prompt-history.ts   # 输入历史（↑/↓）存储
 ├── message-delta.ts    # message_delta 增量 patch 纯函数，有单测
 ├── lazy-window.ts      # 消息列表惰性窗口化纯函数，有单测
-├── search-text.ts      # 会话内搜索索引纯函数，有单测
 ├── search-folded.ts    # 折叠区搜索辅助
 ├── present-items.ts    # ★ present_files 卡片纯函数（参数解析/与 details 合并/能力判定/自动打开闸门），有单测
 ├── present-settings.ts # 卡片偏好：自动打开预览弹窗（localStorage，默认关）+ 已开过的 toolCallId 去重表
 ├── file-preview-bridge.ts # 工具卡片 → 文件预览弹窗的模块级 sink（App 注册 opener）
 ├── file-transfer.ts    # 文件传输前端逻辑（配 FileTransferDialog + file-transfer-routes）
 ├── tool-info-state.ts  # 工具定义弹窗的模块级 store（打开/关闭/应答 → 视图，纯函数 + 单测）
+├── tool-prompt-state.ts # 逐工具文案编辑器的默认值 store（get_tool_prompt 应答 → 视图，纯函数）
 ├── tool-schema.ts      # 参数 JSON Schema → 表格行（参数名/类型/必填/说明，纯函数 + 单测）
 ├── tool-args.ts        # 工具卡头参数提示纯函数（路径/超时安全提取，脏参数不抛错），有单测
 ├── skill-block.ts      # parseSkillBlock：<skill> 块解析，有单测
@@ -225,12 +230,12 @@ web/src/
 ├── model-usage.ts      # 模型用量统计
 ├── panel-sash.ts       # 面板分隔条（拖拽调宽）
 ├── provider-oauth-state.ts # 服务商 OAuth 前端状态（配 ProviderOAuthControls）
-├── relative-time.ts    # 相对时间格式化
 ├── rollback-state.ts   # 回滚（workspace-snapshot）前端状态
 ├── scm-commit-history.ts / scm-history-filter.ts / scm-quote.ts / scm-sidebar.ts # SCM 面板辅助模块
 ├── scrollbar-gutter.ts # 滚动条槽位
 ├── shortcut-stack.ts   # 快捷键栈
 ├── stream-markdown.ts  # 流式 Markdown 渲染
+├── swipe-drawer.ts / use-swipe-drawer.ts # 手机端抽屉横滑手势（纯判定 + DOM 粘合）
 ├── term-touch.ts       # 终端触屏支持
 ├── thinking-levels.ts  # 思考强度档位
 ├── tip-position.ts     # 提示定位
@@ -238,9 +243,7 @@ web/src/
 ├── token-input.ts      # Token 输入框
 ├── touch-device.ts     # 触屏设备判定（IS_TOUCH）
 ├── update-command.ts   # 更新命令拼装
-├── use-auto-resize-textarea.ts / use-auto-scroll.ts / use-click-outside.ts / use-debounce.ts /
-│   use-in-view.ts / use-keyboard-shortcut.ts / use-latest-async.ts / use-local-storage.ts /
-│   use-media-query.ts / use-resizable.ts # 通用 Hooks
+├── use-click-outside.ts # 点击外部关闭（浮层通用）
 └── components/         # 见下
 ```
 
@@ -252,6 +255,7 @@ web/src/
 | `PluginFilePreview.tsx`                                                                   | 插件提供的文件预览器宿主                                                                                                                                                             |
 | `PresentedFiles.tsx`                                                                      | `present_files` 工具卡片正文：图片/视频/音频内联显示/播放，文本开头摘录 + 「预览」按钮；每行「预览/本地打开/在文件夹中显示/下载/复制路径」；`focus` 条目按偏好自动弹预览窗（三道闸） |
 | `ToolInfoDialog.tsx`                                                                      | 「工具详细信息」弹窗（工具卡右键）：展示工具**定义**（说明/参数 schema 表格+原始 JSON），点开现取不进快照；portal 到 body（消息流祖先有 overflow/transform）                         |
+| `ToolPromptEditor.tsx`                                                                    | 逐工具文案编辑器（设置→工具区「编辑文案」）：description/snippet/guidelines 三字段，留空=默认；保存走 `set_settings.toolPromptOverrides`                                             |
 | `ToolApprovalDialog.tsx`                                                                  | 审批弹窗（ask 规则命中时的人机协同拦截 + 改写执行）                                                                                                                                  |
 | `LeftPanel.tsx`                                                                           | 左栏：最近项目、运行的对话、历史对话（含删除）                                                                                                                                       |
 | `RightPanel.tsx`                                                                          | 文件树浏览（list_files），文件名点击→预览，🔗 引用路径（仅路径，无内容注入）/👁 预览/⬇ 下载等按钮；服务端原生递归 watcher                                                             |

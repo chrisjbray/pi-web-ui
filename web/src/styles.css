@@ -2531,6 +2531,7 @@ select.plugin-topbar-item.plugin-topbar-select {
 	border-radius: 10px;
 	background: var(--bg-elev, #1c1e24);
 	box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
+	font-size: 12.5px;
 }
 /* issue #183：必须是直子选择器 —— 溢出菜单里搬进来的是整块宿主控件
    （Dropdown 的 .chip 触发器 + .dd-menu、BrowserControl 的 .chip 等），
@@ -2627,6 +2628,7 @@ select.plugin-topbar-item.plugin-topbar-select {
 	gap: 6px;
 	padding: 5px 10px;
 	align-items: center;
+	font-size: 12.5px;
 }
 .plugin-topbar-menu.portal
 	:is(.tb-row, .chip, .tb-tab, .plugin-topbar-item, .panel-toggle)
@@ -2640,6 +2642,10 @@ select.plugin-topbar-item.plugin-topbar-select {
 	/* emoji 字形：字号跟方盒走，别让字体自己决定高度 */
 	font-size: 14px;
 	line-height: 1;
+}
+.plugin-topbar-menu.portal .plugin-icon-glyph svg {
+	width: 100%;
+	height: 100%;
 }
 /* 没有行首图标的行补一个同宽占位（伪元素在 flex 里是 flex item，天然不参与
    text-overflow），文字左缘因此和带图标的行对齐。 */
@@ -2956,6 +2962,26 @@ select.plugin-topbar-item.plugin-topbar-select {
 	to {
 		opacity: 1;
 	}
+}
+
+/* 常驻遮罩（移动端抽屉手势专用，见 use-swipe-drawer.ts）：不进 DOM 就不存在
+   mount 动画，改由 .on 类 + opacity 过渡控制 —— 跟手期间 JS 直接写内联 opacity，
+   松手后清掉内联值就自动过渡到 .on / 无类的终态。 */
+.drawer-backdrop.persistent {
+	animation: none;
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity 0.25s ease;
+}
+.drawer-backdrop.persistent.on {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+/* 手势跟手期间禁掉过渡：transform 由 JS 逐帧写内联值（松手立刻移除本类，
+   让 CSS/React 接着把它过渡到最终位置）。 */
+.panel-drawer.drawer-dragging {
+	transition: none;
 }
 
 /* 视图 tab 的胶囊外观已搬到 .tb-tab（顶栏扁平化：不再有 .view-switch 容器，
@@ -9317,27 +9343,50 @@ div.chead[role="button"]:focus-visible,
 	/* 限高封顶靠下面的清单自身滚动（不砍头部）。列向 flex 子项给 min-height:0：
 	   否则清单的 max-height 到了 .main 算总高时仍可能被压回，整页跟着滚。 */
 	min-height: 0;
+	padding: 10px 14px;
+	border-radius: 8px;
+	background-color: var(--bg-elev);
+	border: 1px solid var(--border-subtle);
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+	font-size: 13px;
+	position: relative;
+	transition:
+		padding 0.15s ease,
+		border-radius 0.15s ease;
 }
 
-/* 摘要栏（标题 / 计数 / 当前步骤 chip / 操作按钮）—— 窄屏下唯一会打架的一行。
- * 竖排病根：行内 flex 子项默认 min-width:auto 且允许收缩，「任务看板」「0/6 (0%)」
- * 被 chip 挤到 1 字一行（CJK 逐字断）。口径：标题与计数钉死 nowrap + 不参与收缩，
- * 可压缩的额度全留给 chip；chip 自己 flex-basis 120px，放不下整块换行（父级 wrap），
- * 于是「宽屏同行、窄屏另起一行」，不再出现竖排。 */
+/* 折叠精简态：纯粹单行状态条（高度 ~28px，底边 2px 进度线） */
+.plan-board.plan-board-collapsed {
+	padding: 4px 10px 6px;
+	border-radius: 6px;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+	overflow: hidden;
+}
+
+/* 摘要栏（标题 / 计数徽章 / 当前步骤 chip / 操作按钮）
+ * 口径：标题与计数徽标钉死同行 nowrap + 不参与收缩，无论展开还是折叠都绝不换行；
+ * 进度计数以高亮徽标呈现，与任务标题锁死在一起。 */
 .plan-board-head {
 	display: flex;
-	align-items: flex-start;
+	align-items: center;
 	justify-content: space-between;
 	gap: 8px;
 	min-width: 0;
 	cursor: pointer;
 	user-select: none;
+	position: relative;
+}
+.plan-board:not(.plan-board-collapsed) .plan-board-head {
+	padding-bottom: 8px;
+}
+.plan-board-collapsed .plan-board-head {
+	min-height: 22px;
 }
 .plan-board-head-main {
 	display: flex;
 	align-items: center;
-	flex-wrap: wrap;
-	gap: 4px 8px;
+	flex-wrap: nowrap;
+	gap: 6px;
 	flex: 1 1 auto;
 	min-width: 0;
 }
@@ -9351,12 +9400,24 @@ div.chead[role="button"]:focus-visible,
 	white-space: nowrap;
 	flex: 0 0 auto;
 }
+/* 任务进度计数徽标：紧凑圆角胶囊，同行展示，100% 自动变绿 */
 .plan-board-count {
-	font-size: 12px;
-	color: var(--text-dim);
+	display: inline-flex;
+	align-items: center;
+	padding: 1px 7px;
+	border-radius: 999px;
+	font-size: 11.5px;
+	font-weight: 600;
+	background: var(--accent-soft);
+	color: var(--accent);
 	white-space: nowrap;
 	flex: 0 0 auto;
 	font-variant-numeric: tabular-nums;
+	line-height: 1.4;
+}
+.plan-board-count.plan-board-count-done {
+	background: var(--green-soft);
+	color: var(--green);
 }
 .plan-board-active {
 	/* basis 180px：手机端同行只剩 ~150px，放不下就整块落到第二行拿满宽度
@@ -9374,6 +9435,24 @@ div.chead[role="button"]:focus-visible,
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
+}
+.plan-board-collapsed .plan-board-active {
+	flex: 0 1 auto;
+	margin-left: 2px;
+	padding: 1px 6px;
+	font-size: 11px;
+	line-height: 1.4;
+}
+
+@media (max-width: 640px) {
+	.plan-board-collapsed .plan-board-active {
+		max-width: min(24ch, 36%);
+	}
+}
+@media (max-width: 440px) {
+	.plan-board-collapsed .plan-board-active {
+		display: none;
+	}
 }
 .plan-board-actions {
 	display: flex;
@@ -9415,12 +9494,12 @@ div.chead[role="button"]:focus-visible,
 	background: var(--bg-elev2);
 }
 
-/* 计划看板的「开始实施」：计划模式下**唯一**的出口（闸门在服务端常亮）。
-   实心强调色 + 文案，和旁边两个纯图标钮拉开一个层级。 */
-.plan-board-implement {
+/* 任务看板行动按钮：实施与净室执行并排，外观保持统一一致（实心强调色 + 相同圆角尺寸） */
+.plan-board-implement,
+.plan-board-clean-handoff {
 	display: inline-flex;
 	align-items: center;
-	padding: 3px 10px;
+	padding: 3px 8px;
 	border: none;
 	border-radius: 6px;
 	background: var(--accent);
@@ -9429,28 +9508,11 @@ div.chead[role="button"]:focus-visible,
 	line-height: 1.5;
 	cursor: pointer;
 	white-space: nowrap;
+	transition: filter 0.15s ease;
 }
-.plan-board-implement:hover {
-	filter: brightness(1.08);
-}
-
-/* 净室执行按钮：开辟全新无探索噪音会话 */
-.plan-board-clean-handoff {
-	display: inline-flex;
-	align-items: center;
-	padding: 3px 8px;
-	border: 1px solid var(--accent);
-	border-radius: 6px;
-	background: var(--accent-soft);
-	color: var(--accent);
-	font-size: 12px;
-	line-height: 1.5;
-	cursor: pointer;
-	white-space: nowrap;
-}
+.plan-board-implement:hover,
 .plan-board-clean-handoff:hover {
-	background: var(--accent);
-	color: #fff;
+	filter: brightness(1.1);
 }
 
 .plan-board-add-btn {
@@ -9492,6 +9554,48 @@ div.chead[role="button"]:focus-visible,
 		/* 手机：摘要栏 + 清单合计仍需给消息区和输入框留出可用地板 */
 		max-height: 34vh;
 	}
+	.plan-board-implement,
+	.plan-board-clean-handoff {
+		padding: 3px 6px;
+		font-size: 11.5px;
+	}
+}
+
+/* 展开态：紧贴头部底部的分界线进度条（优雅充当分界线，不占单独空行） */
+.plan-board-head-divider {
+	position: absolute;
+	left: -14px;
+	right: -14px;
+	bottom: 0;
+	height: 2px;
+	background: rgba(255, 255, 255, 0.08);
+	overflow: hidden;
+	pointer-events: none;
+}
+.plan-board-head-divider-fill {
+	height: 100%;
+	transition: width 0.3s ease;
+}
+
+/* 底边 2px 细线进度条（折叠态专用，绝对贴底，零垂直占位） */
+.plan-board-progress-line {
+	position: absolute;
+	left: 0;
+	bottom: 0;
+	width: 100%;
+	height: 2px;
+	background: rgba(255, 255, 255, 0.08);
+	overflow: hidden;
+	pointer-events: none;
+}
+.plan-board-progress-line-fill {
+	height: 100%;
+	transition: width 0.3s ease;
+}
+
+/* 展开态下的独立进度条（已废弃独立行，统一走 head-divider） */
+.plan-board-steps-progress {
+	display: none;
 }
 
 /* ---------------------------------------------------------------- goalbar */
@@ -13060,6 +13164,265 @@ button.source-default-toggle {
 	border-color: var(--accent);
 }
 
+/* ---- 预设分享面板（导入 / 导出 / 浏览共享仓库） ------------------------- */
+.set-preset-share-bar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.modal.preset-share-modal {
+	position: fixed;
+	top: 50%;
+	left: 50%;
+	transform: translate(-50%, -50%);
+	width: min(720px, calc(100vw - 32px));
+	max-width: none;
+	max-height: min(720px, calc(100vh - 80px));
+	overflow: hidden;
+	gap: 0;
+	padding: 0;
+	border-radius: 14px;
+}
+.preset-share-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 12px 14px;
+	border-bottom: 1px solid var(--border-soft);
+}
+.preset-share-title {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-weight: 600;
+	font-size: 14px;
+	white-space: nowrap;
+}
+.preset-share-tabs {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	margin-left: auto;
+}
+.preset-share-tab {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	padding: 6px 10px;
+	border: 1px solid transparent;
+	border-radius: 8px;
+	background: transparent;
+	color: var(--text-dim);
+	font-size: 12px;
+	cursor: pointer;
+}
+.preset-share-tab:hover {
+	color: var(--text);
+	background: var(--bg-elev);
+}
+.preset-share-tab.active {
+	color: var(--accent);
+	border-color: rgba(139, 92, 246, 0.4);
+	background: var(--bg-elev2);
+}
+.preset-share-badge {
+	font-style: normal;
+	font-size: 10px;
+	padding: 0 5px;
+	border-radius: 999px;
+	background: var(--bg-elev2);
+	border: 1px solid var(--border-soft);
+}
+.preset-share-body {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: 14px;
+}
+.preset-share-pane {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+.preset-share-field {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	font-size: 12px;
+	color: var(--text-dim);
+}
+.preset-share-field > span {
+	font-weight: 500;
+}
+.preset-share-input,
+.preset-share-json {
+	width: 100%;
+	min-height: 120px;
+	resize: vertical;
+	background: var(--bg-elev2);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	color: var(--text);
+	padding: 9px 12px;
+	font-family: var(--mono);
+	font-size: 12px;
+	line-height: 1.5;
+	outline: none;
+}
+.preset-share-json {
+	min-height: 200px;
+}
+.preset-share-input:focus,
+.preset-share-json:focus {
+	border-color: var(--accent);
+}
+.preset-share-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+.preset-share-url-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.preset-share-url-row .set-input {
+	min-width: 0;
+}
+.preset-share-hint {
+	margin: 0;
+	font-size: 12px;
+	color: var(--text-dim);
+	line-height: 1.5;
+}
+.preset-share-warn {
+	margin: 0;
+	font-size: 12px;
+	color: var(--amber);
+	line-height: 1.5;
+	word-break: break-word;
+}
+.preset-share-error {
+	margin: 0;
+	font-size: 12px;
+	color: var(--red);
+	line-height: 1.5;
+	word-break: break-word;
+}
+.preset-share-ok {
+	margin: 0;
+	font-size: 12px;
+	color: var(--green);
+}
+.preset-share-preview {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	border: 1px solid var(--border-soft);
+	border-radius: 10px;
+	padding: 12px;
+	background: var(--bg-elev);
+}
+.preset-share-preview-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 13px;
+}
+.preset-share-preview-name {
+	color: var(--accent);
+}
+.preset-share-preview-desc {
+	margin: 0;
+	font-size: 12px;
+	color: var(--text-dim);
+}
+.preset-share-meta {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 14px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	font-size: 12px;
+	color: var(--text-dim);
+}
+.preset-share-snippet {
+	margin: 0;
+	max-height: 120px;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	background: var(--bg-elev2);
+	border: 1px solid var(--border-soft);
+	border-radius: 8px;
+	padding: 8px 10px;
+	font-size: 12px;
+	color: var(--text-dim);
+}
+.preset-share-check {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12px;
+	color: var(--text-dim);
+	cursor: pointer;
+}
+.preset-share-list {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.preset-share-item {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	border: 1px solid var(--border-soft);
+	border-radius: 10px;
+	padding: 12px;
+}
+.preset-share-item-head {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	font-size: 13px;
+}
+.preset-share-item-author,
+.preset-share-item-date {
+	font-size: 11px;
+	color: var(--text-dim);
+}
+.preset-share-item-date {
+	margin-left: auto;
+}
+.preset-share-item-desc {
+	margin: 0;
+	font-size: 12px;
+	color: var(--text-dim);
+	line-height: 1.5;
+}
+.preset-share-item-tags {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 5px;
+}
+.preset-share-tag {
+	font-size: 10px;
+	padding: 1px 7px;
+	border-radius: 999px;
+	border: 1px solid var(--border-soft);
+	background: var(--bg-elev2);
+	color: var(--text-dim);
+}
+.preset-share-spin {
+	animation: spin 0.8s linear infinite;
+}
+
 /* ---- 插件市场（设置面板可一键安装的插件列表） -------------------------- */
 .set-catalog-add {
 	display: flex;
@@ -13124,6 +13487,23 @@ button.source-default-toggle {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 	max-width: 100%;
+}
+/* 后台作业的中止键（issue #468）：插件安装/更新是长任务，起跑后必须能停下来（服务端杀进程树）。 */
+.set-job-cancel {
+	flex: 0 0 auto;
+	padding: 1px 8px;
+	border: 1px solid var(--border-subtle, rgb(255 255 255 / 0.16));
+	border-radius: 6px;
+	background: transparent;
+	color: inherit;
+	font-size: 11.5px;
+	line-height: 1.5;
+	cursor: pointer;
+	white-space: nowrap;
+}
+.set-job-cancel:hover {
+	background: var(--bg-elev2);
+	color: var(--text);
 }
 /* 「安装前先读 spec」的一句话提示（DSH P0-3）：输入框下就地给出形状/已装/远端结论。 */
 /* 布局诊断横幅（P0-1）：列出「没出现在界面上」的条目与原因，默认折叠。 */
@@ -16340,61 +16720,130 @@ button.source-default-toggle {
 	text-overflow: ellipsis;
 }
 
-/* ---- 屏幕边缘浮动图标停靠栏（SideDock） ---- */
+/* ---- 屏幕边缘的图标停靠栏（SideDock）----
+ * **布局内的贴边槽位**：作为 .layout 的 flex 子项参与排版，面板与主区向内让出它的宽度，
+ * 因此它永远不会叠在面板内容（会话行 / 文件行按钮）上面。该侧没有图标时整个组件不渲染
+ * （SideDock 返回 null），连宽度都不占。
+ * 旧的实现是 `position: fixed` 浮层（z-index 70），会盖住面板竖中央那一条，已废弃。
+ *
+ * **竖向三段**：`entry.align` 在这里读作竖轴（start=靠上 / center=居中 / end=靠下），
+ * 因此容器撑满整列，**药丸底画在每一段上**（`.side-dock-seg`，空段不画）而不是整个
+ * 停靠栏上 —— 否则一整条竖底看不出段与段的差别。上下两段各 flex:1 平分剩余高度，
+ * 中间那段自然落在竖向正中（与顶栏两个 spacer 夹住中间段同构）。 */
 .side-dock {
-	position: fixed;
-	top: 50%;
-	transform: translateY(-50%);
-	z-index: 70;
+	position: relative;
+	flex-shrink: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 6px;
+	padding: 6px 0;
+	width: fit-content;
+	max-height: 100%;
+	min-height: 0;
+	user-select: none;
+}
+
+/* 弹性格子：**始终渲染**（包着空段也占位），靠它把上/下两段等分剩余高度，
+ * 中间那段自然落在竖向正中（与顶栏两个 spacer 夹住中间段同构）。 */
+.side-dock-slot {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	min-height: 0;
+	width: 100%;
+}
+
+.side-dock-slot-start,
+.side-dock-slot-end {
+	flex: 1 1 0;
+}
+
+.side-dock-slot-start {
+	justify-content: flex-start;
+}
+
+.side-dock-slot-end {
+	justify-content: flex-end;
+}
+
+.side-dock-slot-center {
+	flex: 0 0 auto;
+}
+
+/* 药丸本体：内容高（不继承弹性格子的高度），带图标的那几段才画。 */
+.side-dock-seg {
 	display: flex;
 	flex-direction: column;
 	align-items: center;
 	gap: 4px;
+	min-height: 0;
+	max-height: 100%;
 	padding: 6px 3px;
+	overflow-y: auto;
+	overscroll-behavior: contain;
 	background: var(--bg-elev);
 	border: 1px solid var(--border);
 	box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
 	backdrop-filter: blur(12px);
 	-webkit-backdrop-filter: blur(12px);
-	transition:
-		opacity 0.2s ease,
-		transform 0.2s ease;
-	user-select: none;
 }
 
-.side-dock-left {
-	left: 0;
+.side-dock-left .side-dock-seg {
 	border-left: none;
 	border-radius: 0 10px 10px 0;
 }
 
-.side-dock-right {
-	right: 0;
+.side-dock-right .side-dock-seg {
 	border-right: none;
 	border-radius: 10px 0 0 10px;
 }
 
-.side-dock-empty {
-	opacity: 0.35;
-	padding: 4px 2px;
+/* 悬浮模式（设置 → 界面布局「侧边图标悬浮显示」）：回到 fixed 贴边浮层。
+ * `position:fixed` 自身脱离文档流，所以它不再向面板/主区要宽度；代价是又会盖在面板
+ * 竖中央那一条上（文件行/会话行按钮），所以默认关闭。
+ * 高度给固定值（略矮于整屏、竖向居中）：悬浮时没有「整列」可撑，但又得有高度才看得出
+ * 靠上/居中/靠下；浮层底色只画在有图标的那几段上，空白段 `pointer-events:none`，
+ * 既不挡面板点击也不显形。 */
+.side-dock-float {
+	position: fixed;
+	top: 50%;
+	transform: translateY(-50%);
+	height: 70vh;
+	z-index: 70;
+	align-self: auto;
+	max-height: none;
+	pointer-events: none;
 }
 
-.side-dock-empty:hover {
-	opacity: 1;
+.side-dock-float .side-dock-slot {
+	pointer-events: none;
+}
+
+.side-dock-float .side-dock-seg {
+	pointer-events: auto;
+}
+
+.side-dock-float.side-dock-collapsed {
+	height: auto;
+}
+
+.side-dock-float.side-dock-left {
+	left: 0;
+}
+
+.side-dock-float.side-dock-right {
+	right: 0;
 }
 
 .side-dock-collapsed {
-	padding: 4px 2px;
+	padding: 3px 1px;
 }
 
-.side-dock-items {
-	display: flex;
-	flex-direction: column;
-	align-items: center;
-	gap: 4px;
-	max-height: calc(100vh - 140px);
-	overflow-y: auto;
-	overscroll-behavior: contain;
+/* 收起态下唯一的按钮（或展开态那颗收起箭头）是浮层自己的直接子按钮：它不在药丸里，
+ * 得单独吃回点击 —— 否则 `pointer-events:none` 之下点不动（展开按钮点不回去）。 */
+.side-dock-float > .side-dock-btn {
+	pointer-events: auto;
 }
 
 .side-dock-btn {
@@ -16424,6 +16873,14 @@ button.source-default-toggle {
 .side-dock-btn.active {
 	background: var(--accent-soft);
 	color: var(--accent);
+}
+
+/* 收起后只剩这一个展开按钮：比条内的普通图标更小，收起的停靠栏本身也只占一条窄边。 */
+.side-dock-toggle-btn {
+	width: 22px;
+	height: 22px;
+	font-size: 12px;
+	border-radius: 5px;
 }
 
 .side-dock-collapse-btn {
@@ -16516,4 +16973,297 @@ button.source-default-toggle {
 .status-item-wrap {
 	display: inline-flex;
 	align-items: center;
+}
+
+/* ---- 图标编辑模式（IconEditor）----
+ * 从顶栏「⋯」→「编辑图标」进入：在一个面板里**同时**画出顶栏 / 底栏 / 左悬浮栏 / 右悬浮栏
+ * 的条目，直接拖动改位置（写的是同一份 uiLayout 偏好，见 web/src/ui-layout-edit.ts）。
+ * 为什么是独立面板而不是「就地拖真顶栏」：四个栏不可能同时可见（悬浮栏会收起、面板会折叠、
+ * 条目会被实测溢出收进 ⋯），跨栏拖动根本没有共同的拖放面。 */
+.icon-editor-backdrop {
+	position: fixed;
+	inset: 0;
+	z-index: 90;
+	background: rgba(0, 0, 0, 0.45);
+}
+
+.icon-editor {
+	position: fixed;
+	left: 50%;
+	top: 50%;
+	transform: translate(-50%, -50%);
+	z-index: 91;
+	display: flex;
+	flex-direction: column;
+	width: min(880px, calc(100vw - 24px));
+	max-height: min(84vh, 760px);
+	background: var(--bg-elev);
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+	overflow: hidden;
+	/* 拖动时指针会扫过面板里的文字，不禁选就会边走边选中一片。 */
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+.icon-editor-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 10px 12px;
+	border-bottom: 1px solid var(--border-soft);
+	flex-shrink: 0;
+}
+
+.icon-editor-title {
+	font-size: 13px;
+	font-weight: 700;
+	color: var(--text);
+	white-space: nowrap;
+}
+
+.icon-editor-hint {
+	flex: 1;
+	min-width: 0;
+	font-size: 11px;
+	color: var(--text-faint);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.icon-editor-close {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 26px;
+	height: 26px;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--bg-elev2);
+	color: var(--text-dim);
+	cursor: pointer;
+}
+
+.icon-editor-close:hover {
+	color: var(--text);
+	border-color: var(--accent);
+}
+
+.icon-editor-body {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	padding: 10px 12px 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.icon-editor-zone {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+}
+
+.icon-editor-zone-title {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 11px;
+	font-weight: 700;
+	letter-spacing: 0.6px;
+	color: var(--text-faint);
+}
+
+.icon-editor-zone-count {
+	font-size: 10px;
+	font-weight: 600;
+	color: var(--text-dim);
+	background: var(--bg-elev2);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	padding: 0 5px;
+}
+
+.icon-editor-strip {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	min-height: 42px;
+	padding: 5px 6px;
+	border: 1px dashed var(--border);
+	border-radius: 8px;
+	background: var(--bg-elev2);
+	transition:
+		border-color 0.15s ease,
+		background-color 0.15s ease;
+}
+
+.icon-editor-strip.drop-over {
+	border-color: var(--accent);
+	background: var(--accent-soft);
+}
+
+/* 段标签（start/center/end）独占一行：图标才能从行首左对齐，不被标签挤开。 */
+.icon-editor-strip-label {
+	width: 100%;
+	font-size: 10px;
+	color: var(--text-faint);
+	letter-spacing: 0.5px;
+	text-transform: uppercase;
+}
+
+.icon-editor-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	max-width: 100%;
+	padding: 4px 8px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: var(--card-bg, var(--bg-elev));
+	color: var(--text);
+	font: inherit;
+	font-size: 12px;
+	cursor: grab;
+	/* 触屏上按住图标拖动 = 拖拽，不是滚动页面（pointermove 才收得到）。 */
+	touch-action: none;
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+.icon-editor-chip:hover {
+	border-color: var(--accent);
+}
+
+.icon-editor-chip.dragging {
+	opacity: 0.4;
+	cursor: grabbing;
+}
+
+.icon-editor-chip-icon {
+	display: inline-flex;
+	align-items: center;
+	flex: none;
+	font-size: 13px;
+}
+
+.icon-editor-chip-label {
+	min-width: 0;
+	max-width: 170px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* 插入位置指示（落点高亮之外的第二重反馈：插在谁前面）。 */
+.icon-editor-caret {
+	flex: none;
+	align-self: stretch;
+	width: 2px;
+	min-height: 22px;
+	background: var(--accent);
+	border-radius: 1px;
+}
+
+.icon-editor-empty {
+	font-size: 11px;
+	color: var(--text-faint);
+}
+
+.icon-editor-zone-tray .icon-editor-strip {
+	opacity: 0.9;
+}
+
+.icon-editor-zone-tray .icon-editor-chip {
+	border-style: dashed;
+}
+
+/* 顶栏 ⋯ 菜单里的分隔线（图标编辑入口与条目之间）。 */
+.tb-menu-divider {
+	height: 1px;
+	margin: 4px 0;
+	background: var(--border-soft);
+}
+
+/* 宿主内置图标的字形回落（● / # 这类纯字符图标）。 */
+.host-icon-char {
+	font-size: 12px;
+	line-height: 1;
+}
+
+/* ---- 逐工具文案编辑器（设置→工具区「编辑文案」，ToolPromptEditor）----
+ * 三个字段改的是模型看到的三处工具文案（description / snippet / guidelines）。
+ * 留空 = 用默认；默认文本用 <details> 折叠展示，不占地方。 */
+.tool-prompt-editor {
+	width: 100%;
+	max-width: 720px;
+	max-height: 82vh;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.tool-prompt-body {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	padding: 12px 14px;
+	overflow-y: auto;
+	min-width: 0;
+}
+
+.tool-prompt-field {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	min-width: 0;
+}
+
+/* 小字段（摘要）按单行输入；描述/要点按 textarea 走，140px 保底太占地方。 */
+.tool-prompt-field .set-prompt-input {
+	min-height: 84px;
+}
+
+.tool-prompt-default {
+	font-size: 12px;
+	color: var(--text-dim);
+}
+
+.tool-prompt-default summary {
+	cursor: pointer;
+	user-select: none;
+}
+
+.tool-prompt-default pre {
+	margin: 6px 0 0;
+	padding: 8px 10px;
+	max-height: 200px;
+	overflow: auto;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+	background: var(--bg-elev2);
+	border: 1px solid var(--border-soft);
+	border-radius: 8px;
+	font-size: 12px;
+	line-height: 1.6;
+}
+
+.tool-prompt-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	padding-top: 4px;
+}
+
+/* 有自定义文案的工具行：编辑键高亮，一眼看出哪些改过。 */
+.set-icon-btn.tool-prompt-edit.edited {
+	color: var(--accent);
+	border-color: var(--accent);
 }

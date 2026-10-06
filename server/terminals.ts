@@ -25,6 +25,7 @@ import { spawn, type IPty } from "node-pty";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { CommandDef, ServerMessage, TerminalInfo } from "./protocol.js";
+import { BASH_DESCRIPTION, BASH_PARAMETERS, BASH_PROMPT_GUIDELINES, BASH_PROMPT_SNIPPET } from "./tool-prompts.js";
 import { pick, type ServerLang } from "./i18n.js";
 
 // ---------------------------------------------------------------------------
@@ -1714,28 +1715,36 @@ function cleanBashOutput(raw: string): string {
  *  保留在 history 供查阅——故每调用独立 id，避免复用覆盖旧输出。 */
 let oneShotBashSeq = 0;
 
+/** head / tail 的运行时上限，与 bash 工具参数 schema 的 maximum 5000 一致
+ *  （agent-service.ts）——schema 只影响提示不拦运行时（issue #462）。 */
+const MAX_HEAD_TAIL_LINES = 5000;
+
 /** 应用 head / tail 参数到输出顶层行（替代 `| head` / `| tail` 管道——管道会
  *  缓冲输出、让可见终端全程哑火，还容易白白触发静默解阻）。两者同时给时先
  *  截头再截尾。 */
 export function applyHeadTail(text: string, head?: number, tail?: number, lang: ServerLang = "en"): string {
+	// 入口钳到 schema 上限：此前只判 >0，传 1e9 会把整段缓冲灌进单条工具结果
+	// 并持久化进转录。
+	const headN = head && head > 0 ? Math.min(Math.floor(head), MAX_HEAD_TAIL_LINES) : 0;
+	const tailN = tail && tail > 0 ? Math.min(Math.floor(tail), MAX_HEAD_TAIL_LINES) : 0;
 	// 只对真实数据行切片；省略提示行单独存，最后再包回输出，避免提示行在
 	// head+tail 组合时被当成数据行参与第二次截取（导致尾部少截一行）。
 	let data = text.split("\n");
 	let headNote: string | null = null;
 	let tailNote: string | null = null;
-	if (head && head > 0 && data.length > head) {
-		const n = data.length - head;
+	if (headN && data.length > headN) {
+		const n = data.length - headN;
 		headNote = pick(lang, `…（后 ${n} 行已省略）`, `…[${n} lines omitted below]…`, "terminals.headtail.omitted.below", {
 			n,
 		});
-		data = data.slice(0, head);
+		data = data.slice(0, headN);
 	}
-	if (tail && tail > 0 && data.length > tail) {
-		const n = data.length - tail;
+	if (tailN && data.length > tailN) {
+		const n = data.length - tailN;
 		tailNote = pick(lang, `…（前 ${n} 行已省略）`, `…[${n} lines omitted above]…`, "terminals.headtail.omitted.above", {
 			n,
 		});
-		data = data.slice(-tail);
+		data = data.slice(-tailN);
 	}
 	const parts: string[] = [];
 	if (tailNote) parts.push(tailNote);
@@ -1767,41 +1776,12 @@ export function makeTerminalBashTool(
 	return defineTool({
 		name: "bash",
 		label: "Run bash command",
-		description:
-			"Run a shell command in a visible terminal; returns full output and exit code. " +
-			"persist=false (default): a fresh one-shot terminal per call; the shell exits after the command but its output stays viewable. " +
-			"persist=true: runs in the persistent 'ai-bash' terminal — shell state (cd/venv/ssh) is retained across calls; " +
-			"terminal_read/terminal_input/terminal_key observe or interact; terminal_wait blocks on backgrounded commands. " +
-			"Run the bare command — never pipe through head/tail/more/less (output is returned complete; pipes hide live progress); use the head/tail params instead. " +
-			"For interactive commands (REPLs, y/n prompts) set persist=true and drive them with terminal_input / terminal_key.",
-		promptSnippet: "run shell commands (persist=true keeps the terminal alive across calls)",
-		parameters: Type.Object({
-			command: Type.String({ description: "The shell command to run" }),
-			timeout: Type.Optional(Type.Number({ description: "Optional timeout in seconds" })),
-			persist: Type.Optional(
-				Type.Boolean({
-					description:
-						"true → run in the persistent 'ai-bash' terminal: shell state (cd/venv/ssh) is retained across calls. " +
-						"false (default) → one-shot terminal that exits when the command finishes; output stays viewable.",
-				}),
-			),
-			head: Type.Optional(
-				Type.Integer({
-					minimum: 1,
-					maximum: 5000,
-					description:
-						"Only return the FIRST N lines of output (like `| head -N`); prefer this over piping through head.",
-				}),
-			),
-			tail: Type.Optional(
-				Type.Integer({
-					minimum: 1,
-					maximum: 5000,
-					description:
-						"Only return the LAST N lines of output (like `| tail -N`); prefer this over piping through tail.",
-				}),
-			),
-		}),
+		// 提示词单源：模型看到的 bash 定义由 makeAdaptiveBashTool 从 tool-prompts.ts 取，
+		// 本定义只提供终端这条执行路径（description/schema 必须与另两条一致，不另写一套）。
+		description: BASH_DESCRIPTION,
+		promptSnippet: BASH_PROMPT_SNIPPET,
+		promptGuidelines: BASH_PROMPT_GUIDELINES,
+		parameters: BASH_PARAMETERS,
 		execute: async (_id, p, signal) => {
 			const lang: ServerLang = opts.lang?.() ?? "en";
 			const persist = p.persist ?? opts.defaultPersist();
@@ -2115,11 +2095,11 @@ export function makePersistentTerminalTools(
 			name: "terminal_create",
 			label: "Create terminal",
 			description:
-				"Create a named persistent interactive PTY. Interact via terminal_input / terminal_key, inspect output via terminal_read. " +
-				"Prefer bash for one-shot commands; use this (or bash persist=true) for interactive/TUI programs (REPLs, vim/htop, y/n prompts) or long-running servers to observe or interrupt.",
-			promptSnippet:
-				"run interactive programs or long-running servers in a persistent visible PTY (multi-step: " +
-				"create → input/key → read)",
+				"Create a named persistent interactive PTY. Interact via terminal_input / terminal_key; inspect output via terminal_read.",
+			promptSnippet: "drive interactive programs or long-running servers in a PTY",
+			promptGuidelines: [
+				"Use this for full-screen TUIs (vim/htop) and servers you need to observe or interrupt; prefer bash for one-shot commands",
+			],
 			parameters: Type.Object({
 				terminalId: Type.String({ description: "Stable terminal name" }),
 				cwd: Type.Optional(Type.String({ description: "Workspace-relative directory" })),
@@ -2288,10 +2268,10 @@ export function makePersistentTerminalTools(
 			name: "terminal_wait",
 			label: "Wait for terminal command",
 			description:
-				"Block until a command started through the BASH TOOL finishes (exit marker appears) or timeout — no polling. " +
-				"Only applies to bash-tool commands; commands sent via terminal_input have no completion marker — use terminal_read(waitMs=…) for those. " +
-				"Returns {finished, exitCode} plus output produced while waiting; finished=false means still running (call again).",
-			promptSnippet: "block until a terminal's current command finishes (no polling)",
+				"Block until a bash-tool command finishes (exit marker) or timeout — no polling. " +
+				"Returns {finished, exitCode} plus output produced meanwhile; finished=false = still running (call again). " +
+				"terminal_input commands have no completion marker — use terminal_read(waitMs=…) for those.",
+			promptSnippet: "avoid polling: wait for a long bash command to finish",
 			parameters: Type.Object({
 				terminalId: Type.String(),
 				cursor: Type.Optional(

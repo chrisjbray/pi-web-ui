@@ -4,8 +4,6 @@ import {
 	FiArrowRight,
 	FiCheck,
 	FiCheckCircle,
-	FiChevronDown,
-	FiChevronRight,
 	FiClock,
 	FiCopy,
 	FiLoader,
@@ -19,6 +17,7 @@ import { useT } from "../i18n";
 import { openContextMenu } from "../context-menu-state";
 // 工具定义说明弹窗（模块级 store：卡片只负责发打开请求，弹窗挂在 App 上）。
 import { openToolInfo } from "../tool-info-state";
+import { CollapsibleHead } from "./CollapsibleHead";
 import type { UiSlotEntry } from "../ui-slots";
 import { parseDelegateArgs, shortenPath, toolArgHints, type DelegateField } from "../tool-args";
 import { PRESENT_FILES_TOOL_NAME } from "../../../server/tool-manager.js";
@@ -39,7 +38,7 @@ export interface ToolView {
 }
 
 /** Kill just the running bash command(s) — the agent run itself continues. */
-export type KillBashHandler = () => void;
+type KillBashHandler = () => void;
 
 const TOOL_ICONS: Record<string, string> = {
 	bash: "$",
@@ -244,115 +243,110 @@ export const ToolCallBlock = memo(function ToolCallBlock({
 
 	return (
 		<div className={`toolcall ${statusClass}`}>
-			<div
-				className="chead toolcall-head"
-				role="button"
-				tabIndex={0}
-				aria-expanded={shown}
-				title={shown ? t("collapseMsg") : t("expandMsg")}
-				onClick={() => setOpen(!expanded)}
-				onContextMenu={onHeadContextMenu}
-				onKeyDown={(e) => {
-					if (e.target !== e.currentTarget) return;
-					if (e.key === "Enter" || e.key === " ") {
-						e.preventDefault();
-						setOpen(!expanded);
-					}
-				}}
-			>
-				<button
-					type="button"
-					className="chead-toggle toolcall-toggle"
-					title={shown ? t("collapseMsg") : t("expandMsg")}
-					aria-label={shown ? t("collapseMsg") : t("expandMsg")}
-					aria-expanded={shown}
-					onClick={(e) => {
-						e.stopPropagation();
-						setOpen(!expanded);
-					}}
-				>
-					{shown ? <FiChevronDown /> : <FiChevronRight />}
-				</button>
-				<span className="chead-icon toolcall-icon">{toolIcon(block.name)}</span>
-				<span className="chead-title toolcall-name">{block.name}</span>
-				<span
-					className="toolcall-status"
-					title={exitHint ? `${statusLabel} · ${exitHint}` : statusLabel}
-					aria-label={exitHint ? `${statusLabel} · ${exitHint}` : statusLabel}
-				>
-					{isError ? <FiX /> : done ? <FiCheck /> : running ? <FiLoader /> : waitingModel ? <FiClock /> : <FiMinus />}
-				</span>
-				{duration && (
-					<span
-						className="toolcall-duration toolcall-timeout"
-						style={{ marginLeft: -2, fontFamily: "var(--mono)" }}
-						title={exitHint ? `${statusLabel} · ${exitHint}` : statusLabel}
-					>
-						{duration}
-					</span>
-				)}
-				{collapsedCmd && (
-					<span className="toolcall-cmd" title={bashCommand}>
-						$ {collapsedCmd}
-					</span>
-				)}
-				{hints.path && (
-					<span className="toolcall-path" title={hints.path}>
-						{shortenPath(hints.path)}
-					</span>
-				)}
-				{hints.timeout && <span className="toolcall-timeout">⏱ {hints.timeout}</span>}
-				{isDelegate && hints.agent && (
-					<span className="toolcall-agent" title={hints.agent}>
-						◈ {hints.agent}
-					</span>
-				)}
-				<span className="toolcall-spacer" />
-				{isBashRunning && onKillBash && (
-					<button
-						type="button"
-						className="toolcall-kill"
-						title={t("stopBashTip")}
-						onClick={(e) => {
-							e.stopPropagation();
-							onKillBash?.();
-						}}
-					>
-						<FiSquare />
-						<span>{t("stopBash")}</span>
-					</button>
-				)}
-				{isDelegate && done && delegateConvId && (
-					<button
-						type="button"
-						className="toolcall-open"
-						title={t("delegateOpenSubagent")}
-						onClick={(e) => {
-							e.stopPropagation();
-							window.dispatchEvent(
-								new CustomEvent<string>("pi-web-ui:switch-conversation", { detail: delegateConvId }),
-							);
-						}}
-					>
-						<FiArrowRight />
-						<span>{t("delegateOpenSubagent")}</span>
-					</button>
-				)}
-				{/* 卡头右端**只有复制键**：消息级按钮一律落在消息底部的 .msg-actions 行
+			<CollapsibleHead
+				open={shown}
+				headClassName="toolcall-head"
+				toggleClassName="toolcall-toggle"
+				titleText={shown ? t("collapseMsg") : t("expandMsg")}
+				onToggle={() => setOpen(!expanded)}
+				onHeadContextMenu={onHeadContextMenu}
+				icon={toolIcon(block.name)}
+				iconClassName="toolcall-icon"
+				titleClassName="toolcall-name"
+				after={
+					<>
+						<span
+							className="toolcall-status"
+							title={exitHint ? `${statusLabel} · ${exitHint}` : statusLabel}
+							aria-label={exitHint ? `${statusLabel} · ${exitHint}` : statusLabel}
+						>
+							{isError ? (
+								<FiX />
+							) : done ? (
+								<FiCheck />
+							) : running ? (
+								<FiLoader />
+							) : waitingModel ? (
+								<FiClock />
+							) : (
+								<FiMinus />
+							)}
+						</span>
+						{duration && (
+							<span
+								className="toolcall-duration toolcall-timeout"
+								style={{ marginLeft: -2, fontFamily: "var(--mono)" }}
+								title={exitHint ? `${statusLabel} · ${exitHint}` : statusLabel}
+							>
+								{duration}
+							</span>
+						)}
+						{collapsedCmd && (
+							<span className="toolcall-cmd" title={bashCommand}>
+								$ {collapsedCmd}
+							</span>
+						)}
+						{hints.path && (
+							<span className="toolcall-path" title={hints.path}>
+								{shortenPath(hints.path)}
+							</span>
+						)}
+						{hints.timeout && <span className="toolcall-timeout">⏱ {hints.timeout}</span>}
+						{isDelegate && hints.agent && (
+							<span className="toolcall-agent" title={hints.agent}>
+								◈ {hints.agent}
+							</span>
+						)}
+						<span className="toolcall-spacer" />
+						{isBashRunning && onKillBash && (
+							<button
+								type="button"
+								className="toolcall-kill"
+								title={t("stopBashTip")}
+								onClick={(e) => {
+									e.stopPropagation();
+									onKillBash?.();
+								}}
+							>
+								<FiSquare />
+								<span>{t("stopBash")}</span>
+							</button>
+						)}
+						{isDelegate && done && delegateConvId && (
+							<button
+								type="button"
+								className="toolcall-open"
+								title={t("delegateOpenSubagent")}
+								onClick={(e) => {
+									e.stopPropagation();
+									window.dispatchEvent(
+										new CustomEvent<string>("pi-web-ui:switch-conversation", { detail: delegateConvId }),
+									);
+								}}
+							>
+								<FiArrowRight />
+								<span>{t("delegateOpenSubagent")}</span>
+							</button>
+						)}
+						{/* 卡头右端**只有复制键**：消息级按钮一律落在消息底部的 .msg-actions 行
 				    （纯工具调用的消息没有正文，不渲染那一行）。 */}
-				<button
-					type="button"
-					className={`chead-copy toolcall-copy${copied ? " copied" : ""}`}
-					title={t("copyArgs")}
-					aria-label={t("copyArgs")}
-					onClick={(e) => {
-						e.stopPropagation();
-						copyArgs();
-					}}
-				>
-					{copied ? <FiCheckCircle /> : <FiCopy />}
-				</button>
-			</div>
+						<button
+							type="button"
+							className={`chead-copy toolcall-copy${copied ? " copied" : ""}`}
+							title={t("copyArgs")}
+							aria-label={t("copyArgs")}
+							onClick={(e) => {
+								e.stopPropagation();
+								copyArgs();
+							}}
+						>
+							{copied ? <FiCheckCircle /> : <FiCopy />}
+						</button>
+					</>
+				}
+			>
+				{block.name}
+			</CollapsibleHead>
 			{resultImages.length > 0 && (
 				<div className="toolcall-images">
 					{resultImages.map((img, i) => (
@@ -471,7 +465,7 @@ function DelegateBrief({ args }: { args: Partial<Record<DelegateField | "agent" 
 
 /** 折叠态 bash 命令预览：首行空白归一后取 80 字，多行追加 `+N` 后缀。
  *  输入脏（空串/全空白）返回 undefined——卡头不显示。 */
-export function collapsedBashPreview(command: string): string | undefined {
+function collapsedBashPreview(command: string): string | undefined {
 	const lines = command.split("\n");
 	const first = lines[0].replace(/\s+/g, " ").trim();
 	if (!first) return undefined;

@@ -62,6 +62,7 @@ import {
 	PluginManager,
 	resolvePluginClientFile,
 	type PluginChatRequest,
+	type PluginConversationQuery,
 	type PluginConversationSnapshot,
 	type PluginRunEvent,
 } from "./plugins.js";
@@ -1109,14 +1110,15 @@ export interface DispatchSession {
 	newChat(preset?: string, ephemeral?: boolean): Promise<boolean | void>;
 	editMessage(messageId: string, text: string, attachments?: PromptAttachment[]): Promise<void>;
 	forkSession?(messageId: string, position?: "before" | "at", targetConvId?: string): Promise<void>;
-	cycleModel(): Promise<void>;
-	cycleThinking(): void;
 	flushSnapshot(forceFull?: boolean): void;
 	pushSlashCommands(): Promise<void>;
 	/** 取一条工具的**定义说明** → `tool_info`（工具卡右键 → 「显示工具详细信息」）。
 	 *  pi 与 dsh 都实现了；缺失时 dispatch 回 `unsupported`（不静默 —— 否则点开弹窗
 	 *  会永远停在「读取中」）。 */
 	getToolInfo?(name: string): void | Promise<void>;
+	/** 取一条工具的「出厂默认 + 当前覆盖」→ `tool_prompt`（设置页逐工具编辑文案）。
+	 *  缺失时 dispatch 回 `found: false`（引擎不支持 / 旧服务端）。 */
+	getToolPrompt?(name: string): void | Promise<void>;
 	/** 查询被某个压缩卡片折叠的历史消息（按需惰性加载，issue #398）。 */
 	getCompactedMessages?(compactionMessageId: string, targetConvId?: string): void | Promise<void>;
 	refreshSessions(): Promise<void>;
@@ -1127,7 +1129,6 @@ export interface DispatchSession {
 	renameConversation(id: string, name: string): Promise<void>;
 	dismissConversation(id: string, withFinishedSubagents?: boolean, force?: boolean): Promise<void>;
 	dismissFinishedSubagents(parentId?: string): Promise<void>;
-	handoffSubagent?(fromRunId: string, toRunId: string, payload: string): Promise<void>;
 	persistConversation?(id: string): Promise<void>;
 	setConversationPinned?(id: string, pinned: boolean): Promise<void>;
 	pinSession?(path: string, pinned: boolean): Promise<void>;
@@ -1302,6 +1303,12 @@ export interface DispatchSession {
 	savePreset(name: string): Promise<void>;
 	applyPreset(name: string): Promise<void>;
 	deletePreset(name: string): Promise<void>;
+	/** 预设分享（server/preset-share.ts）：导出 / 导入 / 网址导入 / 目录 / 一键分享。 */
+	exportPreset(msg: Extract<ClientMessage, { type: "preset_export" }>): Promise<void>;
+	importPreset(msg: Extract<ClientMessage, { type: "preset_import" }>): Promise<void>;
+	importPresetFromUrl(msg: Extract<ClientMessage, { type: "preset_import_url" }>): Promise<void>;
+	pushPresetCatalog(msg: Extract<ClientMessage, { type: "preset_catalog" }>): Promise<void>;
+	sharePreset(msg: Extract<ClientMessage, { type: "preset_share" }>): Promise<void>;
 	/** Upsert 一个子代理模板（全局共享）。 */
 	saveSubagentTemplate(template: UiSubagentTemplate): Promise<void>;
 	saveApprovalRule?(rule: UiApprovalRule): Promise<void>;
@@ -1399,8 +1406,11 @@ export interface EngineService {
 	onRunEvent?: ((ev: PluginRunEvent) => void) | undefined;
 	/** 对话切换通知（切历史会话/切 running 对话/新对话/切项目，pi 引擎）。 */
 	onConversationChanged?: (() => void) | undefined;
-	/** 当前打开对话的快照（pi 引擎；dsh 引擎无此方法，插件回退空态）。 */
-	readConversationForPlugins?: (() => PluginConversationSnapshot | null) | undefined;
+	/** 当前打开对话的快照（pi 引擎；dsh 引擎无此方法，插件回退空态）。
+	 *  #542：可带 `{clientId}` 取某标签页正在看的对话。 */
+	readConversationForPlugins?: ((options?: PluginConversationQuery) => PluginConversationSnapshot | null) | undefined;
+	/** 模型切换成功通知（#542；pi 引擎。dsh 引擎暂无——插件订不到事件但快照照旧可读）。 */
+	onClientModelChanged?: ((snap: PluginConversationSnapshot) => void) | undefined;
 	/** 插件无头调用 agent（pi 引擎；dsh 引擎暂无，host.chat 明确拒绝）。 */
 	chatFromPlugin?:
 		((pluginId: string, req: PluginChatRequest) => Promise<{ conversationId: string; clientId: string }>) | undefined;
@@ -1820,8 +1830,10 @@ service.onRunEvent = (ev) => pluginMgr.emitRunEvent(ev);
 // 插件扩展点：对话切换通知（轨迹视图切会话后即重拉；dsh 引擎暂无）。
 service.onConversationChanged = () => pluginMgr.emitConversationChanged();
 // 插件扩展点：当前打开对话的快照（轨迹视图直接显示打开对话的时间线；
-// dsh 引擎无此方法时回退 null，插件显示空态）。
-pluginMgr.conversationProvider = () => service.readConversationForPlugins?.() ?? null;
+// dsh 引擎无此方法时回退 null，插件显示空态）。#542：透传 {clientId} 选本标签页的对话。
+pluginMgr.conversationProvider = (opts) => service.readConversationForPlugins?.(opts) ?? null;
+// 插件扩展点：模型切换成功事件（#542；dsh 引擎无此钩子 = 不发事件）。
+service.onClientModelChanged = (snap) => pluginMgr.emitClientModelChanged(snap);
 // 插件扩展点：无头调用 agent（微信通道等经 host.chat 投递外部消息，无浏览器也能跑）。
 pluginMgr.chatProvider = (pluginId, req) =>
 	service.chatFromPlugin?.(pluginId, req) ?? Promise.reject(new Error("当前引擎不支持无头调用（仅标准 pi 引擎）"));
@@ -1839,7 +1851,7 @@ service.pluginCommandsProvider = () => pluginMgr.listCommands();
 pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 service.pluginBgTasksProvider = () => pluginMgr.bgTasks();
 service.pluginStopBgTask = (taskId) => pluginMgr.stopPluginBgTask(taskId);
-// 定时任务 Agent 工具的数据源（schedule_task/list/cancel）：标准 pi 引擎的
+// 定时任务 Agent 工具的数据源（schedule 单 action：create/list/cancel）：标准 pi 引擎的
 // AgentService 才有 schedulerStore 字段，DSH service 没有 —— 有才设。
 if ("schedulerStore" in service) {
 	(service as unknown as { schedulerStore: typeof scheduler }).schedulerStore = scheduler;
@@ -2213,12 +2225,6 @@ wss.on("connection", (ws) => {
 			case "rollback_session":
 				void cs.rollbackSession?.(msg.messageId, msg.conversationId, msg.restoreWorkspace);
 				break;
-			case "cycle_model":
-				void cs.cycleModel();
-				break;
-			case "cycle_thinking":
-				cs.cycleThinking();
-				break;
 			case "get_state":
 				// Always a FULL snapshot: the client is (re)connecting or detected
 				// a rev/seq gap — it needs an authoritative state to rebuild from.
@@ -2235,6 +2241,14 @@ wss.on("connection", (ws) => {
 					void cs.getToolInfo(msg.name);
 				} else {
 					send({ type: "tool_info", name: msg.name, found: false, unsupported: true });
+				}
+				break;
+			case "get_tool_prompt":
+				// 设置页逐工具文案编辑器：取「出厂默认 + 当前覆盖」。
+				if (typeof cs.getToolPrompt === "function") {
+					void cs.getToolPrompt(msg.name);
+				} else {
+					send({ type: "tool_prompt", name: msg.name, found: false, unsupported: true });
 				}
 				break;
 			case "get_compacted_messages":
@@ -2278,9 +2292,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "dismiss_finished_subagents":
 				void cs.dismissFinishedSubagents(msg.parentId);
-				break;
-			case "subagent_handoff":
-				void cs.handoffSubagent?.(msg.fromRunId, msg.toRunId, msg.payload);
 				break;
 			case "switch_session":
 				void cs.switchSession(msg.path);
@@ -2616,6 +2627,7 @@ wss.on("connection", (ws) => {
 					customSystemPrompt: msg.customSystemPrompt,
 					promptTemplate: (msg as { promptTemplate?: string }).promptTemplate,
 					promptOverrides: (msg as { promptOverrides?: Record<string, string> }).promptOverrides,
+					toolPromptOverrides: (msg as { toolPromptOverrides?: Record<string, unknown> }).toolPromptOverrides,
 					disabledSkills: msg.disabledSkills,
 					disabledExtensions: msg.disabledExtensions,
 					disabledAgentTools: msg.disabledAgentTools,
@@ -2627,6 +2639,7 @@ wss.on("connection", (ws) => {
 					terminalBashMaxForegroundMs: (msg as { terminalBashMaxForegroundMs?: number }).terminalBashMaxForegroundMs,
 					toolWatchdogTimeoutMs: (msg as { toolWatchdogTimeoutMs?: number }).toolWatchdogTimeoutMs,
 					readDirEnabled: (msg as { readDirEnabled?: boolean }).readDirEnabled,
+					toolLazyLoading: (msg as { toolLazyLoading?: boolean }).toolLazyLoading,
 					toolApprovalEnabled: (msg as { toolApprovalEnabled?: boolean }).toolApprovalEnabled,
 					editSoftEnabled: (msg as { editSoftEnabled?: boolean }).editSoftEnabled,
 					questionnaireEnabled: (msg as { questionnaireEnabled?: boolean }).questionnaireEnabled,
@@ -2775,6 +2788,9 @@ wss.on("connection", (ws) => {
 						done: async (ok, info) => {
 							if (ok) {
 								await reloadPluginsAndPush(jobLang);
+								if (typeof cs?.checkPluginUpdates === "function") {
+									void cs.checkPluginUpdates(false);
+								}
 								const isZh = jobLang() === "zh";
 								const actionLabel =
 									jobAction === "uninstall"
@@ -3057,6 +3073,22 @@ wss.on("connection", (ws) => {
 				break;
 			case "save_preset":
 				void cs.savePreset(msg.name);
+				break;
+			// -- 预设分享（server/preset-share.ts，docs/preset-sharing.md）------
+			case "preset_export":
+				void cs.exportPreset(msg);
+				break;
+			case "preset_import":
+				void cs.importPreset(msg);
+				break;
+			case "preset_import_url":
+				void cs.importPresetFromUrl(msg);
+				break;
+			case "preset_catalog":
+				void cs.pushPresetCatalog(msg);
+				break;
+			case "preset_share":
+				void cs.sharePreset(msg);
 				break;
 			case "save_subagent_template":
 				void cs.saveSubagentTemplate(msg.template);

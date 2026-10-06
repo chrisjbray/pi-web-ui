@@ -21,6 +21,7 @@ import {
 	FiRefreshCw,
 	FiSend,
 	FiSettings,
+	FiShare2,
 	FiShield,
 	FiVolume2,
 	FiSliders,
@@ -39,11 +40,13 @@ import { sortAgentPresets, presetText } from "./DshPresetBar";
 import { DSH_PERMISSION_ORDER, permDescKey, permLabelKey } from "./DshPermissionBar";
 import { PluginPage } from "./PluginPage";
 import { PluginSettingsForm } from "./PluginSettingsForm";
+import { ToolPromptEditor } from "./ToolPromptEditor";
 import type {
 	CommandDef,
 	DshPermissionOption,
 	SchedulerTaskView,
 	UiAgentPreset,
+	UiAlign,
 	UiApprovalRule,
 	UiExtensionInfo,
 	UiLayoutPrefs,
@@ -54,6 +57,7 @@ import type {
 	UiSettingsState,
 	UiSkillInfo,
 	UiSubagentTemplate,
+	UiToolPromptOverride,
 } from "../types";
 import { SchedulerPanel } from "./SchedulerPanel";
 import { SoundSettingsPanel, TtsSettingsPanel } from "./SoundSettings";
@@ -83,7 +87,17 @@ import {
 	type UiDiagnostic,
 	type UiSlotEntry,
 } from "../ui-slots";
-import type { CatalogSyncState, PluginInstallInspectState, PluginJobState } from "../use-chat";
+import { ICON_EDIT_ALIGNS, sideAlignLabel } from "../ui-layout-edit";
+import type {
+	CatalogSyncState,
+	PluginInstallInspectState,
+	PluginJobState,
+	PresetCatalogState,
+	PresetExportState,
+	PresetImportState,
+	PresetShareState,
+} from "../use-chat";
+import { PresetShareModal } from "./PresetShareModal";
 import { appSend, useAppGlobals } from "../app-globals";
 import { countPluginPhases, pluginPhase, type PluginPhase } from "../plugin-phase";
 import {
@@ -151,6 +165,11 @@ interface SettingsModalProps {
 		pluginJobs: Record<string, PluginJobState>;
 		/** 最近一次目录同步的回执（issue #165「从目录同步」框展示用）。 */
 		catalogSync: CatalogSyncState | null;
+		/** 预设分享（server/preset-share.ts）的四条回执状态。 */
+		presetExport: PresetExportState | null;
+		presetImport: PresetImportState | null;
+		presetCatalog: PresetCatalogState | null;
+		presetShare: PresetShareState | null;
 		/** 最近一次「安装前先读 spec」的检查结果（DSH P0-3）。 */
 		installInspect: PluginInstallInspectState | null;
 		/** 插件重载纪元：作为插件 client bundle URL 的 ?e= 缓存击穿参数传给插件页（#146）。 */
@@ -277,6 +296,22 @@ function ToggleRow({
 				<span className="set-switch-knob" />
 			</button>
 		</div>
+	);
+}
+
+/** 工具行右端的「编辑文案」按钮（设置→工具区每个工具行都用；有覆盖时高亮）。 */
+function ToolPromptButton({ name, edited, onEdit }: { name: string; edited: boolean; onEdit: (name: string) => void }) {
+	const t = useT();
+	return (
+		<button
+			type="button"
+			className={`set-icon-btn tool-prompt-edit${edited ? " edited" : ""}`}
+			title={edited ? t("toolPromptEdited") : t("toolPromptEdit")}
+			aria-label={t("toolPromptEdit")}
+			onClick={() => onEdit(name)}
+		>
+			<FiEdit3 />
+		</button>
 	);
 }
 
@@ -484,6 +519,8 @@ interface SettingsPatch {
 	customSystemPrompt?: string;
 	promptTemplate?: string;
 	promptOverrides?: Record<string, string>;
+	/** 逐工具文案覆盖（工具名 → description/snippet/guidelines；空对象 = 清除该工具覆盖）。 */
+	toolPromptOverrides?: Record<string, UiToolPromptOverride>;
 	disabledSkills?: string[];
 	disabledExtensions?: string[];
 	disabledPlugins?: string[];
@@ -500,6 +537,8 @@ interface SettingsPatch {
 	toolWatchdogTimeoutMs?: number;
 	/** read 工具读目录开关（默认开；行为开关，live 生效无需 reload，见 server/read-tool.ts）。 */
 	readDirEnabled?: boolean;
+	/** 工具延迟加载开关（默认开）：只影响新会话与之后的门控重放。 */
+	toolLazyLoading?: boolean;
 	/** 工具执行审批总开关（默认开；纯运行开关，live 生效无需 reload）。 */
 	toolApprovalEnabled?: boolean;
 	editSoftEnabled?: boolean;
@@ -650,6 +689,8 @@ export function SettingsModal({
 	const [reviewPromptDraft, setReviewPromptDraft] = useState("");
 	const reviewPromptFocus = useRef(false);
 	const [presetName, setPresetName] = useState("");
+	// 预设分享面板（导入/导出/浏览分享）：null = 关闭；字符串 = 打开并预选该预设（"" = 当前设置）。
+	const [presetShareFor, setPresetShareFor] = useState<string | null>(null);
 	// 正在编辑的子代理模板草稿（新建 = 空模板；null = 关闭编辑表单，表单在独立弹窗里渲染）。
 	const [tplDraft, setTplDraft] = useState<UiSubagentTemplate | null>(null);
 	// 弹窗标题用：新建 vs 编辑（draft 本身区分不出来）。
@@ -666,6 +707,16 @@ export function SettingsModal({
 	// Read-only viewer for the FULL system prompt actually in effect.
 	const [showFullPrompt, setShowFullPrompt] = useState(false);
 	const [showToolsSchema, setShowToolsSchema] = useState(false);
+	// 逐工具文案编辑器：当前正在编辑的工具名（null = 未打开）。
+	const [editingToolPrompt, setEditingToolPrompt] = useState<string | null>(null);
+	const toolPromptEdits = settings?.toolPromptOverrides ?? {};
+	const editedToolNames = useMemo(() => new Set(Object.keys(toolPromptEdits)), [toolPromptEdits]);
+	/** 工具行右端的「编辑文案」按钮（三个工具列表共用）。DSH 引擎无 pi 工具注册面，不显示。 */
+	const toolEditAction = (name: string) =>
+		isDsh ? null : <ToolPromptButton name={name} edited={editedToolNames.has(name)} onEdit={setEditingToolPrompt} />;
+	/** 保存/清除某工具的文案覆盖（空对象 = 清除，服务端逐工具合并）。 */
+	const applyToolPromptOverride = (name: string, override: UiToolPromptOverride | null) =>
+		setPartial({ toolPromptOverrides: { [name]: override ?? {} } });
 	// 当前生效提示词与工具 schema 的 token 占用（估算值，非精确分词）。
 	const promptTokenEstimate = useMemo(
 		() => estimatePromptTokens(settings?.effectiveSystemPrompt ?? ""),
@@ -1264,6 +1315,15 @@ export function SettingsModal({
 					<FiRefreshCw className="set-job-spin" />
 					{t("pluginJobRunning")}
 					<span className="set-catalog-job-line">{last}</span>
+					{/* 安装/更新是长任务（跑 CLI、打构建），起跑后必须给一个中止口：服务端
+					    `plugin_job_cancel` 会杀掉整棵进程树（plugin-installer.cancel）。 */}
+					<button
+						type="button"
+						className="set-job-cancel"
+						onClick={() => appSend({ type: "plugin_job_cancel", jobId: job.jobId })}
+					>
+						{t("cancel")}
+					</button>
 				</div>
 			);
 		}
@@ -1308,8 +1368,10 @@ export function SettingsModal({
 	/** 渲染层真正按 align 分区的槽位（其余槽位的 align 存了也无处生效，布局页就不提供了）。
 	 *  顶栏与底栏/输入框动作区同口径：顶栏可受管条目的 align 均生效（手机端特有的对话折叠
 	 *  按钮 host:history 与文件列表折叠按钮 host:files 是两侧列表的唯一入口，不可被管理显示，
-	 *  已从设置页中去掉）。 */
+	 *  已从设置页中去掉）。侧边停靠栏同属「真分区」，只是轴是竖的（靠上/居中/靠下）。 */
 	const uiAlignSlots: UiSlotId[] = ["bottombar", "composer.actions", "topbar.primary", "sidebar.left", "sidebar.right"];
+	/** 该槽位的 align 是竖轴：分段头与下拉用「靠上/居中/靠下」而非 start/center/end。 */
+	const verticalAlignSlot = (slot: string) => slot === "sidebar.left" || slot === "sidebar.right";
 	/** 可自由在上下和两侧切换位置的槽位 */
 	const uiPositionSlots: UiSlotId[] = ["topbar.primary", "bottombar", "sidebar.left", "sidebar.right"];
 	const [uiLayoutFilter, setUiLayoutFilter] = useState("");
@@ -2075,6 +2137,16 @@ export function SettingsModal({
 									enabled={settings.readDirEnabled !== false}
 									onToggle={() => setPartial({ readDirEnabled: settings.readDirEnabled === false })}
 								/>
+								{/* 工具延迟加载（DSH 无 pi 工具注册面，不显示）：开 = 只有核心工具常驻，
+								    其余工具在提示词里只有名字 + 一行摘要，模型用 load_tools 按需拉取。 */}
+								{!isDsh && (
+									<ToggleRow
+										title={t("toolLazyLoading")}
+										tip={t("toolLazyLoadingDesc")}
+										enabled={settings.toolLazyLoading !== false}
+										onToggle={() => setPartial({ toolLazyLoading: settings.toolLazyLoading === false })}
+									/>
+								)}
 								<ToggleRow
 									title={t("toolApprovalEnabled")}
 									tip={t("toolApprovalEnabledDesc")}
@@ -2193,6 +2265,7 @@ export function SettingsModal({
 											key={n}
 											title={n}
 											tip={CORE_TOOL_TIPS[n]}
+											action={toolEditAction(n)}
 											subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
 											enabled={!blocked && !disabledTools.has(n)}
 											disabled={blocked}
@@ -2208,6 +2281,7 @@ export function SettingsModal({
 											key={n}
 											title={n}
 											tip={t("settingsTerminalToolsDesc")}
+											action={toolEditAction(n)}
 											subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
 											enabled={!blocked && !disabledTools.has(n)}
 											disabled={blocked}
@@ -2275,6 +2349,7 @@ export function SettingsModal({
 											key={n}
 											title={n}
 											tip={SUBAGENT_TOOL_TIPS[n]}
+											action={toolEditAction(n)}
 											subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
 											enabled={!blocked && !disabledTools.has(n)}
 											disabled={blocked}
@@ -2318,6 +2393,7 @@ export function SettingsModal({
 								<ToggleRow
 									title={MARKERS_LIST_TOOL_NAME}
 									tip={`${t("todoListEnabledDesc")}\n${t("todoListOffHint")}`}
+									action={toolEditAction(MARKERS_LIST_TOOL_NAME)}
 									subtitle={
 										isBlockedByPreset(MARKERS_LIST_TOOL_NAME)
 											? t("toolsBlockedByPreset", { name: piPresetName })
@@ -2335,6 +2411,7 @@ export function SettingsModal({
 											key={tool.name}
 											title={tool.name}
 											tip={`${tt(tool.descKey ?? tool.name)}\n${tt(tool.offHintKey ?? tool.name)}`}
+											action={toolEditAction(tool.name)}
 											subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
 											enabled={!blocked && !disabledTools.has(tool.name)}
 											disabled={blocked}
@@ -2367,6 +2444,7 @@ export function SettingsModal({
 																? `${tool.description}\n${t("pluginToolOffHint")}`
 																: t("pluginToolOffHint")
 														}
+														action={toolEditAction(tool.name)}
 														subtitle={
 															pluginDisabled
 																? t("pluginToolsDisabledByPlugin")
@@ -2959,6 +3037,16 @@ export function SettingsModal({
 									</button>
 								</div>
 								<div className="set-note">{t("uiLayoutHint")}</div>
+								{/* 侧边图标停靠栏形态：默认「贴边槽位」（占宽、不遮挡面板按钮）；勾上 = 旧的
+								    悬浮浮层（不占宽，但会盖住面板竖中央那条）。 */}
+								<label className="set-toggle" title="sideDockFloat">
+									<input
+										type="checkbox"
+										checked={layout?.sideDockFloat === true}
+										onChange={(e) => setLayout({ sideDockFloat: e.target.checked })}
+									/>
+									<span>{t("uiLayoutSideDockFloat")}</span>
+								</label>
 								{uiDiagnostics.length > 0 && (
 									<details className="set-ui-diag" open={uiDiagnostics.some((d) => d.level === "error")}>
 										<summary>⚠ {t("uiLayoutDiagTitle", { n: uiDiagnostics.length })}</summary>
@@ -3061,9 +3149,19 @@ export function SettingsModal({
 																onChange={(e) => setUiAlign(it.id, e.target.value)}
 																aria-label={t("uiLayoutAlign")}
 															>
-																<option value="start">start</option>
-																<option value="center">center</option>
-																<option value="end">end</option>
+																{verticalAlignSlot(slot) ? (
+																	ICON_EDIT_ALIGNS.map((al) => (
+																		<option key={al} value={al}>
+																			{sideAlignLabel(t, al)}
+																		</option>
+																	))
+																) : (
+																	<>
+																		<option value="start">start</option>
+																		<option value="center">center</option>
+																		<option value="end">end</option>
+																	</>
+																)}
 															</select>
 														</label>
 													)}
@@ -3126,7 +3224,11 @@ export function SettingsModal({
 											) : (
 												segments.map((seg) => (
 													<Fragment key={seg.align ?? "all"}>
-														{seg.align && <div className="set-ui-slot-title set-ui-seg">{seg.align}</div>}
+														{seg.align && (
+															<div className="set-ui-slot-title set-ui-seg">
+																{verticalAlignSlot(slot) ? sideAlignLabel(t, seg.align as UiAlign) : seg.align}
+															</div>
+														)}
 														{seg.items.map((it) => renderRow(it, seg.items))}
 													</Fragment>
 												))
@@ -4058,6 +4160,25 @@ export function SettingsModal({
 									<FiSettings className="set-section-icon" />
 									{t("settingsPresets")}
 									<span className="set-count">{settings.presets.length}</span>
+									{/* 导入 / 分享 / 浏览共享仓库（server/preset-share.ts） */}
+									<div className="set-preset-share-bar">
+										<button
+											type="button"
+											className="set-icon-btn"
+											title={t("presetShareTabImport")}
+											onClick={() => setPresetShareFor("")}
+										>
+											<FiUpload />
+										</button>
+										<button
+											type="button"
+											className="set-icon-btn"
+											title={t("presetShare")}
+											onClick={() => setPresetShareFor(settings.presets[0]?.name ?? "")}
+										>
+											<FiShare2 />
+										</button>
+									</div>
 								</div>
 								<div className="set-preset-save">
 									<input
@@ -4100,6 +4221,30 @@ export function SettingsModal({
 													</div>
 												</div>
 												<div className="set-row-actions">
+													<button
+														type="button"
+														className="set-icon-btn"
+														title={t("presetExportJson")}
+														onClick={() => {
+															appSend({
+																type: "preset_export",
+																source: "preset",
+																name: p.name,
+																requestId: `export:${randomUuid()}`,
+															});
+															setPresetShareFor(p.name);
+														}}
+													>
+														<FiDownload />
+													</button>
+													<button
+														type="button"
+														className="set-icon-btn"
+														title={t("presetShareSubmit")}
+														onClick={() => setPresetShareFor(p.name)}
+													>
+														<FiShare2 />
+													</button>
 													<button
 														type="button"
 														className="set-uninstall"
@@ -4832,6 +4977,16 @@ export function SettingsModal({
 								className="set-plugin-page"
 							/>
 						)}
+
+						{/* ---- 逐工具文案编辑器（工具 tab 的「编辑文案」入口） ------------- */}
+						{editingToolPrompt && (
+							<ToolPromptEditor
+								name={editingToolPrompt}
+								override={toolPromptEdits[editingToolPrompt] ?? null}
+								onApply={applyToolPromptOverride}
+								onClose={() => setEditingToolPrompt(null)}
+							/>
+						)}
 					</div>
 				</div>
 
@@ -4841,6 +4996,19 @@ export function SettingsModal({
 					</button>
 				</div>
 			</div>
+
+			{/* 预设分享面板（导入 / 导出 / 浏览共享仓库）—— 自己一层 portal，盖在设置页上。 */}
+			{presetShareFor !== null && (
+				<PresetShareModal
+					presets={settings.presets.map((p) => p.name)}
+					presetExport={chat.presetExport}
+					presetImport={chat.presetImport}
+					presetCatalog={chat.presetCatalog}
+					presetShare={chat.presetShare}
+					initialPreset={presetShareFor}
+					onClose={() => setPresetShareFor(null)}
+				/>
+			)}
 		</div>
 	);
 }

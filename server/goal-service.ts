@@ -140,6 +140,10 @@ export interface GoalHost {
 	 *  执行者 vitals（目标条实时进度用：是否在跑 / 最近工具 / 会话累计用量）。
 	 *  缺省字段即不采集（老 fake host 只回 text 也照常工作）。 */
 	readRoleAgent?: (convId: string) => RoleAgentRead | undefined;
+	/** 该对话最近的工具/命令证据（#543：审查者拿不到「执行者到底跑了什么」）。
+	 *  实现方把会话里最近的 bashExecution / toolResult 压成一段文本（见 goal-evidence.ts）。
+	 *  缺席 / 读失败 = 不注入证据段（老 host 与 fake host 照常工作）。 */
+	readRoleEvidence?: (convId: string) => string | undefined;
 	/** 中止该对话正在跑的回合（角色轮超时 / 清目标时用）。 */
 	stopRoleAgent?: (convId: string) => Promise<void>;
 	/** 收尾：移出角色子代理（目标完成/清除时用）；主对话槽位实现为 no-op。 */
@@ -677,7 +681,9 @@ export class GoalService {
 		conv.goalGeneration += 1;
 		// 上一轮目标可能还留着常驻执行者子代理（委托执行）：先停掉再开新的，
 		// 否则旧循环会在新目标上继续派活（代次已作废，但角色对话得收）。
-		this.stopDelegated(conv);
+		// await 到 dismiss 完全落定：后面的 spawn 名额检查才不会数到还在收尾的
+		// 旧执行者而误报上限（issue #464；stopDelegated 自身已按会话串行化）。
+		await this.stopDelegated(conv);
 		const goal = conv.goal;
 		goal.reviewing = false;
 		goal.conversationId = goalConversationId;
@@ -1358,7 +1364,8 @@ export class GoalService {
 		const conv = this.host.activeConv();
 		conv.goalGeneration += 1;
 		// 委托执行：停掉在飞的执行者（循环靠代次作废 + 代次守卫退出）。
-		this.stopDelegated(conv);
+		// await 落定，保证旧执行者已移出会话表，后续重设目标不再误报名额（issue #464）。
+		await this.stopDelegated(conv);
 		this.resetLoopCounters(conv);
 		this.clearGoalFields(conv);
 		this.emitGoalStatus();
@@ -1393,13 +1400,14 @@ export class GoalService {
 	 */
 	async stopAllGoals(): Promise<void> {
 		let stopped = 0;
-		// 直接迭代：stopDelegated 只发 fire-and-forget 的停/收请求，不会同步改这张表
-		// （循环退出是异步的，靠代次守卫），无需快照。
-		for (const convId of this.delegatedLoops.keys()) {
+		// 快照迭代：await stopDelegated 期间，循环退出的回调可能增删这张表。
+		for (const convId of [...this.delegatedLoops.keys()]) {
 			const conv = this.host.getConv(convId);
 			if (!conv) continue;
 			conv.goalGeneration += 1; // 作废在飞回调（循环靠代次守卫退出）
-			this.stopDelegated(conv); // 停执行者 + 唤醒 verdict 等待者 + 清 roles/phase
+			// 逐个 await 停/收落定（stopDelegated 已按会话串行化，issue #464）：
+			// 停执行者 + 唤醒 verdict 等待者 + 清 roles/phase
+			await this.stopDelegated(conv);
 			this.resetLoopCounters(conv);
 			this.clearGoalFields(conv);
 			stopped++;
@@ -1444,6 +1452,8 @@ export class GoalService {
 				}
 				conv.goalGeneration += 1;
 				// 委托执行：手动停止也要把在飞的执行者停掉（否则它还在后台改工作区）。
+				// 本钩子是同步上下文，fire-and-forget 即可：stopDelegated 已按会话
+				// 串行化（issue #464），重设/清除目标的一方会先等这次 dismiss 落定。
 				this.stopDelegated(conv);
 				this.resetLoopCounters(conv);
 				g.conversationId = null;
@@ -1652,7 +1662,25 @@ export class GoalService {
 		return exec?.convId;
 	}
 
-	private async stopDelegated(conv: GoalConversation): Promise<void> {
+	private stopInflight = new Map<string, Promise<void>>();
+
+	/**
+	 * 停掉委托执行者（stop + dismiss + 唤醒等待者）。同一会话并发调用时按序串行：
+	 * 上一次 stop/dismiss 未落定前，下一次先等它 —— 否则重设目标时旧执行者尚未
+	 * 移出会话表，随后 spawn 的名额检查会数到它而误报容量上限（issue #464）。
+	 * 同步上下文（onAgentEnd 等钩子）可以继续 fire-and-forget，串行化由这里兜住。
+	 */
+	private stopDelegated(conv: GoalConversation): Promise<void> {
+		const prev = this.stopInflight.get(conv.id);
+		const run = prev ? prev.catch(() => {}).then(() => this.stopDelegatedNow(conv)) : this.stopDelegatedNow(conv);
+		this.stopInflight.set(conv.id, run);
+		void run.finally(() => {
+			if (this.stopInflight.get(conv.id) === run) this.stopInflight.delete(conv.id);
+		});
+		return run;
+	}
+
+	private async stopDelegatedNow(conv: GoalConversation): Promise<void> {
 		// 排队的启动请求一并作废：setGoal 会在后面按新代次重新排，clearGoal 则不需要。
 		this.delegatedPending.delete(conv.id);
 		conv.awaitingVerdict = undefined;
@@ -1814,7 +1842,7 @@ export class GoalService {
 			g.status = `审查中（第 ${round}${this.roundsLabel(budget)} 轮）…`;
 			g.statusEn = `Reviewing (round ${round}${this.roundsLabel(budget)})…`;
 			this.emitGoalStatus();
-			const verdict = await this.askDelegatedReview(conv, goalGeneration, round, budget, sample.output);
+			const verdict = await this.askDelegatedReview(conv, goalGeneration, round, budget, sample.output, execId);
 			if (!this.isCurrentDelegated(conv, goalGeneration)) return;
 			if (verdict === "invalid" || verdict === "timeout" || verdict === "gone") {
 				await this.finishDelegated(
@@ -1827,9 +1855,12 @@ export class GoalService {
 				);
 				return;
 			}
+			// #543 §2：空 feedback 兜底 —— verdict JSON 允许 `{"verdict":"fail","feedback":""}`，
+			// 照原样传下去，下一轮执行者只会收到「上一轮审查意见：」+ 空行，白烧一轮。
+			const verdictFeedback = this.ensureReviewerFeedback(verdict.verdict, verdict.feedback, feedback);
 			// 审查结论卡：把 verdict JSON 翻译成人话框住（裸 JSON 留在流里，但不再是唯一载体）。
 			if (this.isCurrentDelegated(conv, goalGeneration)) {
-				await this.pushReviewCard(conv, this.reviewCardText(verdict.verdict, round, budget, verdict.feedback), {
+				await this.pushReviewCard(conv, this.reviewCardText(verdict.verdict, round, budget, verdictFeedback), {
 					phase: "result",
 					round,
 					verdict: verdict.verdict,
@@ -1837,10 +1868,10 @@ export class GoalService {
 			}
 			if (!this.isCurrentDelegated(conv, goalGeneration)) return;
 			if (verdict.verdict === "pass") {
-				await this.finishDelegated(conv, goalGeneration, "pass", round, verdict.feedback, goalText);
+				await this.finishDelegated(conv, goalGeneration, "pass", round, verdictFeedback, goalText);
 				return;
 			}
-			feedback = verdict.feedback;
+			feedback = verdictFeedback;
 			// fail：回到循环顶部（预算检查在那里兜底）。
 		}
 	}
@@ -2004,6 +2035,7 @@ export class GoalService {
 		round: number,
 		budget: number,
 		execOutput: string,
+		execId: string,
 	): Promise<DelegatedVerdict> {
 		for (let attempt = 0; attempt < 2; attempt++) {
 			// 委托执行下用户仍可自由聊天：先等主对话空闲，否则审查指令会被当成
@@ -2014,12 +2046,57 @@ export class GoalService {
 			const planDesc = this.host.describePlan?.(conv.id) ?? "";
 			const text =
 				attempt === 0
-					? this.reviewerRoundPrompt(conv.goal.goal ?? "", round, budget, execOutput, planDesc)
+					? this.reviewerRoundPrompt(
+							conv.goal.goal ?? "",
+							round,
+							budget,
+							execOutput,
+							planDesc,
+							this.readExecutorEvidence(execId),
+						)
 					: this.verdictRetryPrompt();
 			const verdict = await this.deliverAndWait(conv, round, text);
 			if (verdict !== "invalid") return verdict;
 		}
 		return "invalid";
+	}
+
+	/** 执行者会话最近的工具/命令证据（#543 §1）。宿主未接线 / 读失败 / 空会话 → 空串，
+	 *  提示词据此跳过整段（不注入空标题、不改变老行为）。 */
+	private readExecutorEvidence(execId: string): string {
+		try {
+			return this.host.readRoleEvidence?.(execId)?.trim() ?? "";
+		} catch {
+			return "";
+		}
+	}
+
+	/** 审查结论 feedback 为空时的兜底（#543 §2；调用点见 runDelegatedLoop）。
+	 *  - 有内容 → 原样返回（不动审查者的措辞）；
+	 *  - pass 且无说明 → 不编造通过理由，只补一句中性标注；
+	 *  - fail 且上一轮有意见 → 沿用上一轮（标注是沿用的，避免执行者以为拿到了新指令）；
+	 *  - fail 且两轮都空 → 给一条可执行的失败说明（复核目标 + 补证据），别让执行者空转。 */
+	private ensureReviewerFeedback(verdict: "pass" | "fail", feedback: string, prevFeedback: string): string {
+		const fb = feedback.trim();
+		if (fb) return fb;
+		if (verdict === "pass") {
+			return pick(this.lang(), "（审查者未附说明）", "(the reviewer gave no note)", "goal.role.review.feedback.pass");
+		}
+		const prev = prevFeedback.trim();
+		if (prev) {
+			return pick(
+				this.lang(),
+				`（审查者本轮未给出新意见，沿用上一轮意见）\n${prev}`,
+				`(the reviewer gave no new feedback this round — carrying the previous round's over)\n${prev}`,
+				"goal.role.review.feedback.prev",
+			);
+		}
+		return pick(
+			this.lang(),
+			"审查者判 fail 但未给出说明。请复核目标的每一条要求，补齐尚未完成或尚未验证的部分，并在自述里给出可核验的证据（跑过的命令与输出）。",
+			"The reviewer returned fail without a note. Re-check every requirement in the goal, finish what is unfinished or unverified, and back it up with verifiable evidence (the commands you ran and their output).",
+			"goal.role.review.feedback.empty",
+		);
 	}
 
 	/** 等主对话空闲（事件驱动，不轮询）；超上限返回 false。 */
@@ -2387,6 +2464,7 @@ export class GoalService {
 		budget: number,
 		execOutput: string,
 		planDesc = "",
+		evidence = "",
 	): string {
 		const rounds = this.roundsLabel(budget);
 		const out = execOutput.trim().slice(0, 4000);
@@ -2398,10 +2476,19 @@ export class GoalService {
 			planDesc && planDesc !== "No active plan."
 				? `\n\n# Task Plan Board\n${planDesc}\nWhen verifying, also check whether the above plan steps have been legitimately advanced or completed.`
 				: "";
+		// #543 §1：执行者的工具/命令证据（服务端自动采集）。只保留输出尾部、可能被截断 ——
+		// 契约里写明这一点，免得审查者把「没看到」读成「没发生」。
+		const ev = evidence.trim();
+		const evidenceBlockZh = ev
+			? `\n\n【执行者最近的工具与命令证据（服务端自动采集，只保留输出尾部，可能被截断）】\n${ev}`
+			: "";
+		const evidenceBlockEn = ev
+			? `\n\n# Executor's recent tool & command evidence (auto-collected, output tails only, may be truncated)\n${ev}`
+			: "";
 		return pick(
 			this.lang(),
-			`你是严格、独立的验收者。只判断目标是否被完全满足：不要相信描述，去看工作区的实际状态。\n\n【目标】\n${goalText}\n\n【这是第 ${round}${rounds} 轮】${planBlockZh}\n\n【执行者本轮自述】\n${out || "（执行者本轮没有给出自述）"}\n\n你可以用只读手段核实：read / grep / scm（只读 git）/ 只读 bash（跑测试）。\n\n只输出一个 JSON 对象，不要有任何其他文本、不要代码围栏、不要复述下面的形状示例。本回合写类与派发类工具会被服务端直接拒绝（不要试）。字段：verdict 只能填 pass（目标已完全满足，一句话说明满足了什么）或 fail（未满足，给出可以直接动手改的具体待改项）；feedback 是一句话说明。形状示例（不要照抄尖括号里的占位符）：\n{"verdict":"<pass|fail>","feedback":"<一句话说明>"}\n[goal-review]`,
-			`You are a strict, independent acceptor. Judge only whether the goal is fully satisfied: do not trust the summary — inspect the actual workspace state.\n\n# Goal\n${goalText}\n\n# This is round ${round}${rounds}${planBlockEn}\n\n# Executor's summary this round\n${out || "(the executor produced no summary)"}\n\nYou may verify with read-only means: read / grep / scm (read-only git) / read-only bash (run tests).\n\nReply with ONLY one JSON object — no other text, no code fences, do not echo the shape example below. Write and dispatch tools are blocked by the server during this round — do not try them. Fields: verdict must be pass (goal fully satisfied, say what in one sentence) or fail (not satisfied, give concrete items the executor must fix); feedback is one short sentence. Shape example (do not copy the placeholders in angle brackets):\n{"verdict":"<pass|fail>","feedback":"<one sentence>"}\n[goal-review]`,
+			`你是严格、独立的验收者。只判断目标是否被完全满足：不要相信描述，去看工作区的实际状态。\n\n【目标】\n${goalText}\n\n【这是第 ${round}${rounds} 轮】${planBlockZh}\n\n【执行者本轮自述】\n${out || "（执行者本轮没有给出自述）"}${evidenceBlockZh}\n\n你可以用只读手段核实：read / grep / scm（只读 git）/ 只读 bash（跑测试）。\n\n判定口径：\n- 只判【执行者本轮自述】里**声称已完成**的条目；本轮没声称完成的后续阶段不构成 fail 理由（目标写成「完成阶段 3 并收尾后续」也不代表这一轮要做完所有阶段）。\n- 忽略与目标无关的本地改动（其它项目的补丁、工具/模型配置、临时文件）。\n- 声称完成但自述与证据里都没有对应命令输出或文件证据的，必须 fail，并点名缺哪条命令的输出。\n- feedback 不得为空：fail 时必须给出可以直接动手改的具体待改项。\n\n只输出一个 JSON 对象，不要有任何其他文本、不要代码围栏、不要复述下面的形状示例。本回合写类与派发类工具会被服务端直接拒绝（不要试）。字段：verdict 只能填 pass（目标已完全满足，一句话说明满足了什么）或 fail（未满足，给出可以直接动手改的具体待改项）；feedback 是一句话说明。形状示例（不要照抄尖括号里的占位符）：\n{"verdict":"<pass|fail>","feedback":"<一句话说明>"}\n[goal-review]`,
+			`You are a strict, independent acceptor. Judge only whether the goal is fully satisfied: do not trust the summary — inspect the actual workspace state.\n\n# Goal\n${goalText}\n\n# This is round ${round}${rounds}${planBlockEn}\n\n# Executor's summary this round\n${out || "(the executor produced no summary)"}${evidenceBlockEn}\n\nYou may verify with read-only means: read / grep / scm (read-only git) / read-only bash (run tests).\n\nJudging rules:\n- Judge only the items the executor's summary **claims to have completed this round**; later phases it did not claim this round are NOT grounds for fail (a goal phrased as "finish phase 3 and wrap up the rest" does not mean all phases must land this round).\n- Ignore local changes unrelated to the goal (other projects' patches, tool/model settings, scratch files).\n- If a claimed item has no matching command output or file evidence in the summary or the evidence above, you MUST fail and name which command's output is missing.\n- feedback must not be empty: on fail, give concrete items the executor can act on directly.\n\nReply with ONLY one JSON object — no other text, no code fences, do not echo the shape example below. Write and dispatch tools are blocked by the server during this round — do not try them. Fields: verdict must be pass (goal fully satisfied, say what in one sentence) or fail (not satisfied, give concrete items the executor must fix); feedback is one short sentence. Shape example (do not copy the placeholders in angle brackets):\n{"verdict":"<pass|fail>","feedback":"<one sentence>"}\n[goal-review]`,
 			"goal.role.review",
 		);
 	}

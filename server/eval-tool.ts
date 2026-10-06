@@ -526,12 +526,11 @@ export function makeEvalTool(opts: { cwd: string; ownerId?: string; lang?: () =>
 		label: "Execute code in persistent sandbox",
 		description:
 			"Execute Python or JavaScript/TypeScript code in an isolated evaluation sandbox. " +
-			"Variables and imported modules persist across calls within the conversation. " +
-			"Ideal for quick calculations, data transformations, algorithm verification, and inspecting outputs without creating temporary script files.",
-		promptSnippet: "evaluate Python or JS/TS code with persistent state (default-off sandbox)",
+			"Variables and imported modules persist across calls within the conversation.",
+		promptSnippet: "run a code snippet without creating a script file",
 		parameters: Type.Object({
 			code: Type.String({
-				description: "The code snippet to evaluate. Top-level variables and functions are preserved across calls.",
+				description: "The code snippet to evaluate. Top-level variables and functions persist across calls.",
 			}),
 			language: Type.Optional(
 				Type.Unsafe<"py" | "js" | "ts">({
@@ -542,7 +541,7 @@ export function makeEvalTool(opts: { cwd: string; ownerId?: string; lang?: () =>
 			),
 			title: Type.Optional(
 				Type.String({
-					description: 'Optional short label for this step (e.g. "Calculate metrics", "Parse payload").',
+					description: "Optional short label for this step.",
 				}),
 			),
 			timeout: Type.Optional(
@@ -560,7 +559,31 @@ export function makeEvalTool(opts: { cwd: string; ownerId?: string; lang?: () =>
 		}),
 		execute: async (_id, params) => {
 			const lang = getLang();
-			const language = params.language ?? "py";
+			let language: string = params.language ?? "py";
+			if (language === "python") language = "py"; // 常见笔误别名（issue #462）
+			if (language !== "py" && language !== "js" && language !== "ts") {
+				// schema 已声明 enum(["py","js","ts"])（#417），但那只影响提示不拦运行时；
+				// getKernel 的 normLang 只映射 ts，其余任意值会原样建出名为它的 Node 内核，
+				// Python 代码被 node 执行报 JS 语法错且模型无从知道是键写错。
+				const text = pick(
+					lang,
+					`错误：language 仅支持 py / js / ts，收到「${language}」。`,
+					`Error: language must be one of py / js / ts; got "${language}".`,
+				);
+				return {
+					content: [{ type: "text", text }],
+					details: {
+						language,
+						durationMs: 0,
+						ok: false,
+						stdout: "",
+						stderr: "",
+						result: null,
+						error: text,
+						reset: params.reset ?? false,
+					},
+				};
+			}
 			const timeoutSec = Math.min(Math.max(1, params.timeout ?? DEFAULT_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS);
 			const timeoutMs = timeoutSec * 1000;
 			const startTime = Date.now();
