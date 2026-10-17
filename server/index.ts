@@ -1187,6 +1187,27 @@ export interface TerminalManagerLike {
 	kill(id: string): void;
 	rename(id: string, title: string): void;
 	runCommand(id: string, command: CommandDef, cols: number, rows: number, fallbackCwd: string): void;
+	/** v1 tmux：新建会话并只读接入（裸终端用；不可用回退 create）。 */
+	createTmux?(
+		id: string,
+		cwd: string,
+		cols: number,
+		rows: number,
+		fallbackCwd: string,
+		title?: string,
+		opts?: { locale?: string },
+	): Promise<unknown>;
+	/** 领养外部 tmux 会话（只读）。 */
+	adoptTmux?(id: string, session: string, cols: number, rows: number, title?: string): Promise<unknown>;
+	/** 推送领养候选列表并启动 30s 轮询（Terminal 面板打开时调一次）。 */
+	listAdoptablePush?(): Promise<void>;
+	/** tmux 窗口操作（树遥控）。 */
+	tmuxNewWindow?(id: string, title?: string): Promise<void>;
+	tmuxSelectWindow?(id: string, windowId: string): Promise<void>;
+	tmuxRenameWindow?(id: string, windowId: string, name: string): Promise<void>;
+	tmuxKillWindow?(id: string, windowId: string): Promise<void>;
+	tmuxTakeControl?(id: string, readonly: boolean): Promise<void>;
+	tmuxDetach?(id: string): Promise<void>;
 }
 
 export interface DispatchSession {

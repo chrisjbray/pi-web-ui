@@ -397,6 +397,32 @@ export function handleTerminalMessage(msg: ClientMessage, cs: DispatchSession): 
 		case "rename_terminal":
 			cs.getTerminalManager(msg.conversationId)?.rename(msg.terminalId, msg.title);
 			return true;
+		case "tmux_new_window":
+			void cs.getTerminalManager(msg.conversationId)?.tmuxNewWindow?.(msg.terminalId, msg.title);
+			return true;
+		case "tmux_select_window":
+			void cs.getTerminalManager(msg.conversationId)?.tmuxSelectWindow?.(msg.terminalId, msg.windowId);
+			return true;
+		case "tmux_rename_window":
+			void cs.getTerminalManager(msg.conversationId)?.tmuxRenameWindow?.(msg.terminalId, msg.windowId, msg.name);
+			return true;
+		case "tmux_kill_window":
+			void cs.getTerminalManager(msg.conversationId)?.tmuxKillWindow?.(msg.terminalId, msg.windowId);
+			return true;
+		case "tmux_take_control":
+			void cs.getTerminalManager(msg.conversationId)?.tmuxTakeControl?.(msg.terminalId, msg.readonly);
+			return true;
+		case "tmux_adopt":
+			void cs
+				.getTerminalManager(msg.conversationId)
+				?.adoptTmux?.(`adopt-${Date.now().toString(36)}`, msg.session, 120, 40, msg.session);
+			return true;
+		case "tmux_detach":
+			void cs.getTerminalManager(msg.conversationId)?.tmuxDetach?.(msg.terminalId);
+			return true;
+		case "list_tmux_sessions":
+			void cs.getTerminalManager(msg.conversationId)?.listAdoptablePush?.();
+			return true;
 		case "run_command":
 			cs.getTerminalManager(msg.conversationId)?.runCommand(
 				msg.terminalId,
