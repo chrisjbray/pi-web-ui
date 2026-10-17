@@ -380,6 +380,8 @@ export interface ChatState {
 	slashCommands: SlashCommandInfo[];
 	/** Open terminal tabs (metadata only; streams go through the bridge). */
 	terminals: TerminalMeta[];
+	/** Adoptable foreign tmux sessions (read-only candidates, 30s poll). */
+	tmuxSessions: { name: string; attached: boolean; windows: number; adopted: boolean }[];
 	/** Terminal the SCM/settings panel asked to focus (auto-switch on write ops). */
 	terminalActiveId: string | null;
 	/** Goal / review status (set via the goal bar). */
@@ -751,6 +753,12 @@ type Action =
 	| { type: "terminal_restart"; terminalId: string }
 	| { type: "terminal_list"; conversationId?: string; terminals: TerminalInfo[] }
 	| { type: "terminal_active"; id: string }
+	| {
+			type: "terminal_windows";
+			terminalId: string;
+			windows: { id: string; name: string; active: boolean; index: number }[];
+	  }
+	| { type: "tmux_sessions"; sessions: { name: string; attached: boolean; windows: number; adopted: boolean }[] }
 	| {
 			type: "transition_start";
 			kind: WorkspaceTransitionState["kind"];
@@ -1526,6 +1534,13 @@ function reducer(state: ChatState, action: Action): ChatState {
 			};
 		case "terminal_active":
 			return { ...state, terminalActiveId: action.id };
+		case "terminal_windows":
+			return {
+				...state,
+				terminals: state.terminals.map((t) => (t.id === action.terminalId ? { ...t, tmuxWindows: action.windows } : t)),
+			};
+		case "tmux_sessions":
+			return { ...state, tmuxSessions: action.sessions };
 		case "transition_start": {
 			const cachedTargetSessions = action.kind === "cwd" ? readCachedSessions(action.target, state.engine) : null;
 			return {
@@ -1875,6 +1890,7 @@ export function useChat() {
 		commandsPath: "",
 		slashCommands: [],
 		terminals: [],
+		tmuxSessions: [],
 		terminalActiveId: null,
 		goal: DEFAULT_GOAL,
 		bgServers: [],
@@ -2728,6 +2744,12 @@ export function useChat() {
 						conversationId: msg.conversationId,
 						terminals: msg.terminals,
 					});
+					break;
+				case "terminal_windows":
+					dispatch({ type: "terminal_windows", terminalId: msg.terminalId, windows: msg.windows });
+					break;
+				case "tmux_sessions":
+					dispatch({ type: "tmux_sessions", sessions: msg.sessions });
 					break;
 				case "commands":
 					dispatch({
