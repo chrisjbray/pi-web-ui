@@ -1,5 +1,16 @@
-@import "./model-management.css";
+@import "./model-management.css" layer(base);
 
+/* 级联分层（顺序即优先级）：
+   guard  = 唯一活口：mermaid 运行时往 SVG 写内联 style，只能用叹号 important 压。
+   base   = 基线组件样式（普通声明，零叹号 important）
+   theme  = 主题样式（服务端把主题文件包进这层，你不改）
+   普通声明：后面的层优先 → 主题恒压过基线；未分层普通声明胜过任何层内普通声明。
+   需要盖过主题或未分层三方库的结构性复位，写在文件末尾「无层覆盖区」，不用叹号 important。 */
+@layer guard, base, theme;
+
+/* model-management.css 必须落在 base 层里：层外的普通声明会盖掉所有层
+   （含主题），模型设置里的快捷供应商芯片就会被它反压回去。 */
+@layer base {
 /* pi-web-ui — dark theme, pi-flavored */
 
 /* ---- 文字引用 ---- */
@@ -4116,7 +4127,7 @@ select.plugin-topbar-item.plugin-topbar-select {
 }
 .term-win .term-tab-close.confirm {
 	opacity: 1;
-	color: #fff;
+	color: var(--on-red, #fff);
 	background: var(--red);
 }
 /* tmux 风格底部状态栏（tmux 窗口名，in-pane 状态栏的镜像遥控）。 */
@@ -12641,12 +12652,7 @@ div.chead[role="button"]:focus-visible,
 	.plan-board-collapsed .plan-board-active {
 		max-width: min(24ch, 36%);
 	}
-
-	@media (max-width: 640px) {
-		.plan-board-collapsed .plan-board-active {
-			max-width: min(24ch, 36%);
-		}
-	}
+}
 	@media (max-width: 440px) {
 		.plan-board-collapsed .plan-board-active {
 			display: none;
