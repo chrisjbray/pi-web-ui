@@ -36,9 +36,14 @@ Environment=PI_WEB_PORT=8787
 # carry the MagicDNS name, so both must be listed — otherwise every HTTP
 # route (incl. /api/health) gets 403 "host not allowed".
 Environment=PI_WEB_ALLOW_HOSTS=100.68.255.48,oc01-lax1,oc01-lax1.tail86abd.ts.net
+# Tailnet-only exposure: no token auth (browser login never asked).
+# The tailnet mesh is the access control; host-guard allowlist above still applies.
+Environment=PI_WEB_INSECURE_NO_AUTH=1
 # Tool hang guard: one hour (server default is far shorter; long builds and
 # deep-agent runs otherwise get killed mid-flight).
 Environment=PI_WEB_TOOL_TIMEOUT_MS=3600000
+# Build caches use ~/dev/tmp/cache, not /tmp: ~/dev/tmp is aipool/srv/development/tmp with no snapshots and no syncoid.
+Environment=TMPDIR=%h/dev/tmp/cache
 
 [Install]
 WantedBy=default.target
